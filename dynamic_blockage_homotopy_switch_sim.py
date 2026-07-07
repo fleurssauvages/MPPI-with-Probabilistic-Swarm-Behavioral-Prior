@@ -3313,23 +3313,23 @@ def main_dynamic_blockage():
     #   (1, 2) means "wall from obstacle 2 center to obstacle 3 center"
     #
     # Change these values to choose which corridors close.
-    # wall_pairs = []
+    wall_pairs = []
+    wall_width = 0.40
+    wall_extension = 0.20
+    block_step = 150
+    seed = 2
+
+    # wall_pairs = [(0, 1), (1, 2)]
     # wall_width = 0.40
     # wall_extension = 0.20
-    # block_step = 150
+    # block_step = 25
     # seed = 2
 
-    wall_pairs = [(0, 1), (1, 2)]
-    wall_width = 0.40
-    wall_extension = 0.20
-    block_step = 25
-    seed = 2
-
-    wall_pairs = [(0, 2), (1, 2)]
-    wall_width = 0.40
-    wall_extension = 0.20
-    block_step = 30
-    seed = 2
+    # wall_pairs = [(0, 2), (1, 2)]
+    # wall_width = 0.40
+    # wall_extension = 0.20
+    # block_step = 30
+    # seed = 2
 
     blocker = make_wall_blockers_between_obstacles(
         obstacles=base_obstacles,
