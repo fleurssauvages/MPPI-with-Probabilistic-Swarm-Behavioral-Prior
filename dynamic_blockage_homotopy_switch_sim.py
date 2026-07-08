@@ -229,7 +229,7 @@ class MPCConfig:
     robot_radius: float = 0.18
     base_safety_margin: float = 0.07
 
-    w_goal: float = 30.0
+    w_goal: float = 40.0
     w_obstacle: float = 500.0
     w_control: float = 0.03
     w_control_smooth: float = 0.15
@@ -3313,17 +3313,17 @@ def main_dynamic_blockage():
     #   (1, 2) means "wall from obstacle 2 center to obstacle 3 center"
     #
     # Change these values to choose which corridors close.
-    wall_pairs = []
-    wall_width = 0.40
-    wall_extension = 0.20
-    block_step = 150
-    seed = 2
-
-    # wall_pairs = [(0, 1), (1, 2)]
+    # wall_pairs = []
     # wall_width = 0.40
     # wall_extension = 0.20
-    # block_step = 25
+    # block_step = 150
     # seed = 2
+
+    wall_pairs = [(0, 1), (1, 2)]
+    wall_width = 0.40
+    wall_extension = 0.20
+    block_step = 25
+    seed = 2
 
     # wall_pairs = [(0, 2), (1, 2)]
     # wall_width = 0.40
