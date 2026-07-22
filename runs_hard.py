@@ -1,22 +1,25 @@
 #!/usr/bin/env python3
 """
-Dynamic blockage experiment for MPPI-only controller variants.
+Batch robustness experiment for MPPI controller variants with hard collision constraints.
 
-This script saves:
-    - one per-variant GIF named <variant>.gif
-    - one global GIF named all_paths.gif with all variant paths only
+The default entry point runs paired controller trials across several dynamic-wall
+scenarios and random seeds. Obstacle avoidance is removed from the objective;
+rollouts are constrained using the exact polygon geometry. The script writes CSV
+metrics only: no GIFs, plots, or images.
 
-Run:
-    python dynamic_block_soft.py
+Run from the project root:
+    python runs_hard_exact.py
 """
 
 from __future__ import annotations
 
+import csv
 import math
 import pickle
 import time
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Sequence
 
 import numpy as np
@@ -59,9 +62,9 @@ Array = np.ndarray
 # Config
 # =============================================================================
 
-RUN_SEEDS = list(range(5))          # Increase to 20-50 for real experiments.
-RUN_SWARM_SEED = 3
-OUTPUT_PREFIX = "dynamic_block_soft"
+RUN_SEEDS = list(range(1))          # Increase to 20-50 for real experiments.
+RUN_SWARM_SEED = 5
+OUTPUT_PREFIX = "dynamic_block_hard"
 
 
 class ControllerVariant(str, Enum):
@@ -85,7 +88,7 @@ class ControllerVariant(str, Enum):
 class MPPIConfig:
     dt: float = 0.12
     horizon: int = 28
-    num_rollouts: int = 500
+    num_rollouts: int = 650
     lambda_temperature: float = 7.0
 
     v_min: float = -1.6
@@ -101,8 +104,24 @@ class MPPIConfig:
     max_empirical_nominals_per_mode: int = 16
 
     robot_radius: float = 0.18
-    base_safety_margin: float = 0.07
+    base_safety_margin: float = 0.12
     uncertainty_margin_gain: float = 0.25
+
+    # Obstacle handling. In the hard experiment the soft obstacle term is
+    # disabled and exact polygonal collision avoidance is imposed as a rollout
+    # feasibility constraint. A nonzero buffer enlarges the robot footprint.
+    use_soft_obstacle_cost: bool = False
+    enable_hard_collision_filter: bool = True
+    hard_collision_clearance_buffer: float = 0.0
+
+    # Legacy soft-mode settings retained only so the same cost routines can also
+    # be used with use_soft_obstacle_cost=True. They are inactive in hard runs.
+    collision_substeps: int = 5
+    hard_collision_clearance: float = 0.02
+    hard_collision_penalty: float = 200_000.0
+    suppress_blocked_modes: bool = False
+    mode_blocking_clearance: float = 0.02
+    mode_blocking_substeps: int = 2
 
     w_goal: float = 30.0
     w_obstacle: float = 500.0
@@ -476,13 +495,76 @@ def polygon_signed_distance_and_normal(p: Array, obs) -> Tuple[float, Array]:
     return best_dist, best_normal
 
 
-def obstacle_bounding_circles(obstacles: Sequence) -> List[Tuple[Array, float]]:
-    circles = []
+def obstacle_bounding_circles(
+    obstacles: Sequence,
+    *,
+    elongated_aspect_ratio: float = 2.25,
+    max_segment_length: float = 0.20,
+    wall_max_segment_length: float = 0.10,
+) -> List[Tuple[Array, float]]:
+    """Build conservative circle covers for fast MPPI obstacle costs.
+
+    Compact polygons retain the original single bounding-circle approximation.
+    Elongated polygons, including the inserted rectangular walls, are covered by
+    a chain of overlapping circles along their principal axis. This avoids
+    replacing a thin wall with one very large circular forbidden region while
+    keeping the existing Numba circle-cost kernels unchanged.
+
+    The chain conservatively covers the polygon's PCA-aligned bounding box.
+    Exact collision classification still uses polygon signed distance.
+    """
+    circles: List[Tuple[Array, float]] = []
+
     for obs in obstacles:
         poly = _poly_vertices(obs)
         center = poly.mean(axis=0)
-        radius = float(np.max(np.linalg.norm(poly - center[None, :], axis=1)))
-        circles.append((center, radius))
+
+        if len(poly) < 4:
+            radius = float(np.max(np.linalg.norm(poly - center[None, :], axis=1)))
+            circles.append((center, radius))
+            continue
+
+        centered = poly - center[None, :]
+        covariance = centered.T @ centered / max(1, len(poly))
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        major_axis = eigenvectors[:, int(np.argmax(eigenvalues))]
+        minor_axis = np.array([-major_axis[1], major_axis[0]], dtype=np.float64)
+
+        major_coord = centered @ major_axis
+        minor_coord = centered @ minor_axis
+        major_min = float(np.min(major_coord))
+        major_max = float(np.max(major_coord))
+        minor_min = float(np.min(minor_coord))
+        minor_max = float(np.max(minor_coord))
+
+        length = max(major_max - major_min, 1e-12)
+        width = max(minor_max - minor_min, 1e-12)
+        aspect_ratio = length / width
+
+        if aspect_ratio < elongated_aspect_ratio:
+            radius = float(np.max(np.linalg.norm(centered, axis=1)))
+            circles.append((center, radius))
+            continue
+
+        # Divide the major-axis interval into short strips. A circle centered in
+        # each strip has a radius large enough to cover the strip's far corner.
+        # Inserted walls are four-vertex elongated rectangles. Use a denser
+        # circle chain for them while retaining a slightly coarser cover for
+        # other elongated polygons. The radius still covers each strip's far
+        # corner, so the complete wall remains conservatively covered.
+        target_segment_length = (
+            wall_max_segment_length if len(poly) == 4 else max_segment_length
+        )
+        segment_count = max(2, int(math.ceil(length / target_segment_length)))
+        segment_length = length / segment_count
+        circle_radius = math.sqrt((0.5 * segment_length) ** 2 + (0.5 * width) ** 2)
+        minor_mid = 0.5 * (minor_min + minor_max)
+
+        for index in range(segment_count):
+            major_mid = major_min + (index + 0.5) * segment_length
+            circle_center = center + major_mid * major_axis + minor_mid * minor_axis
+            circles.append((circle_center.astype(np.float64), float(circle_radius)))
+
     return circles
 
 
@@ -985,6 +1067,64 @@ if njit is not None:
         return costs
 
     @njit(cache=True)
+    def interpolated_obstacle_penalty_nb(
+        X,
+        circle_centers,
+        circle_radii,
+        robot_radius,
+        base_safety_margin,
+        w_obstacle,
+        collision_substeps,
+        hard_collision_clearance,
+        hard_collision_penalty,
+    ):
+        """Extra obstacle cost at interior rollout points plus a near-hard term."""
+        N = X.shape[0]
+        H = X.shape[1] - 1
+        M = circle_radii.shape[0]
+        extras = np.zeros(N, dtype=np.float64)
+
+        substeps = max(0, int(collision_substeps))
+        denominator = float(substeps + 1)
+
+        for n in range(N):
+            cost = 0.0
+            for t in range(H):
+                x0 = X[n, t, 0]
+                y0 = X[n, t, 1]
+                x1 = X[n, t + 1, 0]
+                y1 = X[n, t + 1, 1]
+
+                # q == substeps + 1 is the endpoint. Endpoints already receive
+                # the normal soft obstacle cost, but still need the hard check.
+                for q in range(1, substeps + 2):
+                    alpha = q / denominator
+                    px = x0 + alpha * (x1 - x0)
+                    py = y0 + alpha * (y1 - y0)
+                    min_clearance = 1e18
+
+                    for j in range(M):
+                        dx = px - circle_centers[j, 0]
+                        dy = py - circle_centers[j, 1]
+                        d = math.sqrt(dx * dx + dy * dy) - circle_radii[j]
+                        clearance = d - robot_radius
+                        if clearance < min_clearance:
+                            min_clearance = clearance
+
+                        if q <= substeps:
+                            margin = robot_radius + base_safety_margin
+                            sp = _softplus_scalar_nb(8.0 * (margin - d))
+                            cost += (w_obstacle / denominator) * sp * sp
+
+                    if min_clearance < hard_collision_clearance:
+                        penetration = hard_collision_clearance - min_clearance
+                        cost += hard_collision_penalty * (1.0 + penetration * penetration)
+
+            extras[n] = cost
+
+        return extras
+
+    @njit(cache=True)
     def point_in_poly_nb(px, py, poly):
         inside = False
         n = poly.shape[0]
@@ -1061,19 +1201,248 @@ if njit is not None:
 
         return best
 
+
+    @njit(cache=True)
+    def _cross2_nb(ax, ay, bx, by):
+        return ax * by - ay * bx
+
+    @njit(cache=True)
+    def _on_segment_nb(ax, ay, bx, by, px, py, eps=1e-12):
+        return (
+            min(ax, bx) - eps <= px <= max(ax, bx) + eps
+            and min(ay, by) - eps <= py <= max(ay, by) + eps
+        )
+
+    @njit(cache=True)
+    def _segments_intersect_nb(ax, ay, bx, by, cx, cy, dx, dy):
+        eps = 1e-12
+        o1 = _cross2_nb(bx - ax, by - ay, cx - ax, cy - ay)
+        o2 = _cross2_nb(bx - ax, by - ay, dx - ax, dy - ay)
+        o3 = _cross2_nb(dx - cx, dy - cy, ax - cx, ay - cy)
+        o4 = _cross2_nb(dx - cx, dy - cy, bx - cx, by - cy)
+
+        if ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and (
+            (o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)
+        ):
+            return True
+
+        if abs(o1) <= eps and _on_segment_nb(ax, ay, bx, by, cx, cy, eps):
+            return True
+        if abs(o2) <= eps and _on_segment_nb(ax, ay, bx, by, dx, dy, eps):
+            return True
+        if abs(o3) <= eps and _on_segment_nb(cx, cy, dx, dy, ax, ay, eps):
+            return True
+        if abs(o4) <= eps and _on_segment_nb(cx, cy, dx, dy, bx, by, eps):
+            return True
+        return False
+
+    @njit(cache=True)
+    def _segment_segment_distance_nb(ax, ay, bx, by, cx, cy, dx, dy):
+        if _segments_intersect_nb(ax, ay, bx, by, cx, cy, dx, dy):
+            return 0.0
+        d1 = point_segment_dist_nb(ax, ay, cx, cy, dx, dy)
+        d2 = point_segment_dist_nb(bx, by, cx, cy, dx, dy)
+        d3 = point_segment_dist_nb(cx, cy, ax, ay, bx, by)
+        d4 = point_segment_dist_nb(dx, dy, ax, ay, bx, by)
+        return min(d1, d2, d3, d4)
+
+    @njit(cache=True)
+    def hard_feasible_mask_nb(
+        X,
+        polys_padded,
+        poly_lengths,
+        poly_bboxes,
+        robot_radius,
+        clearance_buffer,
+    ):
+        """Exact swept-disc feasibility for the piecewise-linear rollout path."""
+        N = X.shape[0]
+        H = X.shape[1] - 1
+        M = poly_lengths.shape[0]
+        feasible = np.ones(N, dtype=np.bool_)
+        required = robot_radius + clearance_buffer
+
+        for rollout in range(N):
+            for t in range(H):
+                ax = X[rollout, t, 0]
+                ay = X[rollout, t, 1]
+                bx = X[rollout, t + 1, 0]
+                by = X[rollout, t + 1, 1]
+
+                seg_min_x = min(ax, bx) - required
+                seg_max_x = max(ax, bx) + required
+                seg_min_y = min(ay, by) - required
+                seg_max_y = max(ay, by) + required
+
+                for obstacle in range(M):
+                    if (
+                        seg_max_x < poly_bboxes[obstacle, 0]
+                        or seg_min_x > poly_bboxes[obstacle, 1]
+                        or seg_max_y < poly_bboxes[obstacle, 2]
+                        or seg_min_y > poly_bboxes[obstacle, 3]
+                    ):
+                        continue
+
+                    n_vertices = poly_lengths[obstacle]
+                    poly = polys_padded[obstacle]
+                    if point_in_poly_nb(ax, ay, poly[:n_vertices]) or point_in_poly_nb(
+                        bx, by, poly[:n_vertices]
+                    ):
+                        feasible[rollout] = False
+                        break
+
+                    for edge in range(n_vertices):
+                        next_edge = edge + 1
+                        if next_edge == n_vertices:
+                            next_edge = 0
+                        distance = _segment_segment_distance_nb(
+                            ax,
+                            ay,
+                            bx,
+                            by,
+                            poly[edge, 0],
+                            poly[edge, 1],
+                            poly[next_edge, 0],
+                            poly[next_edge, 1],
+                        )
+                        if distance < required:
+                            feasible[rollout] = False
+                            break
+
+                    if not feasible[rollout]:
+                        break
+
+                if not feasible[rollout]:
+                    break
+
+        return feasible
+
 else:
     rollout_unicycle_batch_nb = None
     rollout_unicycle_single_nb = None
     fast_swarm_prior_costs_nb = None
     stable_representation_costs_nb = None
     standard_mppi_costs_batch_nb = None
+    interpolated_obstacle_penalty_nb = None
     min_clearance_nb = None
+    hard_feasible_mask_nb = None
 
 
 def obstacle_circles_to_arrays(obstacle_circles: List[Tuple[Array, float]]) -> Tuple[Array, Array]:
+    if not obstacle_circles:
+        return np.zeros((0, 2), dtype=np.float64), np.zeros(0, dtype=np.float64)
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
     radii = np.asarray([r for _, r in obstacle_circles], dtype=np.float64)
     return centers, radii
+
+
+def interpolated_obstacle_penalty(
+    X: Array,
+    obstacle_circles: List[Tuple[Array, float]],
+    cfg: MPPIConfig,
+) -> Array:
+    """Evaluate interior rollout points and apply a near-hard collision cost."""
+    N = int(X.shape[0])
+    if not obstacle_circles:
+        return np.zeros(N, dtype=np.float64)
+
+    centers, radii = obstacle_circles_to_arrays(obstacle_circles)
+    if interpolated_obstacle_penalty_nb is not None:
+        return interpolated_obstacle_penalty_nb(
+            np.asarray(X, dtype=np.float64),
+            centers,
+            radii,
+            float(cfg.robot_radius),
+            float(cfg.base_safety_margin),
+            float(cfg.w_obstacle),
+            int(cfg.collision_substeps),
+            float(cfg.hard_collision_clearance),
+            float(cfg.hard_collision_penalty),
+        )
+
+    extras = np.zeros(N, dtype=np.float64)
+    substeps = max(0, int(cfg.collision_substeps))
+    denominator = float(substeps + 1)
+
+    for t in range(X.shape[1] - 1):
+        p0 = X[:, t, :2]
+        p1 = X[:, t + 1, :2]
+        for q in range(1, substeps + 2):
+            alpha = q / denominator
+            p = p0 + alpha * (p1 - p0)
+            d = np.linalg.norm(
+                p[:, None, :] - centers[None, :, :], axis=2
+            ) - radii[None, :]
+            clearance = d - cfg.robot_radius
+
+            if q <= substeps:
+                margin = cfg.robot_radius + cfg.base_safety_margin
+                extras += (cfg.w_obstacle / denominator) * np.sum(
+                    softplus(8.0 * (margin - d)) ** 2,
+                    axis=1,
+                )
+
+            min_clearance = np.min(clearance, axis=1)
+            penetration = np.maximum(
+                0.0,
+                cfg.hard_collision_clearance - min_clearance,
+            )
+            extras += cfg.hard_collision_penalty * (
+                penetration > 0.0
+            ) * (1.0 + penetration ** 2)
+
+    return extras
+
+
+def path_min_clearance_to_circles(
+    path: Array,
+    obstacle_circles: List[Tuple[Array, float]],
+    robot_radius: float,
+    substeps: int = 2,
+) -> float:
+    """Minimum robot clearance along a polyline under the circle approximation."""
+    p = np.asarray(path, dtype=np.float64)
+    if len(p) == 0 or not obstacle_circles:
+        return float("inf")
+
+    centers, radii = obstacle_circles_to_arrays(obstacle_circles)
+    samples = [p]
+    if len(p) > 1:
+        for q in range(1, max(0, int(substeps)) + 1):
+            alpha = q / float(max(0, int(substeps)) + 1)
+            samples.append(p[:-1] + alpha * (p[1:] - p[:-1]))
+    points = np.vstack(samples)
+    clearance = (
+        np.linalg.norm(points[:, None, :] - centers[None, :, :], axis=2)
+        - radii[None, :]
+        - float(robot_radius)
+    )
+    return float(np.min(clearance))
+
+
+def unblocked_mode_indices(
+    local_modes: Sequence[MPPIHomotopyMode],
+    obstacle_circles: List[Tuple[Array, float]],
+    cfg: MPPIConfig,
+) -> Tuple[List[int], Array]:
+    """Return usable mode indices and their local centerline clearances."""
+    clearances = np.asarray([
+        path_min_clearance_to_circles(
+            mode.mean_path,
+            obstacle_circles,
+            cfg.robot_radius,
+            substeps=cfg.mode_blocking_substeps,
+        )
+        for mode in local_modes
+    ], dtype=np.float64)
+
+    if not cfg.suppress_blocked_modes or len(local_modes) <= 1:
+        return list(range(len(local_modes))), clearances
+
+    usable = np.where(clearances >= cfg.mode_blocking_clearance)[0].tolist()
+    if not usable:
+        usable = [int(np.argmax(clearances))]
+    return usable, clearances
 
 
 def obstacles_to_padded_arrays(obstacles: Sequence) -> Tuple[Array, Array]:
@@ -1087,6 +1456,248 @@ def obstacles_to_padded_arrays(obstacles: Sequence) -> Tuple[Array, Array]:
         lengths[i] = p.shape[0]
 
     return padded, lengths
+
+
+
+def obstacles_to_hard_arrays(obstacles: Sequence) -> Tuple[Array, Array, Array]:
+    """Pack exact polygon vertices, lengths, and axis-aligned bounding boxes."""
+    if not obstacles:
+        return (
+            np.zeros((0, 0, 2), dtype=np.float64),
+            np.zeros(0, dtype=np.int64),
+            np.zeros((0, 4), dtype=np.float64),
+        )
+    padded, lengths = obstacles_to_padded_arrays(obstacles)
+    bboxes = np.zeros((len(obstacles), 4), dtype=np.float64)
+    for index, obstacle in enumerate(obstacles):
+        poly = _poly_vertices(obstacle)
+        bboxes[index] = [
+            float(np.min(poly[:, 0])),
+            float(np.max(poly[:, 0])),
+            float(np.min(poly[:, 1])),
+            float(np.max(poly[:, 1])),
+        ]
+    return padded, lengths, bboxes
+
+
+def _orientation_xy(a: Array, b: Array, c: Array) -> float:
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _on_segment_xy(a: Array, b: Array, p: Array, eps: float = 1e-12) -> bool:
+    return bool(
+        min(a[0], b[0]) - eps <= p[0] <= max(a[0], b[0]) + eps
+        and min(a[1], b[1]) - eps <= p[1] <= max(a[1], b[1]) + eps
+    )
+
+
+def _segments_intersect_xy(a: Array, b: Array, c: Array, d: Array) -> bool:
+    eps = 1e-12
+    o1 = _orientation_xy(a, b, c)
+    o2 = _orientation_xy(a, b, d)
+    o3 = _orientation_xy(c, d, a)
+    o4 = _orientation_xy(c, d, b)
+    if ((o1 > eps and o2 < -eps) or (o1 < -eps and o2 > eps)) and (
+        (o3 > eps and o4 < -eps) or (o3 < -eps and o4 > eps)
+    ):
+        return True
+    return bool(
+        (abs(o1) <= eps and _on_segment_xy(a, b, c, eps))
+        or (abs(o2) <= eps and _on_segment_xy(a, b, d, eps))
+        or (abs(o3) <= eps and _on_segment_xy(c, d, a, eps))
+        or (abs(o4) <= eps and _on_segment_xy(c, d, b, eps))
+    )
+
+
+def _segment_segment_distance_xy(a: Array, b: Array, c: Array, d: Array) -> float:
+    if _segments_intersect_xy(a, b, c, d):
+        return 0.0
+    return min(
+        point_segment_distance_and_normal(a, c, d)[0],
+        point_segment_distance_and_normal(b, c, d)[0],
+        point_segment_distance_and_normal(c, a, b)[0],
+        point_segment_distance_and_normal(d, a, b)[0],
+    )
+
+
+def hard_feasible_rollout_mask(
+    X: Array,
+    obstacles: Sequence,
+    robot_radius: float,
+    clearance_buffer: float = 0.0,
+    enabled: bool = True,
+) -> Array:
+    """Return the exact polygonal feasibility mask for a rollout batch.
+
+    The unicycle discretization produces a straight position segment during each
+    integration interval. The minimum distance between every rollout segment and
+    every polygon edge is therefore checked directly, with the polygon inflated
+    by the robot radius and optional clearance buffer.
+    """
+    X = np.asarray(X, dtype=np.float64)
+    if not enabled or len(obstacles) == 0:
+        return np.ones(X.shape[0], dtype=bool)
+
+    padded, lengths, bboxes = obstacles_to_hard_arrays(obstacles)
+    if hard_feasible_mask_nb is not None:
+        return np.asarray(
+            hard_feasible_mask_nb(
+                X,
+                padded,
+                lengths,
+                bboxes,
+                float(robot_radius),
+                float(clearance_buffer),
+            ),
+            dtype=bool,
+        )
+
+    required = float(robot_radius + clearance_buffer)
+    feasible = np.ones(X.shape[0], dtype=bool)
+    for rollout in range(X.shape[0]):
+        for t in range(X.shape[1] - 1):
+            a = X[rollout, t, :2]
+            b = X[rollout, t + 1, :2]
+            for obstacle in obstacles:
+                poly = _poly_vertices(obstacle)
+                if point_in_poly(a, poly) or point_in_poly(b, poly):
+                    feasible[rollout] = False
+                    break
+                for edge in range(len(poly)):
+                    c = poly[edge]
+                    d = poly[(edge + 1) % len(poly)]
+                    if _segment_segment_distance_xy(a, b, c, d) < required:
+                        feasible[rollout] = False
+                        break
+                if not feasible[rollout]:
+                    break
+            if not feasible[rollout]:
+                break
+    return feasible
+
+
+def impose_hard_collision_constraints(
+    costs: Array,
+    X: Array,
+    obstacles: Sequence,
+    cfg: MPPIConfig,
+) -> Tuple[Array, Array]:
+    """Set the objective of infeasible rollouts to infinity."""
+    feasible = hard_feasible_rollout_mask(
+        X,
+        obstacles,
+        cfg.robot_radius,
+        clearance_buffer=cfg.hard_collision_clearance_buffer,
+        enabled=cfg.enable_hard_collision_filter,
+    )
+    constrained = np.asarray(costs, dtype=np.float64).copy()
+    constrained[~feasible] = np.inf
+    return constrained, feasible
+
+
+def finite_cost_statistics(costs: Array) -> Tuple[float, float]:
+    finite = np.asarray(costs, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return float('inf'), float('inf')
+    return float(np.min(finite)), float(np.mean(finite))
+
+
+def emergency_safe_control(
+    x_current: Array,
+    obstacles: Sequence,
+    goal: Array,
+    cfg: MPPIConfig,
+) -> Tuple[Array, Dict[str, object]]:
+    """Select a collision-free one-step fallback command when no rollout is feasible."""
+    candidates = np.asarray([
+        (0.0, 0.0),
+        (-0.25, 0.0), (-0.50, 0.0), (-0.75, 0.0),
+        (0.0, 1.5), (0.0, -1.5),
+        (-0.30, 1.5), (-0.30, -1.5),
+        (0.25, 1.5), (0.25, -1.5),
+        (-0.60, 2.5), (-0.60, -2.5),
+        (0.40, 2.5), (0.40, -2.5),
+    ], dtype=np.float64)
+    candidates[:, 0] = np.clip(candidates[:, 0], cfg.v_min, cfg.v_max)
+    candidates[:, 1] = np.clip(candidates[:, 1], cfg.omega_min, cfg.omega_max)
+    U = candidates[:, None, :]
+    X = rollout_unicycle_batch(x_current, U, cfg.dt)
+    feasible = hard_feasible_rollout_mask(
+        X,
+        obstacles,
+        cfg.robot_radius,
+        clearance_buffer=cfg.hard_collision_clearance_buffer,
+        enabled=cfg.enable_hard_collision_filter,
+    )
+    if np.any(feasible):
+        ids = np.flatnonzero(feasible)
+        terminal = X[ids, -1, :2]
+        score = np.linalg.norm(terminal - goal[None, :], axis=1)
+        score += 0.05 * (
+            candidates[ids, 0] ** 2 + 0.15 * candidates[ids, 1] ** 2
+        )
+        selected = int(ids[int(np.argmin(score))])
+        return candidates[selected].copy(), {
+            'mppi_action_rule': 'emergency_safe_control',
+            'num_feasible_rollouts': 0,
+            'optimal_traj': X[selected].copy(),
+        }
+    return np.zeros(2, dtype=np.float64), {
+        'mppi_action_rule': 'no_safe_one_step_control_found',
+        'num_feasible_rollouts': 0,
+        'optimal_traj': rollout_unicycle(x_current, np.zeros((1, 2)), cfg.dt),
+    }
+
+
+def select_hard_feasible_action(
+    costs: Array,
+    U: Array,
+    X: Array,
+    x_current: Array,
+    obstacles: Sequence,
+    goal: Array,
+    cfg: MPPIConfig,
+) -> Tuple[Array, Dict[str, object], Array]:
+    """Apply the first command of the lowest-cost feasible rollout."""
+    constrained, feasible = impose_hard_collision_constraints(costs, X, obstacles, cfg)
+    finite_feasible = feasible & np.isfinite(costs)
+    if np.any(finite_feasible):
+        candidate_costs = constrained.copy()
+        candidate_costs[~finite_feasible] = np.inf
+        selected = int(np.argmin(candidate_costs))
+        return U[selected, 0, :].copy(), {
+            'mppi_action_rule': 'best_feasible_rollout_first_control',
+            'num_feasible_rollouts': int(np.sum(finite_feasible)),
+            'optimal_traj': X[selected].copy(),
+        }, constrained
+
+    control, info = emergency_safe_control(x_current, obstacles, goal, cfg)
+    return control, info, constrained
+
+
+def shield_control_if_unsafe(
+    x_current: Array,
+    control: Array,
+    obstacles: Sequence,
+    goal: Array,
+    cfg: MPPIConfig,
+) -> Tuple[Array, Optional[Dict[str, object]]]:
+    """Recheck the actually applied command after optional filtering."""
+    U = np.asarray(control, dtype=np.float64).reshape(1, 1, 2)
+    X = rollout_unicycle_batch(x_current, U, cfg.dt)
+    feasible = hard_feasible_rollout_mask(
+        X,
+        obstacles,
+        cfg.robot_radius,
+        clearance_buffer=cfg.hard_collision_clearance_buffer,
+        enabled=cfg.enable_hard_collision_filter,
+    )
+    if bool(feasible[0]):
+        return np.asarray(control, dtype=np.float64), None
+    safe_control, info = emergency_safe_control(x_current, obstacles, goal, cfg)
+    info['unsafe_requested_control'] = np.asarray(control, dtype=np.float64).copy()
+    return safe_control, info
 
 
 def localize_mode_for_state_with_index(
@@ -1277,7 +1888,7 @@ def fast_swarm_prior_costs(
 ) -> Array:
     if fast_swarm_prior_costs_nb is not None:
         centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        return fast_swarm_prior_costs_nb(
+        costs = fast_swarm_prior_costs_nb(
             np.asarray(X, dtype=np.float64),
             np.asarray(U, dtype=np.float64),
             np.asarray(mode.mean_path, dtype=np.float64),
@@ -1306,6 +1917,7 @@ def fast_swarm_prior_costs(
             bool(use_mode_prior),
             bool(use_mean_reference),
         )
+        return costs + interpolated_obstacle_penalty(X, obstacle_circles, cfg)
 
     N = U.shape[0]
     H = cfg.horizon
@@ -1361,7 +1973,7 @@ def fast_swarm_prior_costs(
     if use_mode_prior:
         costs += cfg.w_mode_prior * (-math.log(mode.probability + 1e-12))
 
-    return costs
+    return costs + interpolated_obstacle_penalty(X, obstacle_circles, cfg)
 
 
 def standard_mppi_costs_batch(
@@ -1373,7 +1985,7 @@ def standard_mppi_costs_batch(
 ) -> Array:
     if standard_mppi_costs_batch_nb is not None:
         centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        return standard_mppi_costs_batch_nb(
+        costs = standard_mppi_costs_batch_nb(
             np.asarray(X, dtype=np.float64),
             np.asarray(U, dtype=np.float64),
             centers,
@@ -1387,6 +1999,7 @@ def standard_mppi_costs_batch(
             float(cfg.w_control),
             float(cfg.w_control_smooth),
         )
+        return costs + interpolated_obstacle_penalty(X, obstacle_circles, cfg)
 
     N, H, _ = U.shape
     costs = np.zeros(N, dtype=np.float64)
@@ -1405,7 +2018,7 @@ def standard_mppi_costs_batch(
     dU = np.diff(U, axis=1)
     costs += cfg.w_control_smooth * np.sum(dU[:, :, 0] ** 2 + 0.2 * dU[:, :, 1] ** 2, axis=1)
 
-    return costs
+    return costs + interpolated_obstacle_penalty(X, obstacle_circles, cfg)
 
 
 
@@ -1457,7 +2070,7 @@ def stable_representation_costs(
 
     if stable_representation_costs_nb is not None:
         centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        return stable_representation_costs_nb(
+        costs = stable_representation_costs_nb(
             np.asarray(X, dtype=np.float64),
             np.asarray(U, dtype=np.float64),
             np.asarray(mode.mean_path, dtype=np.float64),
@@ -1482,6 +2095,7 @@ def stable_representation_costs(
             int(rep_type),
             bool(use_mode_prior),
         )
+        return costs + interpolated_obstacle_penalty(X, obstacle_circles, cfg)
 
     N, H, _ = U.shape
     costs = np.zeros(N, dtype=np.float64)
@@ -1530,14 +2144,18 @@ def stable_representation_costs(
     if use_mode_prior:
         costs += cfg.w_mode_prior * (-math.log(mode.probability + 1e-12))
 
-    return costs
+    return costs + interpolated_obstacle_penalty(X, obstacle_circles, cfg)
+
 
 
 def softmin_score(costs: Array, cfg: MPPIConfig) -> float:
-    rho = float(np.min(costs))
-    z = np.exp(-(costs - rho) / cfg.lambda_temperature)
+    finite = np.asarray(costs, dtype=np.float64)
+    finite = finite[np.isfinite(finite)]
+    if finite.size == 0:
+        return float('inf')
+    rho = float(np.min(finite))
+    z = np.exp(-(finite - rho) / cfg.lambda_temperature)
     return float(rho - cfg.lambda_temperature * math.log(np.mean(z) + 1e-12))
-
 
 def build_nominal_bank_for_mode(
     x_current: Array,
@@ -1594,6 +2212,7 @@ def sample_controls_from_nominal_bank(
     return U
 
 
+
 def stable_swarm_mppi_step(
     x_current: Array,
     global_modes: List[MPPIHomotopyMode],
@@ -1613,44 +2232,45 @@ def stable_swarm_mppi_step(
 
     local_modes = []
     new_progress_by_mode = dict(progress_by_mode)
-    for m in global_modes:
-        key = str(m.signature)
-        prev = progress_by_mode.get(key)
-        local_m, idx = localize_mode_for_state_with_index(
-            m,
+    for mode in global_modes:
+        key = str(mode.signature)
+        previous = progress_by_mode.get(key)
+        local_mode, index = localize_mode_for_state_with_index(
+            mode,
             x_current,
             cfg.horizon,
-            previous_idx=prev if cfg.use_monotonic_reference_progress else None,
+            previous_idx=previous if cfg.use_monotonic_reference_progress else None,
             max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
         )
-        local_modes.append(local_m)
-        new_progress_by_mode[key] = idx
+        local_modes.append(local_mode)
+        new_progress_by_mode[key] = index
+
+    # Hard runs do not use a circular obstacle approximation in the objective.
+    objective_obstacles = obstacle_bounding_circles(obstacles) if cfg.use_soft_obstacle_cost else []
+    active_mode_indices = list(range(len(local_modes)))
+    active_local_modes = local_modes
+    active_global_modes = global_modes
 
     if use_pi_sampling:
-        pi = np.array([m.probability for m in local_modes], dtype=np.float64)
-        pi = pi / (pi.sum() + 1e-12)
+        probabilities = np.asarray([m.probability for m in active_local_modes], dtype=np.float64)
+        probabilities /= probabilities.sum() + 1e-12
     else:
-        pi = np.ones(len(local_modes), dtype=np.float64) / len(local_modes)
+        probabilities = np.ones(len(active_local_modes), dtype=np.float64) / len(active_local_modes)
 
-    mode_ids = rng.choice(len(local_modes), size=cfg.num_rollouts, p=pi)
-    obstacle_circles = obstacle_bounding_circles(obstacles)
+    mode_ids = rng.choice(len(active_local_modes), size=cfg.num_rollouts, p=probabilities)
+    all_costs = np.full(cfg.num_rollouts, np.inf, dtype=np.float64)
+    all_U = np.zeros((cfg.num_rollouts, cfg.horizon, 2), dtype=np.float64)
+    all_X = np.zeros((cfg.num_rollouts, cfg.horizon + 1, 3), dtype=np.float64)
 
-    all_costs = np.zeros(cfg.num_rollouts, dtype=np.float64)
-    all_U0 = np.zeros((cfg.num_rollouts, 2), dtype=np.float64)
-    best_cost = float("inf")
-    best_traj = None
-
-    for mid, local_mode in enumerate(local_modes):
-        ids = np.where(mode_ids == mid)[0]
-        n = len(ids)
-        if n == 0:
+    for mode_id, local_mode in enumerate(active_local_modes):
+        ids = np.where(mode_ids == mode_id)[0]
+        if ids.size == 0:
             continue
-
-        key = str(global_modes[mid].signature)
+        key = str(active_global_modes[mode_id].signature)
         nominal_bank = build_nominal_bank_for_mode(
             x_current,
             local_mode,
-            global_modes[mid],
+            active_global_modes[mode_id],
             goal,
             cfg,
             rng,
@@ -1658,44 +2278,44 @@ def stable_swarm_mppi_step(
             use_mean_nominal=use_mean_nominal,
             previous_idx=progress_by_mode.get(key),
         )
-
         U = sample_controls_from_nominal_bank(
             nominal_bank,
-            n,
+            int(ids.size),
             cfg,
             rng,
             prefer_empirical=use_empirical_init,
         )
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
-
         costs = stable_representation_costs(
             X,
             U,
             local_mode,
-            obstacle_circles,
+            objective_obstacles,
             goal,
             cfg,
             rep_type=rep_type,
             use_mode_prior=use_mode_prior,
         )
-
         all_costs[ids] = costs
-        all_U0[ids] = U[:, 0, :]
-        group_best = int(np.argmin(costs))
-        if float(costs[group_best]) < best_cost:
-            best_cost = float(costs[group_best])
-            best_traj = np.asarray(X[group_best], dtype=np.float64).copy()
+        all_U[ids] = U
+        all_X[ids] = X
 
-    u = mppi_weighted_control(all_costs, all_U0, cfg)
+    control, action_info, constrained = select_hard_feasible_action(
+        all_costs, all_U, all_X, x_current, obstacles, goal, cfg
+    )
+    cost_min, cost_mean = finite_cost_statistics(constrained)
     info = {
-        "cost_min": float(all_costs.min()),
-        "cost_mean": float(all_costs.mean()),
-        "soft_value": softmin_score(all_costs, cfg),
-        "rep_type": int(rep_type),
-        "mode_selection": False,
-        "optimal_traj": best_traj,
+        'cost_min': cost_min,
+        'cost_mean': cost_mean,
+        'soft_value': softmin_score(constrained, cfg),
+        'rep_type': int(rep_type),
+        'mode_selection': False,
+        'active_mode_count': int(len(active_mode_indices)),
+        'suppressed_mode_count': 0,
+        'mode_clearances': [],
+        **action_info,
     }
-    return u, info, new_progress_by_mode
+    return control, info, new_progress_by_mode
 
 
 def mode_selecting_stable_mppi_step(
@@ -1712,37 +2332,29 @@ def mode_selecting_stable_mppi_step(
     use_mode_prior: bool,
     progress_by_mode: Optional[Dict[str, int]] = None,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
-    """
-    Per-homotopy MPPI with hard mode selection.
-
-    Avoids destructive averaging between incompatible homotopies.
-    """
+    """Optimize retained homotopy modes independently and select a feasible mode."""
     progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
-
     top_k = min(max(1, int(cfg.mode_select_top_k)), len(global_modes))
     candidate_modes = global_modes[:top_k]
     n_per_mode = max(
         int(cfg.mode_select_min_rollouts_per_mode),
         int(math.ceil(cfg.num_rollouts / float(top_k))),
     )
-
-    obstacle_circles = obstacle_bounding_circles(obstacles)
-    best = None
+    objective_obstacles = obstacle_bounding_circles(obstacles) if cfg.use_soft_obstacle_cost else []
     new_progress_by_mode = dict(progress_by_mode)
+    best = None
 
-    for mid, global_mode in enumerate(candidate_modes):
+    for mode_index, global_mode in enumerate(candidate_modes):
         key = str(global_mode.signature)
-        prev = progress_by_mode.get(key)
-
-        local_mode, idx = localize_mode_for_state_with_index(
+        previous = progress_by_mode.get(key)
+        local_mode, index = localize_mode_for_state_with_index(
             global_mode,
             x_current,
             cfg.horizon,
-            previous_idx=prev if cfg.use_monotonic_reference_progress else None,
+            previous_idx=previous if cfg.use_monotonic_reference_progress else None,
             max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
         )
-        new_progress_by_mode[key] = idx
-
+        new_progress_by_mode[key] = index
         nominal_bank = build_nominal_bank_for_mode(
             x_current,
             local_mode,
@@ -1752,9 +2364,8 @@ def mode_selecting_stable_mppi_step(
             rng,
             use_empirical_init=use_empirical_init,
             use_mean_nominal=use_mean_nominal,
-            previous_idx=prev,
+            previous_idx=previous,
         )
-
         U = sample_controls_from_nominal_bank(
             nominal_bank,
             n_per_mode,
@@ -1763,48 +2374,52 @@ def mode_selecting_stable_mppi_step(
             prefer_empirical=use_empirical_init,
         )
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
-
         costs = stable_representation_costs(
             X,
             U,
             local_mode,
-            obstacle_circles,
+            objective_obstacles,
             goal,
             cfg,
             rep_type=rep_type,
             use_mode_prior=use_mode_prior,
         )
-
-        u_h = mppi_weighted_control(costs, U[:, 0, :], cfg)
-        J_h = softmin_score(costs, cfg)
-
-        if best is None or J_h < best["score"]:
-            best_idx = int(np.argmin(costs))
-            best = {
-                "score": float(J_h),
-                "u": u_h,
-                "mode_index": int(mid),
-                "signature": str(global_mode.signature),
-                "probability": float(global_mode.probability),
-                "cost_min": float(costs.min()),
-                "cost_mean": float(costs.mean()),
-                "optimal_traj": np.asarray(X[best_idx], dtype=np.float64).copy(),
-            }
+        control, action_info, constrained = select_hard_feasible_action(
+            costs, U, X, x_current, obstacles, goal, cfg
+        )
+        score = softmin_score(constrained, cfg)
+        cost_min, cost_mean = finite_cost_statistics(constrained)
+        record = {
+            'score': score,
+            'u': control,
+            'mode_index': int(mode_index),
+            'signature': str(global_mode.signature),
+            'probability': float(global_mode.probability),
+            'cost_min': cost_min,
+            'cost_mean': cost_mean,
+            **action_info,
+        }
+        if best is None or score < best['score']:
+            best = record
 
     assert best is not None
     info = {
-        "cost_min": best["cost_min"],
-        "cost_mean": best["cost_mean"],
-        "soft_value": best["score"],
-        "selected_mode_index": best["mode_index"],
-        "selected_mode_signature": best["signature"],
-        "selected_mode_probability": best["probability"],
-        "rep_type": int(rep_type),
-        "mode_selection": True,
-        "optimal_traj": best.get("optimal_traj"),
+        'cost_min': best['cost_min'],
+        'cost_mean': best['cost_mean'],
+        'soft_value': best['score'],
+        'selected_mode_index': best['mode_index'],
+        'selected_mode_signature': best['signature'],
+        'selected_mode_probability': best['probability'],
+        'rep_type': int(rep_type),
+        'mode_selection': True,
+        'active_mode_count': int(top_k),
+        'suppressed_mode_count': 0,
+        'mode_clearances': [],
+        'mppi_action_rule': best.get('mppi_action_rule'),
+        'num_feasible_rollouts': best.get('num_feasible_rollouts', 0),
+        'optimal_traj': best.get('optimal_traj'),
     }
-    return best["u"], info, new_progress_by_mode
-
+    return best['u'], info, new_progress_by_mode
 
 def make_temporally_correlated_noise(n: int, H: int, cfg: MPPIConfig, rng: np.random.Generator) -> Array:
     noise_scale = np.array([cfg.noise_v, cfg.noise_omega], dtype=np.float64)
@@ -1831,6 +2446,7 @@ def best_output_trajectory_from_costs(costs: Array, X: Array) -> Array:
     return np.asarray(X[best_idx], dtype=np.float64).copy()
 
 
+
 def swarm_mppi_step(
     x_current: Array,
     global_modes: List[MPPIHomotopyMode],
@@ -1848,98 +2464,90 @@ def swarm_mppi_step(
     progress_by_mode: Optional[Dict[str, int]] = None,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
     progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
-
     local_modes = []
     new_progress_by_mode = dict(progress_by_mode)
-    for m in global_modes:
-        key = str(m.signature)
-        prev = progress_by_mode.get(key)
-        local_m, idx = localize_mode_for_state_with_index(
-            m,
+    for mode in global_modes:
+        key = str(mode.signature)
+        previous = progress_by_mode.get(key)
+        local_mode, index = localize_mode_for_state_with_index(
+            mode,
             x_current,
             cfg.horizon,
-            previous_idx=prev if cfg.use_monotonic_reference_progress else None,
+            previous_idx=previous if cfg.use_monotonic_reference_progress else None,
             max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
         )
-        local_modes.append(local_m)
-        new_progress_by_mode[key] = idx
+        local_modes.append(local_mode)
+        new_progress_by_mode[key] = index
 
+    objective_obstacles = obstacle_bounding_circles(obstacles) if cfg.use_soft_obstacle_cost else []
     if use_pi_sampling:
-        pi = np.array([m.probability for m in local_modes], dtype=np.float64)
-        pi = pi / (pi.sum() + 1e-12)
+        probabilities = np.asarray([m.probability for m in local_modes], dtype=np.float64)
+        probabilities /= probabilities.sum() + 1e-12
     else:
-        pi = np.ones(len(local_modes), dtype=np.float64) / len(local_modes)
+        probabilities = np.ones(len(local_modes), dtype=np.float64) / len(local_modes)
 
-    mode_ids = rng.choice(len(local_modes), size=cfg.num_rollouts, p=pi)
-    obstacle_circles = obstacle_bounding_circles(obstacles)
+    mode_ids = rng.choice(len(local_modes), size=cfg.num_rollouts, p=probabilities)
+    all_costs = np.full(cfg.num_rollouts, np.inf, dtype=np.float64)
+    all_U = np.zeros((cfg.num_rollouts, cfg.horizon, 2), dtype=np.float64)
+    all_X = np.zeros((cfg.num_rollouts, cfg.horizon + 1, 3), dtype=np.float64)
 
-    all_costs = np.zeros(cfg.num_rollouts, dtype=np.float64)
-    all_U0 = np.zeros((cfg.num_rollouts, 2), dtype=np.float64)
-    best_cost = float("inf")
-    best_traj = None
-
-    for mid, mode in enumerate(local_modes):
-        ids = np.where(mode_ids == mid)[0]
-        n = len(ids)
-        if n == 0:
+    for mode_id, mode in enumerate(local_modes):
+        ids = np.where(mode_ids == mode_id)[0]
+        if ids.size == 0:
             continue
-
         if use_mean_reference:
             mean_nominal = nominal_controls_to_track_path(x_current, mode.mean_path, cfg)
         else:
             mean_nominal = nominal_controls_to_goal(x_current, goal, cfg)
-
         if use_empirical_init:
             nominal_bank = build_empirical_nominal_bank(
                 x_current=x_current,
-                global_mode=global_modes[mid],
+                global_mode=global_modes[mode_id],
                 mean_nominal=mean_nominal,
                 cfg=cfg,
                 rng=rng,
-                previous_idx=progress_by_mode.get(str(global_modes[mid].signature)),
+                previous_idx=progress_by_mode.get(str(global_modes[mode_id].signature)),
             )
         else:
             nominal_bank = [mean_nominal]
 
-        if len(nominal_bank) == 1:
-            bank_ids = np.zeros(n, dtype=int)
-        else:
-            probs = np.ones(len(nominal_bank), dtype=np.float64)
-            probs[0] = max(1e-6, 1.0 - cfg.swarm_init_probability)
-            probs[1:] = cfg.swarm_init_probability / (len(nominal_bank) - 1)
-            probs /= probs.sum()
-            bank_ids = rng.choice(len(nominal_bank), size=n, p=probs)
-
-        U = np.stack([nominal_bank[j].copy() for j in bank_ids], axis=0)
-        U += make_temporally_correlated_noise(n, cfg.horizon, cfg, rng)
-
-        U[:, :, 0] = np.clip(U[:, :, 0], cfg.v_min, cfg.v_max)
-        U[:, :, 1] = np.clip(U[:, :, 1], cfg.omega_min, cfg.omega_max)
-
+        U = sample_controls_from_nominal_bank(
+            nominal_bank,
+            int(ids.size),
+            cfg,
+            rng,
+            prefer_empirical=use_empirical_init,
+        )
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
-
         costs = fast_swarm_prior_costs(
-            X, U, mode, obstacle_circles, goal, cfg,
+            X,
+            U,
+            mode,
+            objective_obstacles,
+            goal,
+            cfg,
             use_gaussian_tracking=use_gaussian_tracking,
             use_uncertainty_margin=use_uncertainty_margin,
             use_mode_prior=use_mode_prior,
             use_mean_reference=use_mean_reference,
         )
-
         all_costs[ids] = costs
-        all_U0[ids] = U[:, 0, :]
-        group_best = int(np.argmin(costs))
-        if float(costs[group_best]) < best_cost:
-            best_cost = float(costs[group_best])
-            best_traj = np.asarray(X[group_best], dtype=np.float64).copy()
+        all_U[ids] = U
+        all_X[ids] = X
 
-    u = mppi_weighted_control(all_costs, all_U0, cfg)
+    control, action_info, constrained = select_hard_feasible_action(
+        all_costs, all_U, all_X, x_current, obstacles, goal, cfg
+    )
+    cost_min, cost_mean = finite_cost_statistics(constrained)
     info = {
-        "cost_min": float(all_costs.min()),
-        "cost_mean": float(all_costs.mean()),
-        "optimal_traj": best_traj,
+        'cost_min': cost_min,
+        'cost_mean': cost_mean,
+        'active_mode_count': int(len(local_modes)),
+        'suppressed_mode_count': 0,
+        'mode_clearances': [],
+        **action_info,
     }
-    return u, info, new_progress_by_mode
+    return control, info, new_progress_by_mode
 
 
 def standard_mppi_step(
@@ -1949,25 +2557,23 @@ def standard_mppi_step(
     cfg: MPPIConfig,
     rng: np.random.Generator,
 ) -> Tuple[Array, Dict[str, object]]:
-    obstacle_circles = obstacle_bounding_circles(obstacles)
-    U_nom = nominal_controls_to_goal(x_current, goal, cfg)
-
-    U = np.repeat(U_nom[None, :, :], cfg.num_rollouts, axis=0)
+    objective_obstacles = obstacle_bounding_circles(obstacles) if cfg.use_soft_obstacle_cost else []
+    nominal = nominal_controls_to_goal(x_current, goal, cfg)
+    U = np.repeat(nominal[None, :, :], cfg.num_rollouts, axis=0)
     U += make_temporally_correlated_noise(cfg.num_rollouts, cfg.horizon, cfg, rng)
-
     U[:, :, 0] = np.clip(U[:, :, 0], cfg.v_min, cfg.v_max)
     U[:, :, 1] = np.clip(U[:, :, 1], cfg.omega_min, cfg.omega_max)
-
     X = rollout_unicycle_batch(x_current, U, cfg.dt)
-    costs = standard_mppi_costs_batch(X, U, obstacle_circles, goal, cfg)
-
-    u = mppi_weighted_control(costs, U[:, 0, :], cfg)
-    return u, {
-        "cost_min": float(costs.min()),
-        "cost_mean": float(costs.mean()),
-        "optimal_traj": best_output_trajectory_from_costs(costs, X),
+    costs = standard_mppi_costs_batch(X, U, objective_obstacles, goal, cfg)
+    control, action_info, constrained = select_hard_feasible_action(
+        costs, U, X, x_current, obstacles, goal, cfg
+    )
+    cost_min, cost_mean = finite_cost_statistics(constrained)
+    return control, {
+        'cost_min': cost_min,
+        'cost_mean': cost_mean,
+        **action_info,
     }
-
 
 # =============================================================================
 # Scene and swarm planner
@@ -2186,6 +2792,13 @@ def run_controller_variant(
             u[0] = np.clip(u[0], mppi_cfg.v_min, mppi_cfg.v_max)
             u[1] = np.clip(u[1], mppi_cfg.omega_min, mppi_cfg.omega_max)
 
+        shielded_control, shield_info = shield_control_if_unsafe(
+            x, u, obstacles, goal, mppi_cfg
+        )
+        u = shielded_control
+        if shield_info is not None and isinstance(info, dict):
+            info.update(shield_info)
+
         previous_control = u.copy()
 
         x = unicycle_step(x, u, mppi_cfg.dt)
@@ -2276,6 +2889,50 @@ def obstacle_center(obs) -> Array:
     return _poly_vertices(obs).mean(axis=0)
 
 
+def translate_obstacle_to_center(obs, target_center: Array):
+    """Return a copy of ``obs`` translated so its center is ``target_center``."""
+    vertices = _poly_vertices(obs).copy()
+    shift = np.asarray(target_center, dtype=np.float64) - vertices.mean(axis=0)
+    return PolyObstacle(vertices + shift[None, :])
+
+
+def random_obstacle_center_swap(
+    obstacles: Sequence,
+    *,
+    seed: int,
+) -> Tuple[List[object], Tuple[int, ...]]:
+    """Randomly permute obstacle centers while preserving obstacle shapes.
+
+    Obstacle ``i`` keeps its original polygon shape but is translated to the
+    original center of obstacle ``permutation[i]``. A Sattolo shuffle is used,
+    so every obstacle moves to a different center when at least two obstacles
+    are present. The returned permutation makes each trial layout reproducible.
+    """
+    n = len(obstacles)
+    if n < 2:
+        return list(obstacles), tuple(range(n))
+
+    rng = np.random.default_rng(int(seed))
+    permutation = np.arange(n, dtype=np.int64)
+
+    # Sattolo's algorithm: one random cycle, hence no fixed points.
+    for i in range(n - 1, 0, -1):
+        j = int(rng.integers(0, i))
+        permutation[i], permutation[j] = permutation[j], permutation[i]
+
+    original_centers = [obstacle_center(obs) for obs in obstacles]
+    swapped = [
+        translate_obstacle_to_center(obs, original_centers[int(permutation[i])])
+        for i, obs in enumerate(obstacles)
+    ]
+    return swapped, tuple(int(v) for v in permutation)
+
+
+def obstacle_center_permutation_text(permutation: Sequence[int]) -> str:
+    """Serialize an obstacle-to-original-center assignment for the trial CSV."""
+    return ";".join(f"{i}->{int(target)}" for i, target in enumerate(permutation))
+
+
 def make_wall_between_points(p0: Array, p1: Array, width: float = 0.35, extension: float = 0.0):
     """
     Create a rectangular wall obstacle between two points.
@@ -2352,16 +3009,51 @@ def make_wall_blockers_between_obstacles(
         wall from obstacle 1 center to obstacle 2 center
         wall from obstacle 2 center to obstacle 3 center
     """
-    return [
-        make_wall_between_obstacles(
-            obstacles=obstacles,
-            idx_a=i,
-            idx_b=j,
-            width=width,
-            extension=extension,
-        )
-        for i, j in pairs
+    centers = [obstacle_center(obs).copy() for obs in obstacles]
+    return make_wall_blockers_between_centers(
+        centers=centers,
+        pairs=pairs,
+        width=width,
+        extension=extension,
+    )
+
+
+def make_wall_blockers_between_centers(
+    centers: Sequence[Array],
+    pairs: Sequence[Tuple[int, int]],
+    width: float = 0.35,
+    extension: float = 0.15,
+):
+    """Create wall blockers between fixed spatial center anchors.
+
+    Unlike ``make_wall_blockers_between_obstacles``, this helper does not inspect
+    the current obstacle layout. It is therefore the preferred constructor when
+    obstacle shapes are later permuted between center locations but the walls
+    must remain on the same original center-to-center segments.
+    """
+    fixed_centers = [
+        np.asarray(center, dtype=np.float64).reshape(2).copy()
+        for center in centers
     ]
+
+    blockers = []
+    for i, j in pairs:
+        if i == j:
+            raise ValueError(f"Cannot create wall for degenerate center pair {(i, j)}.")
+        if not (0 <= i < len(fixed_centers) and 0 <= j < len(fixed_centers)):
+            raise IndexError(
+                f"Center pair {(i, j)} is outside the valid index range "
+                f"[0, {len(fixed_centers) - 1}]."
+            )
+        blockers.append(
+            make_wall_between_points(
+                fixed_centers[i],
+                fixed_centers[j],
+                width=width,
+                extension=extension,
+            )
+        )
+    return blockers
 
 
 def as_blocker_list(blocker_or_blockers):
@@ -2373,7 +3065,31 @@ def as_blocker_list(blocker_or_blockers):
 
 
 def active_obstacles_for_step(base_obstacles, blocker, step, block_step):
+    """Legacy step-based obstacle activation helper used by plotting utilities."""
     if step >= block_step:
+        return list(base_obstacles) + as_blocker_list(blocker)
+    return list(base_obstacles)
+
+
+def spatial_progress_along_start_goal(x: Array, start: Array, goal: Array) -> float:
+    """Return normalized projection progress along the start-to-goal direction."""
+    start = np.asarray(start, dtype=np.float64)
+    goal = np.asarray(goal, dtype=np.float64)
+    position = np.asarray(x[:2], dtype=np.float64)
+    direction = goal - start
+    denom = float(direction @ direction)
+    if denom <= 1e-12:
+        return 1.0
+    return float(np.clip(((position - start) @ direction) / denom, 0.0, 1.0))
+
+
+def active_obstacles_for_state(
+    base_obstacles: Sequence,
+    blocker,
+    state_index: int,
+    activation_step: Optional[int],
+):
+    if activation_step is not None and state_index >= activation_step:
         return list(base_obstacles) + as_blocker_list(blocker)
     return list(base_obstacles)
 
@@ -2387,18 +3103,23 @@ def run_dynamic_blockage_controller(
     goal: Array,
     *,
     seed: int,
-    block_step: int = 30,
+    trigger_progress: Optional[float] = 0.25,
+    activation_preview_clearance: Optional[float] = 0.75,
+    blocker_active_from_start: bool = False,
+    condition: str = "dynamic_wall",
+    block_step: Optional[int] = None,
     max_steps: int = 120,
     goal_tolerance: float = 0.35,
     mppi_cfg: Optional[MPPIConfig] = None,
+    record_infos: bool = True,
+    record_obstacle_history: bool = True,
 ):
-    """
-    Simulate one controller with a sudden obstacle insertion.
+    """Simulate one controller under no-wall, static-wall, or dynamic-wall conditions.
 
-    Important:
-        The swarm modes are computed before the blocker exists.
-        After block_step, the controller's obstacle cost sees the blocker.
-        This tests whether the controller can switch homotopy/corridor online.
+    Dynamic walls activate at the earlier of the spatial progress trigger or a
+    clearance-preview trigger. The latter inserts the wall before the robot gets
+    closer than the configurable reaction distance. ``block_step`` is retained
+    only for backwards compatibility.
     """
     rng = np.random.default_rng(seed)
     mppi_cfg = MPPIConfig() if mppi_cfg is None else mppi_cfg
@@ -2410,22 +3131,71 @@ def run_dynamic_blockage_controller(
     obstacle_history = []
     previous_control = None
     swarm_progress = {}
+    selected_mode_switches = 0
+    last_selected_mode = None
+    blockers = as_blocker_list(blocker)
 
+    activation_step: Optional[int] = 0 if blocker_active_from_start else None
+    activation_progress: Optional[float] = 0.0 if blocker_active_from_start else None
+    activation_reason: Optional[str] = "from_start" if blocker_active_from_start else None
+    activation_clearance: Optional[float] = None
+    if blocker_active_from_start and blockers:
+        activation_clearance = min_clearance(
+            x[None, :],
+            blockers,
+            mppi_cfg.robot_radius,
+        )
 
     t0 = time.perf_counter()
 
     for step in range(max_steps):
-        active_obstacles = active_obstacles_for_step(base_obstacles, blocker, step, block_step)
-        obstacle_history.append(active_obstacles)
+        current_progress = spatial_progress_along_start_goal(x, start, goal)
+
+        if activation_step is None and blockers:
+            blocker_clearance = min_clearance(
+                x[None, :],
+                blockers,
+                mppi_cfg.robot_radius,
+            )
+            progress_ready = bool(
+                trigger_progress is not None
+                and current_progress >= float(trigger_progress)
+            )
+            clearance_ready = bool(
+                activation_preview_clearance is not None
+                and blocker_clearance <= float(activation_preview_clearance)
+            )
+            legacy_step_ready = bool(
+                trigger_progress is None
+                and block_step is not None
+                and step >= int(block_step)
+            )
+
+            if progress_ready or clearance_ready or legacy_step_ready:
+                activation_step = step
+                activation_progress = current_progress
+                activation_clearance = blocker_clearance
+                if clearance_ready and progress_ready:
+                    activation_reason = "progress_and_clearance"
+                elif clearance_ready:
+                    activation_reason = "clearance_preview"
+                elif progress_ready:
+                    activation_reason = "progress"
+                else:
+                    activation_reason = "legacy_step"
+
+        active_obstacles = active_obstacles_for_state(
+            base_obstacles,
+            blocker,
+            step,
+            activation_step,
+        )
+        if record_obstacle_history:
+            obstacle_history.append(active_obstacles)
 
         if variant == ControllerVariant.FULL_SWARM_PRIOR_MPPI:
             u, info, swarm_progress = swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 use_pi_sampling=True,
                 use_empirical_init=True,
                 use_mean_reference=True,
@@ -2437,12 +3207,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
             u, info, swarm_progress = swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_reference=True,
@@ -2454,12 +3219,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.EMPIRICAL_INIT_MPPI:
             u, info, swarm_progress = swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 use_pi_sampling=False,
                 use_empirical_init=True,
                 use_mean_reference=False,
@@ -2471,12 +3231,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.HOMOTOPY_SEEDED_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_NONE,
                 use_pi_sampling=True,
                 use_empirical_init=True,
@@ -2487,12 +3242,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.CORRIDOR_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_CORRIDOR,
                 use_pi_sampling=True,
                 use_empirical_init=True,
@@ -2503,12 +3253,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.FRENET_CORRIDOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_FRENET,
                 use_pi_sampling=True,
                 use_empirical_init=True,
@@ -2519,12 +3264,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.HEATMAP_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_HEATMAP,
                 use_pi_sampling=True,
                 use_empirical_init=True,
@@ -2535,12 +3275,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.CONTROL_BANK_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_CONTROL_BANK,
                 use_pi_sampling=False,
                 use_empirical_init=True,
@@ -2551,12 +3286,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI:
             u, info, swarm_progress = mode_selecting_stable_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_NONE,
                 use_empirical_init=True,
                 use_mean_nominal=True,
@@ -2566,12 +3296,7 @@ def run_dynamic_blockage_controller(
 
         elif variant == ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI:
             u, info, swarm_progress = mode_selecting_stable_mppi_step(
-                x,
-                modes,
-                active_obstacles,
-                goal,
-                mppi_cfg,
-                rng,
+                x, modes, active_obstacles, goal, mppi_cfg, rng,
                 rep_type=REP_CORRIDOR,
                 use_empirical_init=True,
                 use_mean_nominal=True,
@@ -2591,78 +3316,217 @@ def run_dynamic_blockage_controller(
             u[0] = np.clip(u[0], mppi_cfg.v_min, mppi_cfg.v_max)
             u[1] = np.clip(u[1], mppi_cfg.omega_min, mppi_cfg.omega_max)
 
-        previous_control = u.copy()
+        shielded_control, shield_info = shield_control_if_unsafe(
+            x, u, active_obstacles, goal, mppi_cfg
+        )
+        u = shielded_control
+        if shield_info is not None and isinstance(info, dict):
+            info.update(shield_info)
 
+        previous_control = u.copy()
         x = unicycle_step(x, u, mppi_cfg.dt)
         states.append(x.copy())
         controls.append(u.copy())
-        infos.append(info)
+
+        selected_mode = info.get("selected_mode_index") if isinstance(info, dict) else None
+        if selected_mode is not None:
+            if last_selected_mode is not None and selected_mode != last_selected_mode:
+                selected_mode_switches += 1
+            last_selected_mode = selected_mode
+
+        if record_infos:
+            infos.append(info)
 
         if np.linalg.norm(x[:2] - goal) <= goal_tolerance:
             break
 
     runtime = time.perf_counter() - t0
 
-    # Add final obstacle state to align with states length.
-    obstacle_history.append(active_obstacles_for_step(base_obstacles, blocker, len(states) - 1, block_step))
+    if record_obstacle_history:
+        obstacle_history.append(active_obstacles_for_state(
+            base_obstacles,
+            blocker,
+            len(states) - 1,
+            activation_step,
+        ))
 
+    legacy_block_step = activation_step if activation_step is not None else max_steps + 1
     return {
         "variant": variant.value,
         "seed": seed,
+        "condition": condition,
         "states": np.asarray(states),
         "controls": np.asarray(controls),
         "infos": infos,
         "runtime": runtime,
-        "block_step": block_step,
+        "block_step": legacy_block_step,
+        "activation_step": activation_step,
+        "activation_progress": activation_progress,
+        "activation_reason": activation_reason,
+        "activation_clearance": activation_clearance,
+        "trigger_progress": trigger_progress,
+        "activation_preview_clearance": activation_preview_clearance,
         "blocker": blocker,
         "obstacle_history": obstacle_history,
+        "selected_mode_switches": int(selected_mode_switches),
+        "last_selected_mode": last_selected_mode,
     }
 
 
 def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius, goal_tolerance=0.15):
+    """Summarize a trial and classify every unsuccessful run."""
     states = result["states"]
+    controls = result["controls"]
+    condition = str(result.get("condition", "dynamic_wall"))
+    activation_step = result.get("activation_step")
+    if activation_step is not None:
+        activation_step = int(activation_step)
 
-    # Evaluate collision against the actual time-varying obstacle set.
+    # For static-wall baselines, the complete trajectory is considered the
+    # post-wall interval. No-wall baselines have no post-wall interval.
+    if condition == "static_wall":
+        metric_start_step: Optional[int] = 0
+    elif condition == "dynamic_wall":
+        metric_start_step = activation_step
+    else:
+        metric_start_step = None
+
     min_vals = []
+    min_vals_after_block = []
     collision = False
+    first_collision_step = None
 
-    for step, x in enumerate(states):
-        active_obs = active_obstacles_for_step(base_obstacles, blocker, step, result["block_step"])
-        c = min_clearance(states[step:step+1], active_obs, robot_radius)
-        min_vals.append(c)
-        if c < 0.0:
+    collision_substeps = 5
+    for step in range(len(states)):
+        active_obs = active_obstacles_for_state(
+            base_obstacles,
+            blocker,
+            step,
+            activation_step,
+        )
+        clearance = min_clearance(states[step:step + 1], active_obs, robot_radius)
+        min_vals.append(clearance)
+        if metric_start_step is not None and step >= metric_start_step:
+            min_vals_after_block.append(clearance)
+        if clearance < 0.0 and first_collision_step is None:
             collision = True
+            first_collision_step = step
+
+        if step + 1 < len(states):
+            segment_obs = active_obstacles_for_state(
+                base_obstacles,
+                blocker,
+                step,
+                activation_step,
+            )
+            alpha = np.linspace(0.0, 1.0, collision_substeps + 2)[1:-1, None]
+            segment_states = states[step][None, :] + alpha * (
+                states[step + 1][None, :] - states[step][None, :]
+            )
+            segment_clearance = min_clearance(segment_states, segment_obs, robot_radius)
+            min_vals.append(segment_clearance)
+            if metric_start_step is not None and step >= metric_start_step:
+                min_vals_after_block.append(segment_clearance)
+            if segment_clearance < 0.0 and first_collision_step is None:
+                collision = True
+                first_collision_step = step
 
     final_dist = float(np.linalg.norm(states[-1, :2] - goal))
+    reached_goal = bool(final_dist <= goal_tolerance)
+    success = bool(reached_goal and not collision)
+
+    if success:
+        failure_reason = ""
+    elif collision:
+        failure_reason = "collision"
+    else:
+        failure_reason = "not_reaching"
 
     selected_modes = []
     for info in result.get("infos", []):
         if isinstance(info, dict) and "selected_mode_index" in info:
             selected_modes.append(info.get("selected_mode_index"))
 
-    selected_mode_switches = 0
-    if len(selected_modes) >= 2:
-        for a, b in zip(selected_modes[:-1], selected_modes[1:]):
-            if a != b:
-                selected_mode_switches += 1
+    if selected_modes:
+        selected_mode_switches = sum(a != b for a, b in zip(selected_modes[:-1], selected_modes[1:]))
+        last_selected_mode = selected_modes[-1]
+    else:
+        selected_mode_switches = int(result.get("selected_mode_switches", 0))
+        last_selected_mode = result.get("last_selected_mode")
+
+    if metric_start_step is None:
+        after_block_state_start = len(states)
+        after_block_control_start = len(controls)
+        steps_after_block = 0
+    else:
+        after_block_state_start = min(metric_start_step, len(states) - 1)
+        after_block_control_start = min(metric_start_step, len(controls))
+        steps_after_block = int(max(0, len(states) - 1 - metric_start_step))
+
+    exposed_to_blocker = bool(
+        condition == "static_wall"
+        or (
+            condition == "dynamic_wall"
+            and activation_step is not None
+            and len(states) - 1 >= activation_step
+        )
+    )
 
     return {
         "variant": result["variant"],
         "seed": result["seed"],
-        "success": bool(final_dist <= goal_tolerance and not collision),
-        "selected_mode_switches": int(selected_mode_switches),
-        "last_selected_mode": selected_modes[-1] if selected_modes else None,
-        "reached_goal": bool(final_dist <= goal_tolerance),
+        "condition": condition,
+        "success": success,
+        "failure_reason": failure_reason,
+        "reached_goal": reached_goal,
         "collision": bool(collision),
+        "not_reaching": bool(not reached_goal and not collision),
+        "first_collision_step": first_collision_step,
+        "collision_after_block": bool(
+            metric_start_step is not None
+            and first_collision_step is not None
+            and first_collision_step >= metric_start_step
+        ),
+        "exposed_to_blocker": exposed_to_blocker,
+        "goal_reached_before_block": bool(
+            condition == "dynamic_wall"
+            and reached_goal
+            and activation_step is None
+        ),
+        "activation_step": activation_step,
+        "activation_progress": result.get("activation_progress"),
+        "activation_reason": result.get("activation_reason"),
+        "activation_clearance": result.get("activation_clearance"),
+        "trigger_progress": result.get("trigger_progress"),
+        "activation_preview_clearance": result.get("activation_preview_clearance"),
+        "selected_mode_switches": int(selected_mode_switches),
+        "last_selected_mode": last_selected_mode,
         "final_dist": final_dist,
-        "min_clearance_dynamic": float(np.min(min_vals)),
+        "min_clearance_dynamic": float(np.min(min_vals)) if min_vals else float("inf"),
+        "min_clearance_after_block": (
+            float(np.min(min_vals_after_block)) if min_vals_after_block else float("nan")
+        ),
         "path_length": path_length(states),
-        "control_effort": control_effort(result["controls"]),
-        "control_smoothness": control_smoothness(result["controls"]),
+        "path_length_after_block": (
+            path_length(states[after_block_state_start:])
+            if metric_start_step is not None else float("nan")
+        ),
+        "control_effort": control_effort(controls),
+        "control_effort_after_block": (
+            control_effort(controls[after_block_control_start:])
+            if metric_start_step is not None else float("nan")
+        ),
+        "control_smoothness": control_smoothness(controls),
+        "control_smoothness_after_block": (
+            control_smoothness(controls[after_block_control_start:])
+            if metric_start_step is not None else float("nan")
+        ),
         "steps": int(len(states) - 1),
+        "steps_after_block": steps_after_block,
         "runtime_sec": float(result["runtime"]),
         "runtime_per_step_sec": float(result["runtime"] / max(1, len(states) - 1)),
-        "block_step": int(result["block_step"]),
+        "block_step": activation_step,
+        "goal_tolerance": float(goal_tolerance),
     }
 
 
@@ -3178,7 +4042,7 @@ def animate_dynamic_blockage(results, base_obstacles, blocker, start, goal, boun
         plt.close(fig)
 
 def main_dynamic_blockage():
-    print("dynamic_block_soft")
+    print("dynamic_block_hard")
     print(f"Numba enabled: {njit is not None}")
 
     scale, bounds_xy, bounds_ranges, start, goal, base_obstacles = build_default_scene()
@@ -3221,11 +4085,11 @@ def main_dynamic_blockage():
     #   (1, 2) means "wall from obstacle 2 center to obstacle 3 center"
     #
     # Change these values to choose which corridors close.
-    # wall_pairs = []
-    # wall_width = 0.40
-    # wall_extension = 0.20
-    # block_step = 150
-    # seed = 2
+    wall_pairs = []
+    wall_width = 0.40
+    wall_extension = 0.20
+    block_step = 150
+    seed = 2
 
     # wall_pairs = [(0, 1), (1, 2)]
     # wall_width = 0.40
@@ -3233,11 +4097,11 @@ def main_dynamic_blockage():
     # block_step = 25
     # seed = 2
 
-    wall_pairs = [(0, 2), (1, 2)]
-    wall_width = 0.40
-    wall_extension = 0.20
-    block_step = 30
-    seed = 2
+    # wall_pairs = [(0, 2), (1, 2)]
+    # wall_width = 0.40
+    # wall_extension = 0.20
+    # block_step = 30
+    # seed = 2
 
     blocker = make_wall_blockers_between_obstacles(
         obstacles=base_obstacles,
@@ -3261,6 +4125,9 @@ def main_dynamic_blockage():
         w_heading=0.0,
         w_mode_prior=0.15,
         uncertainty_margin_gain=0.25,
+        use_soft_obstacle_cost=False,
+        enable_hard_collision_filter=True,
+        hard_collision_clearance_buffer=0.0,
         apply_control_lowpass=True,
         control_lowpass_alpha=0.55,
 
@@ -3327,7 +4194,7 @@ def main_dynamic_blockage():
 
     # if pd is not None:
     #     df = pd.DataFrame(rows)
-    #     df.to_csv("dynamic_block_soft_metrics.csv", index=False)
+    #     df.to_csv("dynamic_block_hard_metrics.csv", index=False)
     #     print("Saved metrics: dynamic_block_soft_metrics.csv")
     #     print(df)
     # else:
@@ -3335,7 +4202,7 @@ def main_dynamic_blockage():
     #         print(row)
 
     from pathlib import Path
-    output_dir = Path("dynamic_block_soft")
+    output_dir = Path("dynamic_block_hard")
     output_dir.mkdir(parents=True, exist_ok=True)
 
     animate_dynamic_blockage(
@@ -3368,7 +4235,7 @@ def main_dynamic_blockage():
 # =============================================================================
 
 def main():
-    print("Variant file: dynamic_block_soft")
+    print("Variant file: dynamic_block_hard")
     print(f"Numba enabled: {njit is not None}")
     scale, bounds_xy, bounds_ranges, start, goal, obstacles = build_default_scene()
 
@@ -3406,7 +4273,7 @@ def main():
     # Keep settings identical where possible.
     mppi_cfg = MPPIConfig(
         horizon=28,
-        num_rollouts=500,
+        num_rollouts=650,
         dt=0.12,
         max_empirical_nominals_per_mode=12,
         swarm_init_probability=0.45,
@@ -3419,6 +4286,9 @@ def main():
         w_heading=0.0,
         w_mode_prior=0.15,
         uncertainty_margin_gain=0.25,
+        use_soft_obstacle_cost=False,
+        enable_hard_collision_filter=True,
+        hard_collision_clearance_buffer=0.0,
         apply_control_lowpass=True,
         control_lowpass_alpha=0.55,
     )
@@ -3522,5 +4392,544 @@ def main():
     # plt.show()
 
 
+# =============================================================================
+# Lightweight repeated robustness experiment
+# =============================================================================
+
+@dataclass(frozen=True)
+class DynamicWallScenario:
+    scenario_id: str
+    wall_pairs: Tuple[Tuple[int, int], ...]
+    trigger_progress: float = 0.25
+    wall_width: float = 0.40
+    wall_extension: float = 0.20
+
+
+def default_dynamic_wall_scenarios() -> List[DynamicWallScenario]:
+    """Smoke-test scenarios using a common spatial activation threshold."""
+    return [
+        DynamicWallScenario("wall_0_1", ((0, 1),), trigger_progress=0.25),
+        DynamicWallScenario("wall_0_2", ((0, 2),), trigger_progress=0.25),
+        DynamicWallScenario("wall_1_2", ((1, 2),), trigger_progress=0.25),
+        DynamicWallScenario(
+            "walls_0_1__1_2",
+            ((0, 1), (1, 2)),
+            trigger_progress=0.25,
+        ),
+    ]
+
+
+def validate_dynamic_wall_scenario(scenario: DynamicWallScenario, obstacle_count: int):
+    if not (0.0 <= scenario.trigger_progress <= 1.0):
+        raise ValueError(
+            f"Scenario {scenario.scenario_id}: trigger_progress must be in [0, 1]."
+        )
+    for i, j in scenario.wall_pairs:
+        if i == j:
+            raise ValueError(f"Scenario {scenario.scenario_id}: wall pair {(i, j)} is degenerate.")
+        if not (0 <= i < obstacle_count and 0 <= j < obstacle_count):
+            raise IndexError(
+                f"Scenario {scenario.scenario_id}: wall pair {(i, j)} is outside "
+                f"the obstacle index range [0, {obstacle_count - 1}]."
+            )
+
+
+def append_csv_row(path, row, fieldnames):
+    """Append one row immediately so long experiments preserve partial results."""
+    path = str(path)
+    write_header = not Path(path).exists() or Path(path).stat().st_size == 0
+    with open(path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+
+
+def wilson_interval(successes: int, trials: int, z: float = 1.96) -> Tuple[float, float]:
+    if trials <= 0:
+        return float("nan"), float("nan")
+    p = successes / trials
+    denom = 1.0 + z * z / trials
+    center = (p + z * z / (2.0 * trials)) / denom
+    half = z * math.sqrt((p * (1.0 - p) + z * z / (4.0 * trials)) / trials) / denom
+    return center - half, center + half
+
+
+def build_homotopy_modes_for_obstacles(
+    start: Array,
+    goal: Array,
+    obstacles: Sequence,
+    scale: float,
+    bounds_xy,
+    bounds_ranges,
+    swarm_seed: int,
+) -> List[MPPIHomotopyMode]:
+    gen_out = run_swarm_planner(
+        start=start,
+        goal=goal,
+        obstacles=obstacles,
+        scale=scale,
+        bounds_xy=bounds_xy,
+        seed=swarm_seed,
+    )
+    mixture = fit_topological_trajectory_mixture(
+        gen_out,
+        obstacles,
+        K=50,
+        beta=1.0,
+        min_mode_samples=3,
+        covariance_jitter=2e-4,
+        bounds=bounds_ranges,
+        goal=goal,
+        snap_to_goal_radius=0.2,
+        snap_straight_tail_points=8,
+    )
+    return mixture_to_mppi_modes(mixture)
+
+
+def save_robustness_summaries(
+    detail_csv: str,
+    summary_csv: str,
+    scenario_summary_csv: str,
+    success_per_scenario_csv: str,
+):
+    if pd is None:
+        print("pandas unavailable; detailed CSV was saved, summary CSVs were skipped.")
+        return
+
+    df = pd.read_csv(detail_csv)
+    completed = df[df["failure_reason"] != "controller_error"].copy()
+
+    rows = []
+    for (condition, variant), all_group in df.groupby(["condition", "variant"], sort=True):
+        group = all_group[all_group["failure_reason"] != "controller_error"]
+        n = int(len(group))
+        successes = int(group["success"].sum()) if n else 0
+        exposed = group[group["exposed_to_blocker"] == True]  # noqa: E712
+        exposed_n = int(len(exposed))
+        exposed_successes = int(exposed["success"].sum()) if exposed_n else 0
+        lo, hi = wilson_interval(successes, n)
+        rows.append({
+            "condition": condition,
+            "variant": variant,
+            "trials": n,
+            "successes": successes,
+            "success_rate": successes / n if n else np.nan,
+            "success_ci95_low": lo,
+            "success_ci95_high": hi,
+            "exposed_trials": exposed_n,
+            "exposed_success_rate": (
+                exposed_successes / exposed_n if exposed_n else np.nan
+            ),
+            "collision_rate": float(group["collision"].mean()) if n else np.nan,
+            "not_reaching_rate": float(group["not_reaching"].mean()) if n else np.nan,
+            "mean_min_clearance_after_block": (
+                float(group["min_clearance_after_block"].mean()) if n else np.nan
+            ),
+            "mean_final_dist": float(group["final_dist"].mean()) if n else np.nan,
+            "mean_steps_after_block": float(group["steps_after_block"].mean()) if n else np.nan,
+            "mean_runtime_per_step_sec": (
+                float(group["runtime_per_step_sec"].mean()) if n else np.nan
+            ),
+            "controller_errors": int((all_group["failure_reason"] == "controller_error").sum()),
+        })
+    pd.DataFrame(rows).to_csv(summary_csv, index=False)
+
+    by_scenario = completed.groupby(
+        ["condition", "scenario_id", "variant"], sort=True
+    ).agg(
+        trials=("success", "size"),
+        successes=("success", "sum"),
+        success_rate=("success", "mean"),
+        collision_rate=("collision", "mean"),
+        not_reaching_rate=("not_reaching", "mean"),
+        exposed_rate=("exposed_to_blocker", "mean"),
+        mean_activation_step=("activation_step", "mean"),
+        mean_activation_progress=("activation_progress", "mean"),
+        mean_min_clearance_after_block=("min_clearance_after_block", "mean"),
+        mean_final_dist=("final_dist", "mean"),
+    ).reset_index()
+    by_scenario.to_csv(scenario_summary_csv, index=False)
+
+    # Compact matrix requested for quickly comparing success by scenario.
+    success_matrix = by_scenario.pivot_table(
+        index=["condition", "scenario_id"],
+        columns="variant",
+        values="success_rate",
+        aggfunc="first",
+    )
+    success_matrix.to_csv(success_per_scenario_csv)
+
+
+def main_dynamic_robustness():
+    """Run paired robustness trials with randomized obstacle-center layouts.
+
+    For each controller seed, obstacle polygon shapes are reassigned to the
+    original obstacle centers using a seeded derangement. The same permuted
+    layout is shared by every controller variant and every condition for that
+    seed. Dynamic and static walls are built once from the original scene, so
+    their geometry remains fixed even though obstacle shapes exchange centers.
+    """
+    controller_seeds = RUN_SEEDS
+    swarm_seeds = [RUN_SWARM_SEED]
+    scenarios = default_dynamic_wall_scenarios()
+    max_steps = 130
+    goal_tolerance = 0.30
+    activation_preview_clearance = 0.75
+
+    variants = [
+        ControllerVariant.FULL_SWARM_PRIOR_MPPI,
+        ControllerVariant.GAUSSIAN_PRIOR_MPPI,
+        ControllerVariant.EMPIRICAL_INIT_MPPI,
+        ControllerVariant.HOMOTOPY_SEEDED_MPPI,
+        ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        ControllerVariant.FRENET_CORRIDOR_MPPI,
+        ControllerVariant.HEATMAP_PRIOR_MPPI,
+        ControllerVariant.CONTROL_BANK_MPPI,
+        ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI,
+        ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
+        ControllerVariant.STANDARD_MPPI,
+    ]
+
+    # Stronger topology/reference priors than the previous smoke-test setup.
+    # Applied-control low-pass filtering is disabled for immediate reaction.
+    cfg = MPPIConfig(
+        horizon=28,
+        num_rollouts=650,
+        dt=0.12,
+        base_safety_margin=0.0,
+        use_soft_obstacle_cost=False,
+        enable_hard_collision_filter=True,
+        hard_collision_clearance_buffer=0.0,
+        suppress_blocked_modes=False,
+        max_empirical_nominals_per_mode=16,
+        swarm_init_probability=0.60,
+        sigma_floor=0.25,
+        max_precision=10.0,
+        w_reference_tracking=1.20,
+        w_control_smooth=0.40,
+        smooth_v_weight=0.5,
+        smooth_omega_weight=2.0,
+        w_heading=0.0,
+        w_mode_prior=0.25,
+        uncertainty_margin_gain=0.25,
+        apply_control_lowpass=False,
+        control_lowpass_alpha=0.0,
+        w_corridor=12.0,
+        corridor_radius_base=0.35,
+        corridor_radius_scale=1.25,
+        corridor_radius_min=0.30,
+        corridor_radius_max=1.20,
+        w_heatmap=4.5,
+        heatmap_sigma_scale=1.4,
+        mode_select_top_k=4,
+        mode_select_min_rollouts_per_mode=64,
+    )
+
+    scale, bounds_xy, bounds_ranges, start, goal, original_obstacles = build_default_scene()
+    for scenario in scenarios:
+        validate_dynamic_wall_scenario(scenario, len(original_obstacles))
+
+    # Freeze the original spatial center anchors before any obstacle swapping.
+    # Wall-pair indices refer to these center slots, not to obstacle identities.
+    fixed_wall_centers = tuple(
+        obstacle_center(obs).copy()
+        for obs in original_obstacles
+    )
+
+    # Build walls from the frozen anchors exactly once. These objects are reused
+    # for every randomized obstacle layout, so wall positions never move.
+    fixed_blockers = {
+        scenario.scenario_id: make_wall_blockers_between_centers(
+            centers=fixed_wall_centers,
+            pairs=scenario.wall_pairs,
+            width=scenario.wall_width,
+            extension=scenario.wall_extension,
+        )
+        for scenario in scenarios
+    }
+
+    detail_csv = "dynamic_block_hard_robustness_trials.csv"
+    summary_csv = "dynamic_block_hard_robustness_summary.csv"
+    scenario_summary_csv = "dynamic_block_hard_robustness_by_scenario.csv"
+    success_per_scenario_csv = "dynamic_block_hard_success_per_scenario.csv"
+
+    for output_path in (
+        detail_csv,
+        summary_csv,
+        scenario_summary_csv,
+        success_per_scenario_csv,
+    ):
+        output = Path(output_path)
+        if output.exists():
+            output.unlink()
+
+    fieldnames = [
+        "condition", "variant", "swarm_seed", "controller_seed", "seed",
+        "obstacle_layout_seed", "obstacle_center_permutation",
+        "scenario_id", "wall_pairs", "wall_count", "wall_width",
+        "wall_extension", "trigger_progress", "activation_preview_clearance",
+        "activation_step", "activation_progress", "activation_reason",
+        "activation_clearance", "block_step", "success", "failure_reason",
+        "reached_goal", "collision", "not_reaching", "first_collision_step",
+        "collision_after_block", "exposed_to_blocker",
+        "goal_reached_before_block", "selected_mode_switches",
+        "last_selected_mode", "final_dist", "min_clearance_dynamic",
+        "min_clearance_after_block", "path_length", "path_length_after_block",
+        "control_effort", "control_effort_after_block", "control_smoothness",
+        "control_smoothness_after_block", "steps", "steps_after_block",
+        "runtime_sec", "runtime_per_step_sec", "goal_tolerance", "error",
+    ]
+
+    trials_per_layout = (1 + 2 * len(scenarios)) * len(variants)
+    total = len(swarm_seeds) * len(controller_seeds) * trials_per_layout
+    trial_index = 0
+
+    def execute_condition_trials(
+        *,
+        condition: str,
+        scenario_id: str,
+        wall_pairs: Tuple[Tuple[int, int], ...],
+        wall_width: float,
+        wall_extension: float,
+        trigger_progress: Optional[float],
+        modes: Optional[List[MPPIHomotopyMode]],
+        controller_base_obstacles: Sequence,
+        blocker,
+        blocker_active_from_start: bool,
+        swarm_seed: int,
+        controller_seed: int,
+        obstacle_layout_seed: int,
+        obstacle_center_permutation: Tuple[int, ...],
+        setup_error: str = "",
+    ) -> None:
+        nonlocal trial_index
+        wall_pairs_text = ";".join(f"{i}-{j}" for i, j in wall_pairs)
+        permutation_text = obstacle_center_permutation_text(
+            obstacle_center_permutation
+        )
+
+        for variant in variants:
+            trial_index += 1
+            print(
+                f"[{trial_index}/{total}] {condition}/{scenario_id} "
+                f"layout={obstacle_layout_seed} seed={controller_seed} "
+                f"variant={variant.value}"
+            )
+            base_row = {
+                "condition": condition,
+                "variant": variant.value,
+                "swarm_seed": swarm_seed,
+                "controller_seed": controller_seed,
+                "seed": controller_seed,
+                "obstacle_layout_seed": obstacle_layout_seed,
+                "obstacle_center_permutation": permutation_text,
+                "scenario_id": scenario_id,
+                "wall_pairs": wall_pairs_text,
+                "wall_count": len(wall_pairs),
+                "wall_width": wall_width,
+                "wall_extension": wall_extension,
+                "trigger_progress": trigger_progress,
+                "activation_preview_clearance": activation_preview_clearance,
+                "goal_tolerance": goal_tolerance,
+                "error": setup_error,
+            }
+
+            if setup_error or modes is None:
+                row = dict(base_row)
+                row.update({
+                    "success": False,
+                    "failure_reason": "controller_error",
+                    "reached_goal": False,
+                    "collision": False,
+                    "not_reaching": False,
+                })
+            else:
+                try:
+                    result = run_dynamic_blockage_controller(
+                        variant=variant,
+                        modes=modes,
+                        base_obstacles=controller_base_obstacles,
+                        blocker=blocker,
+                        start=start,
+                        goal=goal,
+                        seed=controller_seed,
+                        trigger_progress=trigger_progress,
+                        activation_preview_clearance=activation_preview_clearance,
+                        blocker_active_from_start=blocker_active_from_start,
+                        condition=condition,
+                        max_steps=max_steps,
+                        goal_tolerance=goal_tolerance,
+                        mppi_cfg=cfg,
+                        record_infos=False,
+                        record_obstacle_history=False,
+                    )
+                    row = summarize_dynamic_result(
+                        result,
+                        controller_base_obstacles,
+                        blocker,
+                        goal,
+                        cfg.robot_radius,
+                        goal_tolerance=goal_tolerance,
+                    )
+                    row.update(base_row)
+                except Exception as exc:
+                    row = dict(base_row)
+                    row.update({
+                        "success": False,
+                        "failure_reason": "controller_error",
+                        "reached_goal": False,
+                        "collision": False,
+                        "not_reaching": False,
+                        "error": repr(exc),
+                    })
+
+            append_csv_row(detail_csv, row, fieldnames)
+            print(
+                f"  success={row.get('success')} "
+                f"failure={row.get('failure_reason') or '-'} "
+                f"activation={row.get('activation_step')}"
+            )
+
+    for swarm_seed in swarm_seeds:
+        for controller_seed in controller_seeds:
+            # Use controller_seed as the layout seed so all swarm seeds, variants,
+            # and wall conditions can be compared on the same obstacle layouts.
+            obstacle_layout_seed = int(controller_seed)
+            swapped_obstacles, center_permutation = random_obstacle_center_swap(
+                original_obstacles,
+                seed=obstacle_layout_seed,
+            )
+            print(
+                "Obstacle-center layout "
+                f"seed={obstacle_layout_seed}: "
+                f"{obstacle_center_permutation_text(center_permutation)}"
+            )
+
+            try:
+                print(
+                    "Building no-wall/dynamic prior for randomized obstacle "
+                    f"layout {obstacle_layout_seed}, swarm seed {swarm_seed}..."
+                )
+                base_modes = build_homotopy_modes_for_obstacles(
+                    start,
+                    goal,
+                    swapped_obstacles,
+                    scale,
+                    bounds_xy,
+                    bounds_ranges,
+                    swarm_seed,
+                )
+                base_setup_error = ""
+            except Exception as exc:
+                base_modes = None
+                base_setup_error = repr(exc)
+                print(f"  Random-layout prior failed: {base_setup_error}")
+
+            # Baseline 1: randomized obstacles, no wall.
+            execute_condition_trials(
+                condition="no_wall",
+                scenario_id="no_wall",
+                wall_pairs=tuple(),
+                wall_width=0.0,
+                wall_extension=0.0,
+                trigger_progress=None,
+                modes=base_modes,
+                controller_base_obstacles=swapped_obstacles,
+                blocker=[],
+                blocker_active_from_start=False,
+                swarm_seed=swarm_seed,
+                controller_seed=controller_seed,
+                obstacle_layout_seed=obstacle_layout_seed,
+                obstacle_center_permutation=center_permutation,
+                setup_error=base_setup_error,
+            )
+
+            for scenario in scenarios:
+                # This blocker was built from fixed_wall_centers, not from the
+                # swapped layout, and therefore stays on the original segment.
+                blocker = fixed_blockers[scenario.scenario_id]
+
+                # Main test: prior matches randomized obstacles but not the wall
+                # that appears later at the fixed original-scene position.
+                execute_condition_trials(
+                    condition="dynamic_wall",
+                    scenario_id=scenario.scenario_id,
+                    wall_pairs=scenario.wall_pairs,
+                    wall_width=scenario.wall_width,
+                    wall_extension=scenario.wall_extension,
+                    trigger_progress=scenario.trigger_progress,
+                    modes=base_modes,
+                    controller_base_obstacles=swapped_obstacles,
+                    blocker=blocker,
+                    blocker_active_from_start=False,
+                    swarm_seed=swarm_seed,
+                    controller_seed=controller_seed,
+                    obstacle_layout_seed=obstacle_layout_seed,
+                    obstacle_center_permutation=center_permutation,
+                    setup_error=base_setup_error,
+                )
+
+                # Baseline 2: oracle prior knows the fixed wall from t=0 while
+                # using the same randomized obstacle layout.
+                static_obstacles = list(swapped_obstacles) + list(blocker)
+                if base_setup_error:
+                    static_modes = None
+                    static_setup_error = base_setup_error
+                else:
+                    try:
+                        print(
+                            f"Building static-wall oracle prior for "
+                            f"{scenario.scenario_id}, layout "
+                            f"{obstacle_layout_seed}, swarm seed {swarm_seed}..."
+                        )
+                        static_modes = build_homotopy_modes_for_obstacles(
+                            start,
+                            goal,
+                            static_obstacles,
+                            scale,
+                            bounds_xy,
+                            bounds_ranges,
+                            swarm_seed,
+                        )
+                        static_setup_error = ""
+                    except Exception as exc:
+                        static_modes = None
+                        static_setup_error = repr(exc)
+                        print(f"  Static-wall prior failed: {static_setup_error}")
+
+                execute_condition_trials(
+                    condition="static_wall",
+                    scenario_id=scenario.scenario_id,
+                    wall_pairs=scenario.wall_pairs,
+                    wall_width=scenario.wall_width,
+                    wall_extension=scenario.wall_extension,
+                    trigger_progress=None,
+                    modes=static_modes,
+                    controller_base_obstacles=static_obstacles,
+                    blocker=[],
+                    blocker_active_from_start=True,
+                    swarm_seed=swarm_seed,
+                    controller_seed=controller_seed,
+                    obstacle_layout_seed=obstacle_layout_seed,
+                    obstacle_center_permutation=center_permutation,
+                    setup_error=static_setup_error,
+                )
+
+    save_robustness_summaries(
+        detail_csv,
+        summary_csv,
+        scenario_summary_csv,
+        success_per_scenario_csv,
+    )
+    print(f"Saved detailed trials: {detail_csv}")
+    if Path(summary_csv).exists():
+        print(f"Saved condition/variant summary: {summary_csv}")
+    if Path(scenario_summary_csv).exists():
+        print(f"Saved scenario summary: {scenario_summary_csv}")
+    if Path(success_per_scenario_csv).exists():
+        print(f"Saved success matrix: {success_per_scenario_csv}")
+
+
 if __name__ == "__main__":
-    main_dynamic_blockage()
+    main_dynamic_robustness()

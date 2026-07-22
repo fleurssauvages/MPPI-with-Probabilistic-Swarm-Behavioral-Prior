@@ -1,0 +1,10 @@
+condition,scenario_id,control_bank_mppi,corridor_prior_mppi,frenet_corridor_mppi,full_swarm_prior_mppi,gaussian_prior_mppi,heatmap_prior_mppi,mode_selecting_corridor_mppi,mode_selecting_homotopy_mppi,standard_mppi
+dynamic_wall,wall_0_1,1.0,1.0,1.0,1.0,1.0,1.0,0.0,0.0,0.0
+dynamic_wall,wall_0_2,1.0,0.0,1.0,1.0,1.0,0.0,1.0,1.0,0.0
+dynamic_wall,wall_1_2,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0
+dynamic_wall,walls_0_1__1_2,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0
+no_wall,no_wall,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0
+static_wall,wall_0_1,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0
+static_wall,wall_0_2,1.0,1.0,0.0,1.0,1.0,1.0,1.0,1.0,0.0
+static_wall,wall_1_2,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0
+static_wall,walls_0_1__1_2,1.0,1.0,1.0,1.0,1.0,1.0,1.0,1.0,0.0

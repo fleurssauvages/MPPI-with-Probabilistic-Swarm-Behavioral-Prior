@@ -1,0 +1,9 @@
+condition,variant,failure_reason,count,percent_of_failures,failure_trials,total_trials_with_outcome
+dynamic_wall,corridor_prior_mppi,not_reaching,1,100.0,1,4
+dynamic_wall,heatmap_prior_mppi,not_reaching,1,100.0,1,4
+dynamic_wall,mode_selecting_corridor_mppi,not_reaching,1,100.0,1,4
+dynamic_wall,mode_selecting_homotopy_mppi,not_reaching,1,100.0,1,4
+dynamic_wall,standard_mppi,not_reaching,4,100.0,4,4
+no_wall,standard_mppi,not_reaching,1,100.0,1,1
+static_wall,frenet_corridor_mppi,not_reaching,1,100.0,1,4
+static_wall,standard_mppi,not_reaching,4,100.0,4,4
