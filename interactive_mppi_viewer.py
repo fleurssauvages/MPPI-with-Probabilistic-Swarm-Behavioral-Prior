@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Interactive viewer matched to the runs(11).py MPPI navigation experiment.
+"""Interactive viewer matched to the revised runs(18).py MPPI navigation experiment.
 
 Run this file from the project root so the controller module can import
 geometry/, RL/, graph/, planner.py, and save/best_policy.pkl.
@@ -53,9 +53,8 @@ VARIANTS = [
     ("Gaussian prior", "gaussian_prior_mppi"),
     ("Full swarm prior", "full_swarm_prior_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
-    ("Frenet corridor", "frenet_corridor_mppi"),
-    ("Heatmap prior", "heatmap_prior_mppi"),
-    ("Mode-selecting homotopy", "mode_selecting_homotopy_mppi"),
+    ("Frenet prior", "frenet_corridor_mppi"),
+    ("Mode-selecting Gaussian", "mode_selecting_gaussian_mppi"),
     ("Mode-selecting corridor", "mode_selecting_corridor_mppi"),
 ]
 
@@ -147,7 +146,7 @@ def normalized_bounds(bounds_xy: Any) -> tuple[float, float, float, float]:
 
 
 def make_protocol_config(module: Any, num_rollouts: int) -> Any:
-    """Create the same aggressive protocol configuration used by runs(11)."""
+    """Create the protocol configuration used by the revised controller."""
     cfg = module.MPPIConfig()
     settings = {
         "horizon": 50,
@@ -157,24 +156,15 @@ def make_protocol_config(module: Any, num_rollouts: int) -> Any:
         "swarm_init_probability": 0.60,
         "sigma_floor": 0.25,
         "max_precision": 10.0,
-        "w_reference_tracking": 1.20,
         "w_control_smooth": 0.40,
         "smooth_v_weight": 0.5,
         "smooth_omega_weight": 2.0,
-        "w_heading": 0.0,
-        "w_mode_prior": 0.25,
-        "uncertainty_margin_gain": 0.25,
         "apply_control_lowpass": False,
         "control_lowpass_alpha": 0.0,
-        "w_corridor": 12.0,
-        "corridor_radius_base": 0.35,
-        "corridor_radius_scale": 1.25,
-        "corridor_radius_min": 0.30,
-        "corridor_radius_max": 1.20,
-        "w_heatmap": 4.5,
-        "heatmap_sigma_scale": 1.4,
         "mode_select_top_k": 4,
-        "mode_select_min_rollouts_per_mode": 64,
+        # A value of zero means that each mode receives num_rollouts in the
+        # revised mode-selecting implementation.
+        "mode_select_rollouts_per_mode": 0,
         "base_safety_margin": 0.0,
         "collision_substeps": 5,
         "hard_collision_clearance": 0.01,
@@ -182,8 +172,6 @@ def make_protocol_config(module: Any, num_rollouts: int) -> Any:
         "suppress_blocked_modes": True,
         "mode_blocking_clearance": 0.02,
         "mode_blocking_substeps": 2,
-        # Aggressive progress tuning. Reverse remains legal through v_min=-1.0,
-        # but stronger goal pressure and sharper soft-min selection favor forward progress.
         "v_min": -1.0,
         "v_max": 2.8,
         "w_goal": 110.0,
@@ -191,12 +179,12 @@ def make_protocol_config(module: Any, num_rollouts: int) -> Any:
         "lambda_temperature": 2.2,
         "max_delta_v": 0.70,
         "max_delta_omega": 1.40,
-        # Calm only the Gaussian/full-swarm proposal distribution. Corridor
-        # variants keep the aggressive settings that already work well.
+        # Use the same base control-space noise for every controller variant.
+        "noise_v": 0.50,
+        "noise_omega": 0.90,
+        # The full-swarm compatibility branch has separate field names.
         "gaussian_noise_v": 0.50,
         "gaussian_noise_omega": 0.90,
-        "gaussian_temporal_noise_smoothing": 0.90,
-        "gaussian_low_noise_fraction": 0.30,
     }
     for name, value in settings.items():
         if hasattr(cfg, name):
@@ -207,7 +195,7 @@ def make_protocol_config(module: Any, num_rollouts: int) -> Any:
 class InteractiveMPPIViewer:
     def __init__(self, root: tk.Tk, module_path: Path) -> None:
         self.root = root
-        self.root.title("Interactive MPPI viewer - runs(11)")
+        self.root.title("Interactive MPPI viewer - runs(18) revised")
         self.root.geometry("1450x900")
         self.root.minsize(1080, 700)
 
@@ -418,8 +406,8 @@ class InteractiveMPPIViewer:
             warm_cfg.horizon = min(int(getattr(warm_cfg, "horizon", 28)), 6)
         if hasattr(warm_cfg, "num_rollouts"):
             warm_cfg.num_rollouts = 32
-        if hasattr(warm_cfg, "mode_select_min_rollouts_per_mode"):
-            warm_cfg.mode_select_min_rollouts_per_mode = 8
+        if hasattr(warm_cfg, "mode_select_rollouts_per_mode"):
+            warm_cfg.mode_select_rollouts_per_mode = 8
         if hasattr(warm_cfg, "max_empirical_nominals_per_mode"):
             warm_cfg.max_empirical_nominals_per_mode = min(
                 int(getattr(warm_cfg, "max_empirical_nominals_per_mode", 16)), 2
@@ -885,7 +873,7 @@ class InteractiveMPPIViewer:
             f"{bundle.condition.replace('_', ' ')} | step {frame}/{len(states)-1}"
         )
         self.ax.set_title(title)
-        status = f"control: {control_text}\nprior mode: {mode_text}\nwall: {wall_state}"
+        status = f"control: {control_text}\ndisplayed mode: {mode_text}\nwall: {wall_state}"
         if extra_text:
             status += "\n" + extra_text
         self.ax.text(
@@ -903,7 +891,7 @@ class InteractiveMPPIViewer:
         legend_handles = [
             Line2D([0], [0], color="#1f77b4", linewidth=2.4, label="executed path"),
             Line2D([0], [0], color="#ff7f0e", linewidth=2.2, linestyle="--", label="MPPI output"),
-            Line2D([0], [0], color="#9467bd", linewidth=2.0, label="chosen prior"),
+            Line2D([0], [0], color="#9467bd", linewidth=2.0, label="displayed prior"),
         ]
         self.ax.legend(handles=legend_handles, loc="lower right", fontsize=8, framealpha=0.88)
 
@@ -1002,43 +990,85 @@ class InteractiveMPPIViewer:
         mean = np.asarray(local_mode.mean_path, dtype=float)
         self.ax.plot(mean[:, 0], mean[:, 1], color="#9467bd", linewidth=2.2, zorder=6)
 
-        gaussian_variants = {"gaussian_prior_mppi", "full_swarm_prior_mppi"}
-        empirical_variants = {
-            "control_bank_mppi",
-            "mode_selecting_homotopy_mppi",
+        gaussian_variants = {
+            "gaussian_prior_mppi",
+            "full_swarm_prior_mppi",
+            "mode_selecting_gaussian_mppi",
         }
+        empirical_variants = {"control_bank_mppi"}
         corridor_variants = {
             "corridor_prior_mppi",
-            "frenet_corridor_mppi",
             "mode_selecting_corridor_mppi",
         }
 
         if variant in gaussian_variants:
             self._draw_covariance_ellipses(local_mode)
+        elif variant == "frenet_corridor_mppi":
+            self._draw_frenet_covariance(local_mode)
         elif variant in empirical_variants:
             self._draw_empirical_samples(global_mode, state)
         elif variant in corridor_variants:
-            self._draw_corridor(local_mode, frenet=(variant == "frenet_corridor_mppi"))
-        elif variant == "heatmap_prior_mppi":
-            self._draw_heatmap_prior(local_mode)
+            # The revised corridor proposal uses fixed control-space noise around
+            # the mean nominal. No covariance-derived tube is drawn.
+            pass
 
     def _draw_covariance_ellipses(self, local_mode: Any) -> None:
+        """Draw one-standard-deviation Cartesian Gaussian proposal ellipses."""
+        assert self.bundle is not None
         mean = np.asarray(local_mode.mean_path, dtype=float)
         covariances = np.asarray(local_mode.cov_blocks, dtype=float)
+        variance_floor = float(getattr(self.bundle.cfg, "sigma_floor", 0.0)) ** 2
+        covariance_scale = float(getattr(self.bundle.cfg, "gaussian_covariance_scale", 1.0))
+
         for index in range(0, len(mean), 4):
             covariance = 0.5 * (covariances[index] + covariances[index].T)
             values, vectors = np.linalg.eigh(covariance)
-            values = np.maximum(values, 1e-8)
+            values = np.maximum(values, variance_floor)
             order = np.argsort(values)[::-1]
             values = values[order]
             vectors = vectors[:, order]
             angle = math.degrees(math.atan2(vectors[1, 0], vectors[0, 0]))
-            width, height = 2.0 * np.sqrt(values)
+            width, height = 2.0 * covariance_scale * np.sqrt(values)
             self.ax.add_patch(
                 Ellipse(
                     mean[index],
                     width=float(width),
                     height=float(height),
+                    angle=angle,
+                    facecolor="#9467bd",
+                    edgecolor="#9467bd",
+                    alpha=0.10,
+                    linewidth=0.8,
+                    zorder=2,
+                )
+            )
+
+    def _draw_frenet_covariance(self, local_mode: Any) -> None:
+        """Draw the tangent/normal covariance scales used by Frenet sampling."""
+        assert self.bundle is not None
+        mean = np.asarray(local_mode.mean_path, dtype=float)
+        covariances = np.asarray(local_mode.cov_blocks, dtype=float)
+        tangent = np.gradient(mean, axis=0)
+        tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
+        normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+        variance_floor = float(getattr(self.bundle.cfg, "sigma_floor", 0.0)) ** 2
+        lateral_scale = float(getattr(self.bundle.cfg, "frenet_lateral_noise_scale", 1.0))
+        longitudinal_scale = float(getattr(self.bundle.cfg, "frenet_longitudinal_noise_scale", 1.0))
+
+        for index in range(0, len(mean), 4):
+            covariance = 0.5 * (covariances[index] + covariances[index].T)
+            lateral_variance = max(
+                float(normal[index] @ covariance @ normal[index]), variance_floor
+            )
+            longitudinal_variance = max(
+                float(tangent[index] @ covariance @ tangent[index]), variance_floor
+            )
+            angle = math.degrees(math.atan2(tangent[index, 1], tangent[index, 0]))
+            self.ax.add_patch(
+                Ellipse(
+                    mean[index],
+                    width=2.0 * longitudinal_scale * math.sqrt(longitudinal_variance),
+                    height=2.0 * lateral_scale * math.sqrt(lateral_variance),
                     angle=angle,
                     facecolor="#9467bd",
                     edgecolor="#9467bd",
@@ -1067,74 +1097,6 @@ class InteractiveMPPIViewer:
                 linewidth=0.8,
                 alpha=0.18,
                 zorder=2,
-            )
-
-    def _draw_corridor(self, local_mode: Any, *, frenet: bool) -> None:
-        assert self.bundle is not None
-        try:
-            radius = np.asarray(
-                self.bundle.module.corridor_radius_from_mode(local_mode, self.bundle.cfg),
-                dtype=float,
-            )
-        except Exception:
-            covariances = np.asarray(local_mode.cov_blocks, dtype=float)
-            spread = np.sqrt(np.maximum(np.linalg.eigvalsh(covariances)[:, -1], 0.0))
-            radius = np.clip(
-                self.bundle.cfg.corridor_radius_base
-                + self.bundle.cfg.corridor_radius_scale * spread,
-                self.bundle.cfg.corridor_radius_min,
-                self.bundle.cfg.corridor_radius_max,
-            )
-        mean = np.asarray(local_mode.mean_path, dtype=float)
-        for index in range(0, len(mean), 3):
-            if frenet and index < len(mean) - 1:
-                tangent = mean[index + 1] - mean[index]
-                angle = math.degrees(math.atan2(tangent[1], tangent[0]))
-                self.ax.add_patch(
-                    Ellipse(
-                        mean[index],
-                        width=0.30,
-                        height=2.0 * float(radius[index]),
-                        angle=angle,
-                        facecolor="#9467bd",
-                        edgecolor="none",
-                        alpha=0.08,
-                        zorder=2,
-                    )
-                )
-            else:
-                self.ax.add_patch(
-                    Circle(
-                        mean[index],
-                        radius=float(radius[index]),
-                        facecolor="#9467bd",
-                        edgecolor="none",
-                        alpha=0.06,
-                        zorder=2,
-                    )
-                )
-
-    def _draw_heatmap_prior(self, local_mode: Any) -> None:
-        assert self.bundle is not None
-        mean = np.asarray(local_mode.mean_path, dtype=float)
-        try:
-            radius = np.asarray(
-                self.bundle.module.corridor_radius_from_mode(local_mode, self.bundle.cfg),
-                dtype=float,
-            )
-        except Exception:
-            radius = np.full(len(mean), 0.5, dtype=float)
-        sigma = float(self.bundle.cfg.heatmap_sigma_scale) * radius
-        for index in range(0, len(mean), 2):
-            self.ax.add_patch(
-                Circle(
-                    mean[index],
-                    radius=float(sigma[index]),
-                    facecolor="#9467bd",
-                    edgecolor="none",
-                    alpha=0.035,
-                    zorder=2,
-                )
             )
 
     def _draw_robot(self, state: np.ndarray) -> None:
@@ -1174,6 +1136,8 @@ def main() -> None:
     module_path = first_existing_path(
         args.module,
         [
+            "runs(18)_revised.py",
+            "runs(18).py",
             "runs(11)_shared_aggressive_config.py",
             "runs(11).py",
             "runs_soft_optimized.py",

@@ -19,7 +19,7 @@ metric. Continuous metrics are reported as mean +/- standard deviation.
 Success is reported as a count and percentage, without a binary standard
 deviation. Failure reasons are reported as counts and percentages among failed
 trials. Control roughness, control effort, and steps are calculated only over
-successful trials. Average runtime per step is calculated over all trials with
+successful trials. Average runtime per step is calculated only over successful trials with
 valid values.
 
 Default input:
@@ -131,6 +131,7 @@ SUCCESS_ONLY_METRICS = {
     "control_smoothness_after",
     "control_effort",
     "steps",
+    "runtime_per_step_sec",
 }
 
 
@@ -144,7 +145,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--input",
-        default="dynamic_block_robustness_trials.csv",
+        default="dynamic_block_long_robustness_trials.csv",
         help="Detailed trial CSV produced by dynamic_block_robustness.py.",
     )
     parser.add_argument(
@@ -158,7 +159,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--output-prefix",
-        default="dynamic_block_robustness_selected",
+        default="dynamic_block_long_robustness_selected",
         help="Prefix used for generated CSV and PDF files.",
     )
     parser.add_argument(
@@ -585,7 +586,7 @@ def render_pdf_table(
                 "Selected robustness metrics\n"
                 f"Continuous values: mean +/- {std_name}; "
                 "control roughness is mean per transition (lower is smoother); "
-                "roughness/effort/steps: successful trials only",
+                "roughness/effort/steps/runtime: successful trials only",
                 compact_columns,
             ),
             ("Failure reasons\nCounts and percentages among failed trials", failure_columns),
@@ -693,7 +694,7 @@ def main() -> None:
         "explicit pre-wall column; overall roughness is not relabeled as before-wall"
     )
     print("Control roughness, control effort, and steps: successful trials only")
-    print("Average time per step: all trials with valid values")
+    print("Average time per step: successful trials only")
     print(f"Saved continuous mean/SD data: {long_csv}")
     print(f"Saved formatted summary: {wide_csv}")
     print(f"Saved failure-reason data: {failure_csv}")

@@ -15,7 +15,7 @@ import csv
 import math
 import pickle
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Sequence
@@ -60,7 +60,7 @@ Array = np.ndarray
 # Config
 # =============================================================================
 
-RUN_SEEDS = list(range(1))          # Increase to 20-50 for real experiments.
+RUN_SEEDS = list(range(100))          # Increase to 20-50 for real experiments.
 RUN_SWARM_SEED = 5
 OUTPUT_PREFIX = "dynamic_block_soft"
 
@@ -69,22 +69,22 @@ class ControllerVariant(str, Enum):
     FULL_SWARM_PRIOR_MPPI = "full_swarm_prior_mppi"
     GAUSSIAN_PRIOR_MPPI = "gaussian_prior_mppi"
 
-    # Stable representation variants.
+    # Proposal-distribution variants.
     CORRIDOR_PRIOR_MPPI = "corridor_prior_mppi"
     FRENET_CORRIDOR_MPPI = "frenet_corridor_mppi"
-    HEATMAP_PRIOR_MPPI = "heatmap_prior_mppi"
     CONTROL_BANK_MPPI = "control_bank_mppi"
-    MODE_SELECTING_HOMOTOPY_MPPI = "mode_selecting_homotopy_mppi"
+    MODE_SELECTING_GAUSSIAN_MPPI = "mode_selecting_gaussian_mppi"
     MODE_SELECTING_CORRIDOR_MPPI = "mode_selecting_corridor_mppi"
 
     STANDARD_MPPI = "standard_mppi"
+    STANDARD_MPPI_128 = "standard_mppi_128_rollouts"
 
 
 @dataclass
 class MPPIConfig:
     dt: float = 0.12
     horizon: int = 50
-    num_rollouts: int = 32
+    num_rollouts: int = 64
     lambda_temperature: float = 2.2
 
     v_min: float = -1.0
@@ -93,13 +93,18 @@ class MPPIConfig:
     omega_max: float = 4.5
 
     # Default exploration used by corridor and other control-space proposal variants.
-    noise_v: float = 0.90
-    noise_omega: float = 1.50
+    noise_v: float = 0.5
+    noise_omega: float = 0.9
     temporal_noise_smoothing: float = 0.72
 
-    # Gaussian/full-swarm proposals are already concentrated by their trajectory prior.
-    gaussian_noise_v: float = 0.50
-    gaussian_noise_omega: float = 0.90
+    # Legacy control-space exploration retained for the full-swarm controller.
+    gaussian_noise_v: float = 0.5
+    gaussian_noise_omega: float = 0.9
+
+    # Cartesian Gaussian proposal: sample path offsets from the time-indexed
+    # covariance blocks, then add only a small residual control perturbation.
+    gaussian_covariance_scale: float = 1.0
+    gaussian_control_noise_scale: float = 0.15
 
     swarm_init_probability: float = 0.60
     max_empirical_nominals_per_mode: int = 16
@@ -137,9 +142,9 @@ class MPPIConfig:
     w_mode_prior: float = 0.25
     sigma_floor: float = 0.25
 
-    # Explicit Cartesian/Gaussian reference tracking has been removed.
-    # Priors affect proposal sampling, mode probabilities, and uncertainty margins only.
-    # Deprecated compatibility field. Reference tracking is intentionally disabled.
+    # Explicit reference tracking remains disabled. Learned priors affect
+    # proposal sampling and, for dedicated variants, discrete mode selection.
+    # Deprecated compatibility field retained for the legacy full-swarm path.
     w_reference_tracking: float = 1.20
 
     # Penalize yaw-rate changes more than velocity changes. For a unicycle,
@@ -178,22 +183,8 @@ class MPPIConfig:
     terminal_heading_deadzone: float = 0.45
     terminal_blend_power: float = 1.5
 
-    # Stable representation settings.
-    # Corridor/Frenet variants penalize leaving a topological tube rather than
-    # tracking a Cartesian Gaussian mean at every time index.
-    # Deprecated compatibility field; corridor information affects proposals only.
-    w_corridor: float = 12.0
-    corridor_radius_base: float = 0.35
-    corridor_radius_scale: float = 1.25
-    corridor_radius_min: float = 0.30
-    corridor_radius_max: float = 1.20
-
-    # Heatmap-like prior implemented as a smooth radial potential around the
-    # homotopy centerline, without building a grid.
-    # Representation-specific cost weights are retained only for backward
-    # compatibility. All controller variants now use the same base MPPI cost.
-    w_heatmap: float = 4.5
-    heatmap_sigma_scale: float = 1.4
+    # Proposal variants all use the same rollout objective. Corridor uses
+    # default control-space noise around the localized mean-path nominal.
 
     # Frenet proposal parameters. These change only the rollout distribution:
     # trajectories are perturbed longitudinally and laterally in the local path
@@ -205,18 +196,20 @@ class MPPIConfig:
     # Proposal shaping: retain exact/low-noise priors and prefer moving
     # arcs over rotation in place. The execution safety filter may still
     # reduce forward velocity to zero when the next endpoint is unsafe.
-    low_noise_proposal_count: int = 24
+    low_noise_proposal_count: int = 0
     low_noise_proposal_scale: float = 0.15
     min_curve_speed: float = 0.16
 
     # Per-homotopy mode-selection settings.
     mode_select_top_k: int = 4
-    mode_select_min_rollouts_per_mode: int = 64
+    # Zero means one full cfg.num_rollouts MPPI optimization per retained mode.
+    mode_select_rollouts_per_mode: int = 0
     prior_screen_rollouts_per_mode: int = 16
     max_nearby_prior_modes: int = 3
     nearby_prior_distance_slack: float = 0.75
     nearby_prior_blocked_penalty: float = 1.25
     goal_acceptance_epsilon: float = 0.005
+
 
 
 
@@ -1082,124 +1075,6 @@ if njit is not None:
 
 
     @njit(cache=True)
-    def stable_representation_costs_nb(
-        X,
-        U,
-        mean_path,
-        corridor_radius,
-        mode_probability,
-        circle_centers,
-        circle_radii,
-        goal,
-        horizon,
-        robot_radius,
-        base_safety_margin,
-        w_goal,
-        w_obstacle,
-        w_control,
-        w_control_smooth,
-        smooth_v_weight,
-        smooth_omega_weight,
-        w_corridor,
-        w_heatmap,
-        heatmap_sigma_scale,
-        w_mode_prior,
-        rep_type,
-        use_mode_prior,
-    ):
-        """
-        Fast cost for stable homotopy representations.
-
-        rep_type:
-            0 = no representation cost, only current goal/obstacle/control cost
-            1 = soft corridor around centerline
-            2 = Frenet/lateral corridor around centerline
-            3 = heatmap-like radial prior around centerline
-            4 = control-bank/proposal only, no representation cost
-        """
-        N = U.shape[0]
-        H = horizon
-        M = circle_radii.shape[0]
-        costs = np.zeros(N, dtype=np.float64)
-
-        for n in range(N):
-            cost = 0.0
-
-            for t in range(H):
-                px = X[n, t + 1, 0]
-                py = X[n, t + 1, 1]
-
-                # Running goal cost at every predicted state. Divide by H so
-                # w_goal keeps approximately the same scale as the old terminal cost.
-                gx = px - goal[0]
-                gy = py - goal[1]
-                cost += (w_goal / H) * (gx * gx + gy * gy)
-
-                mux = mean_path[t, 0]
-                muy = mean_path[t, 1]
-                ex = px - mux
-                ey = py - muy
-                r = corridor_radius[t]
-
-                if rep_type == 1:
-                    dcen = math.sqrt(ex * ex + ey * ey)
-                    outside = dcen - r
-                    sp = _softplus_scalar_nb(6.0 * outside)
-                    cost += w_corridor * sp * sp
-
-                elif rep_type == 2:
-                    if t < H - 1:
-                        tx = mean_path[t + 1, 0] - mean_path[t, 0]
-                        ty = mean_path[t + 1, 1] - mean_path[t, 1]
-                    else:
-                        tx = mean_path[t, 0] - mean_path[t - 1, 0]
-                        ty = mean_path[t, 1] - mean_path[t - 1, 1]
-
-                    norm_t = math.sqrt(tx * tx + ty * ty) + 1e-12
-                    nx = -ty / norm_t
-                    ny = tx / norm_t
-                    lateral = abs(ex * nx + ey * ny)
-                    outside = lateral - r
-                    sp = _softplus_scalar_nb(6.0 * outside)
-                    cost += w_corridor * sp * sp
-
-                elif rep_type == 3:
-                    dcen = math.sqrt(ex * ex + ey * ey)
-                    sigma = heatmap_sigma_scale * (r + 1e-9)
-                    q = dcen / sigma
-                    heat_cost = 1.0 - math.exp(-0.5 * q * q)
-                    cost += w_heatmap * heat_cost
-
-                for j in range(M):
-                    dx = px - circle_centers[j, 0]
-                    dy = py - circle_centers[j, 1]
-                    d = math.sqrt(dx * dx + dy * dy) - circle_radii[j]
-                    margin = robot_radius + base_safety_margin
-                    sp = _softplus_scalar_nb(8.0 * (margin - d))
-                    cost += w_obstacle * sp * sp
-
-            ctrl_cost = 0.0
-            for t in range(H):
-                v = U[n, t, 0]
-                om = U[n, t, 1]
-                ctrl_cost += v * v + 0.15 * om * om
-            cost += w_control * ctrl_cost
-
-            smooth_cost = 0.0
-            for t in range(H - 1):
-                dv = U[n, t + 1, 0] - U[n, t, 0]
-                dom = U[n, t + 1, 1] - U[n, t, 1]
-                smooth_cost += smooth_v_weight * dv * dv + smooth_omega_weight * dom * dom
-            cost += w_control_smooth * smooth_cost
-
-            if use_mode_prior:
-                cost += w_mode_prior * (-math.log(mode_probability + 1e-12))
-
-            costs[n] = cost
-
-        return costs
-
-    @njit(cache=True)
     def standard_mppi_costs_batch_nb(
         X,
         U,
@@ -1399,7 +1274,6 @@ else:
     nominal_controls_to_goal_nb = None
     temporal_smooth_noise_nb = None
     fast_swarm_prior_costs_nb = None
-    stable_representation_costs_nb = None
     standard_mppi_costs_batch_nb = None
     interpolated_obstacle_penalty_nb = None
     min_clearance_nb = None
@@ -1943,32 +1817,10 @@ def standard_mppi_costs_batch(
 # Proposal-distribution MPPI variants
 # =============================================================================
 
-REP_NONE = 0
-REP_CORRIDOR = 1
-REP_FRENET = 2
-REP_HEATMAP = 3
+REP_GAUSSIAN = 1
+REP_CORRIDOR = 2
+REP_FRENET = 3
 REP_CONTROL_BANK = 4
-
-
-def corridor_radius_from_mode(mode: MPPIHomotopyMode, cfg: MPPIConfig) -> Array:
-    """
-    Convert per-time covariance blocks into a scalar corridor radius.
-
-    This uses covariance as corridor width, not inverse precision. It is
-    therefore much more stable than Mahalanobis trajectory tracking.
-    """
-    K = mode.cov_blocks.shape[0]
-    r = np.zeros(K, dtype=np.float64)
-    for t in range(K):
-        S = 0.5 * (mode.cov_blocks[t] + mode.cov_blocks[t].T)
-        vals = np.linalg.eigvalsh(S)
-        spread = math.sqrt(max(float(np.max(vals)), 0.0) + cfg.sigma_floor ** 2)
-        r[t] = np.clip(
-            cfg.corridor_radius_base + cfg.corridor_radius_scale * spread,
-            cfg.corridor_radius_min,
-            cfg.corridor_radius_max,
-        )
-    return r
 
 
 def stable_representation_costs(
@@ -2014,22 +1866,29 @@ def build_nominal_bank_for_mode(
     use_mean_nominal: bool,
     previous_idx: Optional[int] = None,
 ) -> List[Array]:
+    goal_nominal = nominal_controls_to_goal(x_current, goal, cfg)
     if use_mean_nominal:
         mean_nominal = nominal_controls_to_track_path(x_current, local_mode.mean_path, cfg)
     else:
-        mean_nominal = nominal_controls_to_goal(x_current, goal, cfg)
+        mean_nominal = goal_nominal
 
-    if not use_empirical_init:
-        return [mean_nominal]
+    if use_empirical_init:
+        bank = build_empirical_nominal_bank(
+            x_current=x_current,
+            global_mode=global_mode,
+            mean_nominal=mean_nominal,
+            cfg=cfg,
+            rng=rng,
+            previous_idx=previous_idx,
+        )
+    else:
+        bank = [mean_nominal]
 
-    return build_empirical_nominal_bank(
-        x_current=x_current,
-        global_mode=global_mode,
-        mean_nominal=mean_nominal,
-        cfg=cfg,
-        rng=rng,
-        previous_idx=previous_idx,
-    )
+    # Every prior-based variant receives one exact direct-to-goal proposal.
+    # This is an additional proposal only; it does not alter the shared cost.
+    if not any(np.allclose(candidate, goal_nominal) for candidate in bank):
+        bank.append(goal_nominal)
+    return bank
 
 
 def enforce_forward_curve_proposals(U: Array, cfg: MPPIConfig) -> Array:
@@ -2087,6 +1946,72 @@ def sample_controls_from_nominal_bank(
         )
         cursor += 1
 
+    return enforce_forward_curve_proposals(U, cfg)
+
+
+def sample_gaussian_controls(
+    x_current: Array,
+    local_mode: MPPIHomotopyMode,
+    n: int,
+    cfg: MPPIConfig,
+    rng: np.random.Generator,
+) -> Array:
+    """Sample Cartesian path proposals from the mode Gaussian.
+
+    At each prediction index, offsets are drawn from the localized 2-D
+    covariance block Sigma_{h,t}. The offsets are smoothed over time for
+    dynamically usable paths, converted to unicycle controls, and optionally
+    given a small residual control perturbation. Rollout scoring remains the
+    common task objective.
+    """
+    H = int(cfg.horizon)
+    if n <= 0:
+        return np.zeros((0, H, 2), dtype=np.float64)
+
+    mean_path = np.asarray(local_mode.mean_path, dtype=np.float64)
+    if len(mean_path) != H:
+        mean_path = resample_path(mean_path, H)
+
+    offsets = np.zeros((n, H, 2), dtype=np.float64)
+    covariance_scale = max(0.0, float(cfg.gaussian_covariance_scale))
+    variance_floor = float(cfg.sigma_floor) ** 2
+
+    for t in range(H):
+        S = 0.5 * (
+            np.asarray(local_mode.cov_blocks[t], dtype=np.float64)
+            + np.asarray(local_mode.cov_blocks[t], dtype=np.float64).T
+        )
+        values, vectors = np.linalg.eigh(S)
+        values = np.maximum(values, variance_floor)
+        transform = vectors @ np.diag(np.sqrt(values))
+        offsets[:, t, :] = (
+            rng.normal(size=(n, 2)) @ transform.T
+        ) * covariance_scale
+
+    # Smooth the sampled Cartesian offsets and release them gradually from the
+    # current state. The first proposal remains the exact Gaussian mean path.
+    alpha = float(np.clip(cfg.temporal_noise_smoothing, 0.0, 0.98))
+    for t in range(1, H):
+        offsets[:, t, :] = (
+            alpha * offsets[:, t - 1, :]
+            + (1.0 - alpha) * offsets[:, t, :]
+        )
+    offsets *= np.linspace(0.0, 1.0, H, dtype=np.float64)[None, :, None]
+
+    low_noise_count = min(max(1, int(cfg.low_noise_proposal_count)), n)
+    offsets[:low_noise_count] *= float(cfg.low_noise_proposal_scale)
+    offsets[0, :, :] = 0.0
+
+    U = np.zeros((n, H, 2), dtype=np.float64)
+    for i in range(n):
+        path_i = mean_path + offsets[i]
+        U[i] = nominal_controls_to_track_path(x_current, path_i, cfg)
+
+    if n > 1 and cfg.gaussian_control_noise_scale > 0.0:
+        residual = make_temporally_correlated_noise(n - 1, H, cfg, rng)
+        U[1:] += float(cfg.gaussian_control_noise_scale) * residual
+
+    U[0] = nominal_controls_to_track_path(x_current, mean_path, cfg)
     return enforce_forward_curve_proposals(U, cfg)
 
 
@@ -2206,6 +2131,15 @@ def nearby_mode_indices(
     return [int(item[2]) for item in scores[:limit]]
 
 
+
+
+def balanced_rollout_counts(total: int, groups: int) -> List[int]:
+    """Split a fixed rollout budget across groups, with counts summing to total."""
+    total = max(1, int(total))
+    groups = max(1, min(int(groups), total))
+    base, remainder = divmod(total, groups)
+    return [base + (1 if i < remainder else 0) for i in range(groups)]
+
 def stable_swarm_mppi_step(
     x_current: Array,
     global_modes: List[MPPIHomotopyMode],
@@ -2215,93 +2149,79 @@ def stable_swarm_mppi_step(
     rng: np.random.Generator,
     *,
     rep_type: int,
-    use_pi_sampling: bool,
     use_empirical_init: bool,
     use_mean_nominal: bool,
     use_mode_prior: bool,
     progress_by_mode: Optional[Dict[str, int]] = None,
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
     record_optimal_traj: bool = True,
-    select_mode_before_averaging: bool = False,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
-    progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
+    """Pooled prior-proposal MPPI with one fixed total rollout budget.
 
+    Gaussian, corridor, Frenet, and control-bank variants differ only in how
+    their proposals are generated. Rollouts from all retained modes are pooled
+    before the single MPPI weighted update.
+    """
+    if rep_type not in {
+        REP_GAUSSIAN, REP_CORRIDOR, REP_FRENET, REP_CONTROL_BANK
+    }:
+        raise ValueError(f"Unsupported pooled proposal representation: {rep_type}")
+
+    progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
+
     nearby_indices = nearby_mode_indices(global_modes, x_current, cfg, obstacle_circles)
     candidate_global_modes = [global_modes[i] for i in nearby_indices]
     local_modes = []
     new_progress_by_mode = dict(progress_by_mode)
-    for m in candidate_global_modes:
-        key = str(m.signature)
-        prev = progress_by_mode.get(key)
-        local_m, idx = localize_mode_for_state_with_index(
-            m,
+    for mode in candidate_global_modes:
+        key = str(mode.signature)
+        previous = progress_by_mode.get(key)
+        local_mode, index = localize_mode_for_state_with_index(
+            mode,
             x_current,
             cfg.horizon,
-            previous_idx=prev if cfg.use_monotonic_reference_progress else None,
-            max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+            previous_idx=previous if cfg.use_monotonic_reference_progress else None,
+            max_advance=(
+                cfg.max_reference_index_advance
+                if cfg.use_monotonic_reference_progress else None
+            ),
         )
-        local_modes.append(local_m)
-        new_progress_by_mode[key] = idx
+        local_modes.append(local_mode)
+        new_progress_by_mode[key] = index
 
-    if select_mode_before_averaging:
-        # Evaluate every prior using its actual sampled rollouts. Do not discard a
-        # homotopy because its resampled mean centerline intersects the new wall.
-        active_mode_indices = list(range(len(local_modes)))
-        mode_clearances = np.asarray([
-            path_min_clearance_to_circles(
-                mode.mean_path, obstacle_circles, cfg.robot_radius,
-                substeps=cfg.mode_blocking_substeps,
-            )
-            for mode in local_modes
-        ], dtype=np.float64)
-    else:
-        active_mode_indices, mode_clearances = unblocked_mode_indices(
-            local_modes, obstacle_circles, cfg
-        )
+    active_mode_indices, mode_clearances = unblocked_mode_indices(
+        local_modes, obstacle_circles, cfg
+    )
+    total_budget = max(1, int(cfg.num_rollouts))
+    active_mode_indices = active_mode_indices[:total_budget]
     active_local_modes = [local_modes[i] for i in active_mode_indices]
     active_global_modes = [candidate_global_modes[i] for i in active_mode_indices]
 
-    if select_mode_before_averaging:
-        # Screen every prior with a small rollout-only batch, then spend the full
-        # MPPI budget only on the selected prior. This preserves rollout-based mode
-        # selection without paying num_modes * num_rollouts every control step.
-        rollouts_per_mode = min(
-            int(cfg.num_rollouts),
-            max(8, int(cfg.prior_screen_rollouts_per_mode)),
-        )
-        mode_ids = np.repeat(
-            np.arange(len(active_local_modes), dtype=np.int64),
-            rollouts_per_mode,
-        )
-    else:
-        if use_pi_sampling:
-            pi = np.array([m.probability for m in active_local_modes], dtype=np.float64)
-            pi = pi / (pi.sum() + 1e-12)
-        else:
-            pi = np.ones(len(active_local_modes), dtype=np.float64) / len(active_local_modes)
-        mode_ids = rng.choice(len(active_local_modes), size=cfg.num_rollouts, p=pi)
+    counts = balanced_rollout_counts(total_budget, len(active_local_modes))
+    mode_ids = np.concatenate([
+        np.full(count, mode_index, dtype=np.int64)
+        for mode_index, count in enumerate(counts)
+    ])
 
-    total_rollouts = int(len(mode_ids))
-    all_costs = np.zeros(total_rollouts, dtype=np.float64)
-    all_U0 = np.zeros((total_rollouts, 2), dtype=np.float64)
-    all_U = np.zeros((total_rollouts, cfg.horizon, 2), dtype=np.float64)
+    all_costs = np.zeros(total_budget, dtype=np.float64)
+    all_U = np.zeros((total_budget, cfg.horizon, 2), dtype=np.float64)
     best_cost = float("inf")
     best_traj = None
-    mode_records = []
 
-    for mid, local_mode in enumerate(active_local_modes):
-        ids = np.where(mode_ids == mid)[0]
+    for mode_index, local_mode in enumerate(active_local_modes):
+        ids = np.where(mode_ids == mode_index)[0]
         n = len(ids)
         if n == 0:
             continue
 
-        key = str(active_global_modes[mid].signature)
+        global_mode = active_global_modes[mode_index]
+        key = str(global_mode.signature)
         nominal_bank = build_nominal_bank_for_mode(
             x_current,
             local_mode,
-            active_global_modes[mid],
+            global_mode,
             goal,
             cfg,
             rng,
@@ -2310,7 +2230,9 @@ def stable_swarm_mppi_step(
             previous_idx=progress_by_mode.get(key),
         )
 
-        if rep_type == REP_FRENET:
+        if rep_type == REP_GAUSSIAN:
+            U = sample_gaussian_controls(x_current, local_mode, n, cfg, rng)
+        elif rep_type == REP_FRENET:
             U = sample_frenet_controls(x_current, local_mode, n, cfg, rng)
         else:
             U = sample_controls_from_nominal_bank(
@@ -2320,8 +2242,9 @@ def stable_swarm_mppi_step(
                 rng,
                 prefer_empirical=use_empirical_init,
             )
-        X = rollout_unicycle_batch(x_current, U, cfg.dt)
 
+        U = ensure_direct_goal_prior(U, x_current, goal, cfg)
+        X = rollout_unicycle_batch(x_current, U, cfg.dt)
         costs = stable_representation_costs(
             X,
             U,
@@ -2332,115 +2255,26 @@ def stable_swarm_mppi_step(
             rep_type=rep_type,
             use_mode_prior=use_mode_prior,
         )
-
-        collision_mask = rollout_collision_mask(X, obstacle_circles, cfg)
-        feasible_count = int(np.count_nonzero(~collision_mask))
         costs = reject_colliding_rollouts(costs, X, obstacle_circles, cfg)
         all_costs[ids] = costs
-        all_U0[ids] = U[:, 0, :]
         all_U[ids] = U
-        mode_records.append({
-            "active_mid": int(mid),
-            "global_mode_index": int(nearby_indices[active_mode_indices[mid]]),
-            "costs": costs,
-            "U": U,
-            "X": X,
-            "score": softmin_score(costs, cfg),
-            "feasible_count": feasible_count,
-        })
+
         if record_optimal_traj:
-            group_best = int(np.argmin(costs))
-            if float(costs[group_best]) < best_cost:
-                best_cost = float(costs[group_best])
-                best_traj = np.asarray(X[group_best], dtype=np.float64).copy()
+            local_best = int(np.argmin(costs))
+            if float(costs[local_best]) < best_cost:
+                best_cost = float(costs[local_best])
+                best_traj = np.asarray(X[local_best], dtype=np.float64).copy()
 
-    selected_mode_index = None
-    if select_mode_before_averaging and mode_records:
-        feasible_records = [
-            record for record in mode_records
-            if int(record.get("feasible_count", 0)) > 0
-        ]
-        candidates = feasible_records if feasible_records else mode_records
-        selected = min(candidates, key=lambda record: float(record["score"]))
-        selected_mode_index = int(selected["global_mode_index"])
-        selected_active_mid = int(selected["active_mid"])
-        selected_local_mode = active_local_modes[selected_active_mid]
-        selected_global_mode = active_global_modes[selected_active_mid]
-        selected_key = str(selected_global_mode.signature)
-
-        # Re-sample only the winning prior with the complete rollout budget. No
-        # templates or fallback controls are injected: this remains pure MPPI
-        # proposal sampling followed by the common rollout objective.
-        selected_bank = build_nominal_bank_for_mode(
-            x_current,
-            selected_local_mode,
-            selected_global_mode,
-            goal,
-            cfg,
-            rng,
-            use_empirical_init=use_empirical_init,
-            use_mean_nominal=use_mean_nominal,
-            previous_idx=progress_by_mode.get(selected_key),
-        )
-        full_n = int(cfg.num_rollouts)
-        if rep_type == REP_FRENET:
-            selected_U = sample_frenet_controls(
-                x_current, selected_local_mode, full_n, cfg, rng
-            )
-        else:
-            selected_U = sample_controls_from_nominal_bank(
-                selected_bank,
-                full_n,
-                cfg,
-                rng,
-                prefer_empirical=use_empirical_init,
-            )
-        selected_X = rollout_unicycle_batch(x_current, selected_U, cfg.dt)
-        selected_costs = stable_representation_costs(
-            selected_X,
-            selected_U,
-            selected_local_mode,
-            obstacle_circles,
-            goal,
-            cfg,
-            rep_type=rep_type,
-            use_mode_prior=use_mode_prior,
-        )
-        selected_costs = reject_colliding_rollouts(
-            selected_costs, selected_X, obstacle_circles, cfg
-        )
-        planned_sequence = mppi_weighted_control_sequence(
-            selected_costs, selected_U, cfg
-        )
-        u = planned_sequence[0].copy()
-        if record_optimal_traj:
-            best_traj = selected_X[int(np.argmin(selected_costs))].copy()
-        reported_costs = selected_costs
-        soft_value = softmin_score(selected_costs, cfg)
-    else:
-        planned_sequence = mppi_weighted_control_sequence(all_costs, all_U, cfg)
-        u = planned_sequence[0].copy()
-        reported_costs = all_costs
-        soft_value = softmin_score(all_costs, cfg)
-
+    planned_sequence = mppi_weighted_control_sequence(all_costs, all_U, cfg)
     info = {
-        "cost_min": float(np.min(reported_costs)),
-        "cost_mean": float(np.mean(reported_costs)),
-        "soft_value": float(soft_value),
+        "cost_min": float(np.min(all_costs)),
+        "cost_mean": float(np.mean(all_costs)),
+        "soft_value": float(softmin_score(all_costs, cfg)),
         "rep_type": int(rep_type),
-        "mode_selection": bool(select_mode_before_averaging),
-        "selected_mode_index": selected_mode_index,
-        "selected_mode_feasible_rollouts": (
-            int(selected.get("feasible_count", 0))
-            if select_mode_before_averaging and mode_records else None
-        ),
-        "rollouts_per_mode": (
-            int(cfg.prior_screen_rollouts_per_mode)
-            if select_mode_before_averaging else None
-        ),
-        "selected_mode_full_rollouts": (
-            int(cfg.num_rollouts) if select_mode_before_averaging else None
-        ),
+        "mode_selection": False,
+        "selected_mode_index": None,
+        "rollout_budget_total": total_budget,
+        "rollouts_by_mode": counts,
         "active_mode_count": int(len(active_mode_indices)),
         "suppressed_mode_count": int(len(global_modes) - len(active_mode_indices)),
         "nearby_mode_count": int(len(candidate_global_modes)),
@@ -2448,8 +2282,7 @@ def stable_swarm_mppi_step(
         "optimal_traj": best_traj,
         "planned_control_sequence": planned_sequence,
     }
-    return u, info, new_progress_by_mode
-
+    return planned_sequence[0].copy(), info, new_progress_by_mode
 
 def mode_selecting_stable_mppi_step(
     x_current: Array,
@@ -2460,84 +2293,93 @@ def mode_selecting_stable_mppi_step(
     rng: np.random.Generator,
     *,
     rep_type: int,
-    use_empirical_init: bool,
-    use_mean_nominal: bool,
-    use_mode_prior: bool,
     progress_by_mode: Optional[Dict[str, int]] = None,
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
     record_optimal_traj: bool = True,
-    select_mode_before_averaging: bool = True,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
-    """Per-homotopy MPPI with optional mode selection."""
-    progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
+    """Optimize each retained mode independently, then select the best mode.
 
-    nearby_indices = nearby_mode_indices(global_modes, x_current, cfg)
-    top_k = min(max(1, int(cfg.mode_select_top_k)), len(nearby_indices))
-    candidate_indices = nearby_indices[:top_k]
-    candidate_modes = [global_modes[i] for i in candidate_indices]
+    Only Cartesian Gaussian and default corridor proposals are supported. Each
+    mode receives a complete MPPI rollout batch and produces its own weighted
+    control sequence. Mode selection is performed only after all per-mode
+    optimizations have finished.
+    """
+    if rep_type not in {REP_GAUSSIAN, REP_CORRIDOR}:
+        raise ValueError(
+            "Mode-selecting MPPI supports only Gaussian or corridor proposals."
+        )
+
+    progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
+
+    nearby_indices = nearby_mode_indices(global_modes, x_current, cfg, obstacle_circles)
+    top_k = min(max(1, int(cfg.mode_select_top_k)), len(nearby_indices))
+    candidate_indices = nearby_indices[:top_k]
+    records = []
     new_progress_by_mode = dict(progress_by_mode)
 
-    records = []
-    for candidate_position, global_mode in enumerate(candidate_modes):
-        original_mid = int(candidate_indices[candidate_position])
+    for original_index in candidate_indices:
+        global_mode = global_modes[original_index]
         key = str(global_mode.signature)
-        prev = progress_by_mode.get(key)
-        local_mode, idx = localize_mode_for_state_with_index(
+        previous = progress_by_mode.get(key)
+        local_mode, index = localize_mode_for_state_with_index(
             global_mode,
             x_current,
             cfg.horizon,
-            previous_idx=prev if cfg.use_monotonic_reference_progress else None,
-            max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+            previous_idx=previous if cfg.use_monotonic_reference_progress else None,
+            max_advance=(
+                cfg.max_reference_index_advance
+                if cfg.use_monotonic_reference_progress else None
+            ),
         )
-        new_progress_by_mode[key] = idx
+        new_progress_by_mode[key] = index
         records.append({
-            "original_mid": int(original_mid),
+            "original_mid": int(original_index),
             "global_mode": global_mode,
             "local_mode": local_mode,
-            "key": key,
-            "previous_idx": prev,
         })
 
     active_positions, mode_clearances = unblocked_mode_indices(
-        [record["local_mode"] for record in records],
-        obstacle_circles,
-        cfg,
+        [record["local_mode"] for record in records], obstacle_circles, cfg
     )
     active_records = [records[i] for i in active_positions]
-    n_per_mode = max(
-        int(cfg.mode_select_min_rollouts_per_mode),
-        int(math.ceil(cfg.num_rollouts / float(len(active_records)))),
+
+    configured_per_mode = int(cfg.mode_select_rollouts_per_mode)
+    rollouts_per_mode = (
+        configured_per_mode if configured_per_mode > 0 else max(1, int(cfg.num_rollouts))
     )
 
-    best = None
+    completed = []
     for record in active_records:
         global_mode = record["global_mode"]
         local_mode = record["local_mode"]
 
-        nominal_bank = build_nominal_bank_for_mode(
-            x_current,
-            local_mode,
-            global_mode,
-            goal,
-            cfg,
-            rng,
-            use_empirical_init=use_empirical_init,
-            use_mean_nominal=use_mean_nominal,
-            previous_idx=record["previous_idx"],
-        )
-
-        if rep_type == REP_FRENET:
-            U = sample_frenet_controls(x_current, local_mode, n_per_mode, cfg, rng)
+        if rep_type == REP_GAUSSIAN:
+            U = sample_gaussian_controls(
+                x_current, local_mode, rollouts_per_mode, cfg, rng
+            )
         else:
-            U = sample_controls_from_nominal_bank(
-                nominal_bank,
-                n_per_mode,
+            nominal_bank = build_nominal_bank_for_mode(
+                x_current,
+                local_mode,
+                global_mode,
+                goal,
                 cfg,
                 rng,
-                prefer_empirical=use_empirical_init,
+                use_empirical_init=False,
+                use_mean_nominal=True,
+                previous_idx=progress_by_mode.get(str(global_mode.signature)),
             )
+            U = sample_controls_from_nominal_bank(
+                nominal_bank,
+                rollouts_per_mode,
+                cfg,
+                rng,
+                prefer_empirical=False,
+            )
+
+        U = ensure_direct_goal_prior(U, x_current, goal, cfg)
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
         costs = stable_representation_costs(
             X,
@@ -2547,31 +2389,36 @@ def mode_selecting_stable_mppi_step(
             goal,
             cfg,
             rep_type=rep_type,
-            use_mode_prior=use_mode_prior,
+            use_mode_prior=False,
         )
+        collision_mask = rollout_collision_mask(X, obstacle_circles, cfg)
+        feasible_count = int(np.count_nonzero(~collision_mask))
         costs = reject_colliding_rollouts(costs, X, obstacle_circles, cfg)
+        planned_sequence = mppi_weighted_control_sequence(costs, U, cfg)
 
-        planned_sequence_h = mppi_weighted_control_sequence(costs, U, cfg)
-        u_h = planned_sequence_h[0].copy()
-        J_h = softmin_score(costs, cfg)
-        if best is None or J_h < best["score"]:
-            optimal_traj = None
-            if record_optimal_traj:
-                best_idx = int(np.argmin(costs))
-                optimal_traj = np.asarray(X[best_idx], dtype=np.float64).copy()
-            best = {
-                "score": float(J_h),
-                "u": u_h,
-                "mode_index": record["original_mid"],
-                "signature": str(global_mode.signature),
-                "probability": float(global_mode.probability),
-                "cost_min": float(costs.min()),
-                "cost_mean": float(costs.mean()),
-                "optimal_traj": optimal_traj,
-                "planned_control_sequence": planned_sequence_h,
-            }
+        completed.append({
+            "score": float(softmin_score(costs, cfg)),
+            "mode_index": int(record["original_mid"]),
+            "signature": str(global_mode.signature),
+            "probability": float(global_mode.probability),
+            "feasible_count": feasible_count,
+            "cost_min": float(np.min(costs)),
+            "cost_mean": float(np.mean(costs)),
+            "optimal_traj": (
+                np.asarray(X[int(np.argmin(costs))], dtype=np.float64).copy()
+                if record_optimal_traj else None
+            ),
+            "planned_control_sequence": planned_sequence,
+        })
 
-    assert best is not None
+    if not completed:
+        raise RuntimeError("No homotopy mode was available for mode-selecting MPPI.")
+
+    feasible = [record for record in completed if record["feasible_count"] > 0]
+    best = min(feasible if feasible else completed, key=lambda record: record["score"])
+    counts = [rollouts_per_mode] * len(completed)
+    total_budget = rollouts_per_mode * len(completed)
+
     info = {
         "cost_min": best["cost_min"],
         "cost_mean": best["cost_mean"],
@@ -2581,14 +2428,16 @@ def mode_selecting_stable_mppi_step(
         "selected_mode_probability": best["probability"],
         "rep_type": int(rep_type),
         "mode_selection": True,
-        "active_mode_count": int(len(active_records)),
-        "suppressed_mode_count": int(len(records) - len(active_records)),
+        "rollout_budget_per_mode": rollouts_per_mode,
+        "rollout_budget_total": total_budget,
+        "rollouts_by_mode": counts,
+        "active_mode_count": int(len(completed)),
+        "suppressed_mode_count": int(len(records) - len(completed)),
         "mode_clearances": mode_clearances.tolist(),
-        "optimal_traj": best.get("optimal_traj"),
-        "planned_control_sequence": best.get("planned_control_sequence"),
+        "optimal_traj": best["optimal_traj"],
+        "planned_control_sequence": best["planned_control_sequence"],
     }
-    return best["u"], info, new_progress_by_mode
-
+    return best["planned_control_sequence"][0].copy(), info, new_progress_by_mode
 
 def make_temporally_correlated_noise(
     n: int,
@@ -2732,31 +2581,44 @@ def swarm_mppi_step(
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
     record_optimal_traj: bool = True,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
-    """Two-stage Gaussian/full-swarm MPPI over only nearby priors."""
+    """Gaussian/full-swarm MPPI with exactly cfg.num_rollouts total evaluations."""
+    del use_pi_sampling
     progress_by_mode = {} if progress_by_mode is None else dict(progress_by_mode)
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
+
     nearby_indices = nearby_mode_indices(global_modes, x_current, cfg, obstacle_circles)
+    total_budget = max(1, int(cfg.num_rollouts))
+    nearby_indices = nearby_indices[:total_budget]
     candidate_global_modes = [global_modes[i] for i in nearby_indices]
     local_modes = []
     new_progress_by_mode = dict(progress_by_mode)
     for mode in candidate_global_modes:
         key = str(mode.signature)
-        prev = progress_by_mode.get(key)
-        local_mode, idx = localize_mode_for_state_with_index(
-            mode, x_current, cfg.horizon,
-            previous_idx=prev if cfg.use_monotonic_reference_progress else None,
-            max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+        previous = progress_by_mode.get(key)
+        local_mode, index = localize_mode_for_state_with_index(
+            mode,
+            x_current,
+            cfg.horizon,
+            previous_idx=previous if cfg.use_monotonic_reference_progress else None,
+            max_advance=(
+                cfg.max_reference_index_advance
+                if cfg.use_monotonic_reference_progress else None
+            ),
         )
         local_modes.append(local_mode)
-        new_progress_by_mode[key] = idx
+        new_progress_by_mode[key] = index
 
-    screen_n = min(int(cfg.num_rollouts), max(8, int(cfg.prior_screen_rollouts_per_mode)))
+    counts = balanced_rollout_counts(total_budget, len(local_modes))
     records = []
     mode_clearances = []
-    for local_pos, (local_mode, global_mode) in enumerate(zip(local_modes, candidate_global_modes)):
+    for local_pos, (local_mode, global_mode, n) in enumerate(
+        zip(local_modes, candidate_global_modes, counts)
+    ):
         mode_clearances.append(path_min_clearance_to_circles(
-            local_mode.mean_path, obstacle_circles, cfg.robot_radius,
+            local_mode.mean_path,
+            obstacle_circles,
+            cfg.robot_radius,
             substeps=cfg.mode_blocking_substeps,
         ))
         mean_nominal = (
@@ -2765,26 +2627,39 @@ def swarm_mppi_step(
         )
         nominal_bank = (
             build_empirical_nominal_bank(
-                x_current=x_current, global_mode=global_mode,
-                mean_nominal=mean_nominal, cfg=cfg, rng=rng,
+                x_current=x_current,
+                global_mode=global_mode,
+                mean_nominal=mean_nominal,
+                cfg=cfg,
+                rng=rng,
                 previous_idx=progress_by_mode.get(str(global_mode.signature)),
             ) if use_empirical_init else [mean_nominal]
         )
-        bank_ids = np.zeros(screen_n, dtype=np.int64)
+        bank_ids = np.zeros(n, dtype=np.int64)
         if len(nominal_bank) > 1:
-            probs = np.ones(len(nominal_bank), dtype=np.float64)
-            probs[0] = max(1e-6, 1.0 - cfg.swarm_init_probability)
-            probs[1:] = cfg.swarm_init_probability / (len(nominal_bank) - 1)
-            probs /= probs.sum()
-            bank_ids = rng.choice(len(nominal_bank), size=screen_n, p=probs)
+            probabilities = np.ones(len(nominal_bank), dtype=np.float64)
+            probabilities[0] = max(1e-6, 1.0 - cfg.swarm_init_probability)
+            probabilities[1:] = cfg.swarm_init_probability / (len(nominal_bank) - 1)
+            probabilities /= probabilities.sum()
+            bank_ids = rng.choice(len(nominal_bank), size=n, p=probabilities)
         U = np.stack([nominal_bank[int(j)].copy() for j in bank_ids], axis=0)
         noise = make_temporally_correlated_noise(
-            screen_n, cfg.horizon, cfg, rng,
-            noise_v=cfg.gaussian_noise_v, noise_omega=cfg.gaussian_noise_omega,
+            n,
+            cfg.horizon,
+            cfg,
+            rng,
+            noise_v=cfg.gaussian_noise_v,
+            noise_omega=cfg.gaussian_noise_omega,
         )
         U += noise
+        low_noise_count = min(max(1, int(cfg.low_noise_proposal_count)), n)
+        U[:low_noise_count] = (
+            mean_nominal[None, :, :]
+            + float(cfg.low_noise_proposal_scale) * noise[:low_noise_count]
+        )
         U[0] = mean_nominal
         U = enforce_forward_curve_proposals(U, cfg)
+        U = ensure_direct_goal_prior(U, x_current, goal, cfg)
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
         costs = fast_swarm_prior_costs(
             X, U, local_mode, obstacle_circles, goal, cfg,
@@ -2797,65 +2672,35 @@ def swarm_mppi_step(
         feasible_count = int(np.count_nonzero(~collision_mask))
         costs = reject_colliding_rollouts(costs, X, obstacle_circles, cfg)
         records.append({
-            "local_pos": local_pos, "global_index": int(nearby_indices[local_pos]),
-            "score": softmin_score(costs, cfg), "feasible_count": feasible_count,
+            "global_index": int(nearby_indices[local_pos]),
+            "score": softmin_score(costs, cfg),
+            "feasible_count": feasible_count,
+            "costs": costs,
+            "U": U,
+            "X": X,
         })
 
-    feasible = [r for r in records if r["feasible_count"] > 0]
-    selected = min(feasible if feasible else records, key=lambda r: r["score"])
-    pos = int(selected["local_pos"])
-    local_mode = local_modes[pos]
-    global_mode = candidate_global_modes[pos]
-    mean_nominal = (
-        nominal_controls_to_track_path(x_current, local_mode.mean_path, cfg)
-        if use_mean_reference else nominal_controls_to_goal(x_current, goal, cfg)
+    feasible = [record for record in records if record["feasible_count"] > 0]
+    selected = min(feasible if feasible else records, key=lambda record: record["score"])
+    planned_sequence = mppi_weighted_control_sequence(
+        selected["costs"], selected["U"], cfg
     )
-    nominal_bank = (
-        build_empirical_nominal_bank(
-            x_current=x_current, global_mode=global_mode, mean_nominal=mean_nominal,
-            cfg=cfg, rng=rng,
-            previous_idx=progress_by_mode.get(str(global_mode.signature)),
-        ) if use_empirical_init else [mean_nominal]
+    best_traj = (
+        selected["X"][int(np.argmin(selected["costs"]))].copy()
+        if record_optimal_traj else None
     )
-    n = int(cfg.num_rollouts)
-    bank_ids = np.zeros(n, dtype=np.int64)
-    if len(nominal_bank) > 1:
-        probs = np.ones(len(nominal_bank), dtype=np.float64)
-        probs[0] = max(1e-6, 1.0 - cfg.swarm_init_probability)
-        probs[1:] = cfg.swarm_init_probability / (len(nominal_bank) - 1)
-        probs /= probs.sum()
-        bank_ids = rng.choice(len(nominal_bank), size=n, p=probs)
-    U = np.stack([nominal_bank[int(j)].copy() for j in bank_ids], axis=0)
-    noise = make_temporally_correlated_noise(
-        n, cfg.horizon, cfg, rng,
-        noise_v=cfg.gaussian_noise_v, noise_omega=cfg.gaussian_noise_omega,
-    )
-    U += noise
-    k = min(max(1, int(cfg.low_noise_proposal_count)), n)
-    U[:k] = mean_nominal[None, :, :] + float(cfg.low_noise_proposal_scale) * noise[:k]
-    U[0] = mean_nominal
-    U = enforce_forward_curve_proposals(U, cfg)
-    X = rollout_unicycle_batch(x_current, U, cfg.dt)
-    costs = fast_swarm_prior_costs(
-        X, U, local_mode, obstacle_circles, goal, cfg,
-        use_gaussian_tracking=use_gaussian_tracking,
-        use_uncertainty_margin=use_uncertainty_margin,
-        use_mode_prior=use_mode_prior,
-        use_mean_reference=use_mean_reference,
-    )
-    costs = reject_colliding_rollouts(costs, X, obstacle_circles, cfg)
-    planned_sequence = mppi_weighted_control_sequence(costs, U, cfg)
-    best_traj = X[int(np.argmin(costs))].copy() if record_optimal_traj else None
     info = {
-        "cost_min": float(np.min(costs)),
-        "cost_mean": float(np.mean(costs)),
-        "soft_value": float(softmin_score(costs, cfg)),
+        "cost_min": float(np.min(selected["costs"])),
+        "cost_mean": float(np.mean(selected["costs"])),
+        "soft_value": float(selected["score"]),
         "selected_mode_index": int(selected["global_index"]),
         "selected_mode_feasible_rollouts": int(selected["feasible_count"]),
+        "rollout_budget_total": total_budget,
+        "rollouts_by_mode": counts,
         "nearby_mode_count": int(len(candidate_global_modes)),
         "active_mode_count": int(len(candidate_global_modes)),
         "suppressed_mode_count": int(len(global_modes) - len(candidate_global_modes)),
-        "mode_clearances": [float(v) for v in mode_clearances],
+        "mode_clearances": [float(value) for value in mode_clearances],
         "optimal_traj": best_traj,
         "planned_control_sequence": planned_sequence,
     }
@@ -2968,6 +2813,24 @@ def initial_pose(start: Array, goal: Array) -> Array:
     return np.array([start[0], start[1], heading], dtype=np.float64)
 
 
+def ensure_direct_goal_prior(
+    U: Array,
+    x_current: Array,
+    goal: Array,
+    cfg: MPPIConfig,
+) -> Array:
+    """Reserve one rollout as the exact direct-to-goal nominal.
+
+    The remaining rollouts keep the variant-specific proposal distribution.
+    The rollout objective remains identical for every controller variant.
+    """
+    proposals = np.asarray(U, dtype=np.float64)
+    if proposals.ndim != 3 or proposals.shape[0] == 0:
+        return proposals
+    proposals[-1] = nominal_controls_to_goal(x_current, goal, cfg)
+    return enforce_forward_curve_proposals(proposals, cfg)
+
+
 def run_controller_variant(
     variant: ControllerVariant,
     modes: List[MPPIHomotopyMode],
@@ -3001,9 +2864,10 @@ def run_controller_variant(
     t0 = time.perf_counter()
 
     for _ in range(max_steps):
+        step_cfg = mppi_cfg
         if variant == ControllerVariant.FULL_SWARM_PRIOR_MPPI:
             u, info, swarm_progress = swarm_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
+                x, modes, obstacles, goal, step_cfg, rng,
                 use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_reference=True,
@@ -3016,101 +2880,82 @@ def run_controller_variant(
             )
 
         elif variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
-            u, info, swarm_progress = swarm_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
-                use_pi_sampling=True,
+            u, info, swarm_progress = stable_swarm_mppi_step(
+                x, modes, obstacles, goal, step_cfg, rng,
+                rep_type=REP_GAUSSIAN,
                 use_empirical_init=False,
-                use_mean_reference=True,
-                use_gaussian_tracking=True,
-                use_uncertainty_margin=True,
-                use_mode_prior=True,
+                use_mean_nominal=True,
+                use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.CORRIDOR_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
+                x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_CORRIDOR,
-                use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_nominal=True,
                 use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-                select_mode_before_averaging=True,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.FRENET_CORRIDOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
+                x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_FRENET,
-                use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_nominal=True,
                 use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-                select_mode_before_averaging=True,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
-            )
-
-        elif variant == ControllerVariant.HEATMAP_PRIOR_MPPI:
-            u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
-                rep_type=REP_HEATMAP,
-                use_pi_sampling=True,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
-                progress_by_mode=swarm_progress,
-                select_mode_before_averaging=True,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.CONTROL_BANK_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
+                x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_CONTROL_BANK,
-                use_pi_sampling=False,
                 use_empirical_init=True,
                 use_mean_nominal=False,
                 use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
-        elif variant == ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI:
+        elif variant == ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI:
             u, info, swarm_progress = mode_selecting_stable_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
-                rep_type=REP_NONE,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
+                x, modes, obstacles, goal, step_cfg, rng,
+                rep_type=REP_GAUSSIAN,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI:
             u, info, swarm_progress = mode_selecting_stable_mppi_step(
-                x, modes, obstacles, goal, mppi_cfg, rng,
+                x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_CORRIDOR,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.STANDARD_MPPI:
             u, info = standard_mppi_step(
-                x, obstacles, goal, mppi_cfg, rng,
+                x, obstacles, goal, step_cfg, rng,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
+            )
+
+        elif variant == ControllerVariant.STANDARD_MPPI_128:
+            variant_cfg = replace(step_cfg, num_rollouts=128)
+            u, info = standard_mppi_step(
+                x, obstacles, goal, variant_cfg, rng,
                 obstacle_circles=obstacle_circles,
                 record_optimal_traj=record_infos,
             )
@@ -3120,17 +2965,17 @@ def run_controller_variant(
 
         if "mppi" in variant.value:
             u = apply_terminal_goal_approach(
-                x, u, goal, effective_goal_tolerance, mppi_cfg
+                x, u, goal, effective_goal_tolerance, step_cfg
             )
             u = apply_smooth_safe_control(
-                x, u, previous_control, obstacle_circles, mppi_cfg
+                x, u, previous_control, obstacle_circles, step_cfg
             )
 
         if record_infos and isinstance(info, dict):
-            update_display_trajectory(info, x, u, mppi_cfg)
+            update_display_trajectory(info, x, u, step_cfg)
 
         previous_control = u.copy()
-        x_next = unicycle_step(x, u, mppi_cfg.dt)
+        x_next = unicycle_step(x, u, step_cfg.dt)
         arrived, x_recorded = segment_goal_entry_state(x, x_next, goal, effective_goal_tolerance)
         x = x_recorded if arrived else x_next
 
@@ -3502,13 +3347,14 @@ def run_dynamic_blockage_controller(
     t0 = time.perf_counter()
 
     for step in range(max_steps):
+        step_cfg = mppi_cfg
         current_progress = spatial_progress_along_start_goal(x, start, goal)
 
         if activation_step is None and blockers:
             blocker_clearance = min_clearance(
                 x[None, :],
                 blockers,
-                mppi_cfg.robot_radius,
+                step_cfg.robot_radius,
             )
             progress_ready = bool(
                 trigger_progress is not None
@@ -3553,7 +3399,7 @@ def run_dynamic_blockage_controller(
 
         if variant == ControllerVariant.FULL_SWARM_PRIOR_MPPI:
             u, info, swarm_progress = swarm_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
+                x, modes, active_obstacles, goal, step_cfg, rng,
                 use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_reference=True,
@@ -3566,101 +3412,82 @@ def run_dynamic_blockage_controller(
             )
 
         elif variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
-            u, info, swarm_progress = swarm_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
-                use_pi_sampling=True,
+            u, info, swarm_progress = stable_swarm_mppi_step(
+                x, modes, active_obstacles, goal, step_cfg, rng,
+                rep_type=REP_GAUSSIAN,
                 use_empirical_init=False,
-                use_mean_reference=True,
-                use_gaussian_tracking=True,
-                use_uncertainty_margin=True,
-                use_mode_prior=True,
+                use_mean_nominal=True,
+                use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.CORRIDOR_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
+                x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_CORRIDOR,
-                use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_nominal=True,
                 use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-                select_mode_before_averaging=True,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.FRENET_CORRIDOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
+                x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_FRENET,
-                use_pi_sampling=True,
                 use_empirical_init=False,
                 use_mean_nominal=True,
                 use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-                select_mode_before_averaging=True,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
-            )
-
-        elif variant == ControllerVariant.HEATMAP_PRIOR_MPPI:
-            u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
-                rep_type=REP_HEATMAP,
-                use_pi_sampling=True,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
-                progress_by_mode=swarm_progress,
-                select_mode_before_averaging=True,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.CONTROL_BANK_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
+                x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_CONTROL_BANK,
-                use_pi_sampling=False,
                 use_empirical_init=True,
                 use_mean_nominal=False,
                 use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
-        elif variant == ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI:
+        elif variant == ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI:
             u, info, swarm_progress = mode_selecting_stable_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
-                rep_type=REP_NONE,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
+                x, modes, active_obstacles, goal, step_cfg, rng,
+                rep_type=REP_GAUSSIAN,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI:
             u, info, swarm_progress = mode_selecting_stable_mppi_step(
-                x, modes, active_obstacles, goal, mppi_cfg, rng,
+                x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_CORRIDOR,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
                 progress_by_mode=swarm_progress,
-            obstacle_circles=active_obstacle_circles,
-            record_optimal_traj=record_infos,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
             )
 
         elif variant == ControllerVariant.STANDARD_MPPI:
             u, info = standard_mppi_step(
-                x, active_obstacles, goal, mppi_cfg, rng,
+                x, active_obstacles, goal, step_cfg, rng,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
+            )
+
+        elif variant == ControllerVariant.STANDARD_MPPI_128:
+            variant_cfg = replace(step_cfg, num_rollouts=128)
+            u, info = standard_mppi_step(
+                x, active_obstacles, goal, variant_cfg, rng,
                 obstacle_circles=active_obstacle_circles,
                 record_optimal_traj=record_infos,
             )
@@ -3670,17 +3497,17 @@ def run_dynamic_blockage_controller(
 
         if "mppi" in variant.value:
             u = apply_terminal_goal_approach(
-                x, u, goal, effective_goal_tolerance, mppi_cfg
+                x, u, goal, effective_goal_tolerance, step_cfg
             )
             u = apply_smooth_safe_control(
-                x, u, previous_control, active_obstacle_circles, mppi_cfg
+                x, u, previous_control, active_obstacle_circles, step_cfg
             )
 
         if record_infos and isinstance(info, dict):
-            update_display_trajectory(info, x, u, mppi_cfg)
+            update_display_trajectory(info, x, u, step_cfg)
 
         previous_control = u.copy()
-        x_next = unicycle_step(x, u, mppi_cfg.dt)
+        x_next = unicycle_step(x, u, step_cfg.dt)
         arrived, x_recorded = segment_goal_entry_state(x, x_next, goal, effective_goal_tolerance)
         x = x_recorded if arrived else x_next
         states.append(x.copy())
@@ -4041,6 +3868,7 @@ def tracked_reference_for_frame(
 
     if variant_name in {
         ControllerVariant.STANDARD_MPPI.value,
+        ControllerVariant.STANDARD_MPPI_128.value,
     }:
         return np.vstack([x[:2], np.asarray(goal, dtype=np.float64)])
 
@@ -4507,16 +4335,8 @@ def main_dynamic_blockage():
         hard_collision_clearance=0.01,
         hard_collision_penalty=800_000.0,
 
-        # Stable representation settings.
-        w_corridor=12.0,
-        corridor_radius_base=0.35,
-        corridor_radius_scale=1.25,
-        corridor_radius_min=0.30,
-        corridor_radius_max=1.20,
-        w_heatmap=4.5,
-        heatmap_sigma_scale=1.4,
         mode_select_top_k=4,
-        mode_select_min_rollouts_per_mode=64,
+        mode_select_rollouts_per_mode=0,
     )
 
 
@@ -4530,12 +4350,12 @@ def main_dynamic_blockage():
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
         ControllerVariant.FRENET_CORRIDOR_MPPI,
-        ControllerVariant.HEATMAP_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
-        ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI,
+        ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI,
         ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
 
         ControllerVariant.STANDARD_MPPI,
+        ControllerVariant.STANDARD_MPPI_128,
     ]
 
     results = []
@@ -4683,12 +4503,12 @@ def main():
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
         ControllerVariant.FRENET_CORRIDOR_MPPI,
-        ControllerVariant.HEATMAP_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
-        ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI,
+        ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI,
         ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
 
         ControllerVariant.STANDARD_MPPI,
+        ControllerVariant.STANDARD_MPPI_128,
     ]
 
     all_results = []
@@ -4964,11 +4784,11 @@ def main_dynamic_robustness():
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
         ControllerVariant.FRENET_CORRIDOR_MPPI,
-        ControllerVariant.HEATMAP_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
-        ControllerVariant.MODE_SELECTING_HOMOTOPY_MPPI,
+        ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI,
         ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
         ControllerVariant.STANDARD_MPPI,
+        ControllerVariant.STANDARD_MPPI_128,
     ]
 
     # Stronger topology/reference priors plus swept-path collision rejection.
@@ -4999,15 +4819,8 @@ def main_dynamic_robustness():
         control_lowpass_alpha=0.0,
         max_delta_v=0.70,
         max_delta_omega=1.40,
-        w_corridor=12.0,
-        corridor_radius_base=0.35,
-        corridor_radius_scale=1.25,
-        corridor_radius_min=0.30,
-        corridor_radius_max=1.20,
-        w_heatmap=4.5,
-        heatmap_sigma_scale=1.4,
         mode_select_top_k=4,
-        mode_select_min_rollouts_per_mode=64,
+        mode_select_rollouts_per_mode=0,
     )
 
     scale, bounds_xy, bounds_ranges, start, goal, original_obstacles = build_default_scene()
@@ -5033,10 +4846,10 @@ def main_dynamic_robustness():
         for scenario in scenarios
     }
 
-    detail_csv = "dynamic_block_robustness_trials.csv"
-    summary_csv = "dynamic_block_robustness_summary.csv"
-    scenario_summary_csv = "dynamic_block_robustness_by_scenario.csv"
-    success_per_scenario_csv = "dynamic_block_success_per_scenario.csv"
+    detail_csv = "dynamic_block_long_robustness_trials.csv"
+    summary_csv = "dynamic_block_long_robustness_summary.csv"
+    scenario_summary_csv = "dynamic_block_long_robustness_by_scenario.csv"
+    success_per_scenario_csv = "dynamic_block_long_success_per_scenario.csv"
 
     for output_path in (
         detail_csv,
@@ -5173,6 +4986,7 @@ def main_dynamic_robustness():
                 f"  success={row.get('success')} "
                 f"failure={row.get('failure_reason') or '-'} "
                 f"activation={row.get('activation_step')}"
+                f"Time per step: {row.get('runtime_per_step_sec'):.3f}s"
             )
 
     for swarm_seed in swarm_seeds:
