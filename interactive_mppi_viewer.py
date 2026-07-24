@@ -667,9 +667,6 @@ class InteractiveMPPIViewer:
         return (
             f"Completed: {outcome}\n"
             f"Steps: {len(states) - 1}\n"
-            f"Final goal distance: {goal_distance:.3f}\n"
-            f"Average computation: {per_step_ms:.1f} ms/step\n"
-            "Numba warm-up excluded from timing"
         )
 
     def toggle_play(self) -> None:

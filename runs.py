@@ -2839,7 +2839,7 @@ def run_controller_variant(
     goal: Array,
     *,
     seed: int,
-    max_steps: int = 120,
+    max_steps: int = 200,
     goal_tolerance: float = 0.15,
     mppi_cfg: Optional[MPPIConfig] = None,
     record_infos: bool = True,
@@ -3292,7 +3292,7 @@ def run_dynamic_blockage_controller(
     blocker_active_from_start: bool = False,
     condition: str = "dynamic_wall",
     block_step: Optional[int] = None,
-    max_steps: int = 120,
+    max_steps: int = 200,
     goal_tolerance: float = 0.35,
     mppi_cfg: Optional[MPPIConfig] = None,
     record_infos: bool = True,
@@ -4372,7 +4372,7 @@ def main_dynamic_blockage():
             goal=goal,
             seed=seed,
             block_step=block_step,
-            max_steps=130,
+            max_steps=200,
             goal_tolerance=0.3,
             mppi_cfg=cfg,
         )
@@ -4526,7 +4526,7 @@ def main():
                     start,
                     goal,
                     seed=seed,
-                    max_steps=120,
+                    max_steps=200,
                     goal_tolerance=0.15,
                     mppi_cfg=mppi_cfg,
                         )
@@ -4775,7 +4775,7 @@ def main_dynamic_robustness():
     controller_seeds = RUN_SEEDS
     swarm_seeds = [RUN_SWARM_SEED]
     scenarios = default_dynamic_wall_scenarios()
-    max_steps = 130
+    max_steps = 200
     goal_tolerance = 0.30
     activation_preview_clearance = 0.75
 
