@@ -4545,8 +4545,6 @@ def main():
             print(
                 f"  success={row.get('success')} "
                 f"failure={row.get('failure_reason') or '-'} "
-                f"activation={row.get('activation_step')}"
-                f"Time per step: {row.get('runtime_per_step_sec'):.3f}s"
             )
 
     for swarm_seed in swarm_seeds:
