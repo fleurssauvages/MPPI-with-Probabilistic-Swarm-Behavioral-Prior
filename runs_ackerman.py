@@ -1,14 +1,3 @@
-#!/usr/bin/env python3
-"""
-Batch robustness experiment for MPPI with full dynamic Ackermann bicycle dynamics.
-
-The default entry point runs paired controller trials across several dynamic-wall
-scenarios and random seeds. It writes CSV metrics only: no GIFs, plots, or images.
-
-Run from the project root:
-    python runs_ackerman.py
-"""
-
 from __future__ import annotations
 
 import csv
@@ -36,15 +25,11 @@ except Exception:
     njit = None
 
 
-# -----------------------------------------------------------------------------
-# Your project imports
-# -----------------------------------------------------------------------------
-
 try:
     from geometry.utils import round_obstacle, PolyObstacle, obstacles_to_segs
-    from RL.env2Ddiverse import FishGoalEnv2D
+    from planner.env import FishGoalEnv2D
     from graph.graph import build_full_graph
-    from planner import HomotopyAwareGenerativePlanner, trajectory_cost
+    from planner.planner import HomotopyAwareGenerativePlanner, trajectory_cost
 except Exception as exc:
     raise ImportError(
         "Could not import your project modules. Run from the root of your project, "
@@ -56,11 +41,7 @@ except Exception as exc:
 Array = np.ndarray
 
 
-# =============================================================================
-# Config
-# =============================================================================
-
-RUN_SEEDS = list(range(100))          # Increase to 20-50 for real experiments.
+RUN_SEEDS = list(range(100))
 RUN_SWARM_SEED = 5
 OUTPUT_PREFIX = "dynamic_block_soft"
 
@@ -68,7 +49,7 @@ OUTPUT_PREFIX = "dynamic_block_soft"
 class ControllerVariant(str, Enum):
     GAUSSIAN_PRIOR_MPPI = "gaussian_prior_mppi"
 
-    # Proposal-distribution variants.
+
     CORRIDOR_PRIOR_MPPI = "corridor_prior_mppi"
     FRENET_CORRIDOR_MPPI = "frenet_corridor_mppi"
     CONTROL_BANK_MPPI = "control_bank_mppi"
@@ -83,9 +64,7 @@ class MPPIConfig:
     num_rollouts: int = 32
     lambda_temperature: float = 2.2
 
-    # Full dynamic single-track Ackermann model.
-    # State:   [p_x, p_y, psi, v_x, v_y, yaw_rate, delta]
-    # Control: [longitudinal_acceleration, steering_rate]
+
     wheelbase: float = 0.55
     rear_axle_distance: float = 0.275
     front_axle_distance: float = 0.275
@@ -106,19 +85,18 @@ class MPPIConfig:
     v_max: float = 2.8
     accel_min: float = -3.5
     accel_max: float = 2.5
-    # Aggressive steering envelope with a reduced angle limit.
+
     steering_min: float = -1.20
     steering_max: float = 1.20
     steering_rate_min: float = -7.50
     steering_rate_max: float = 7.50
 
-    # Control-space exploration in acceleration and steering rate.
+
     noise_accel: float = 0.80
     noise_steering_rate: float = 0.70
     temporal_noise_smoothing: float = 0.72
 
-    # Cartesian Gaussian proposal: sample path offsets from the time-indexed
-    # covariance blocks, then add only a small residual control perturbation.
+
     gaussian_covariance_scale: float = 1.0
     gaussian_control_noise_scale: float = 0.15
 
@@ -129,51 +107,45 @@ class MPPIConfig:
     base_safety_margin: float = 0.0
     uncertainty_margin_gain: float = 0.25
 
-    # Legacy dense rollout collision parameters are retained for compatibility,
-    # but the optimized soft objective evaluates obstacles only at rollout states.
-    # Exact/dense collision classification remains in the post-run evaluator.
+
     collision_substeps: int = 5
     hard_collision_clearance: float = 0.01
     hard_collision_penalty: float = 800_000.0
 
-    # Suppress homotopy references whose local centerline is blocked by the
-    # currently active obstacles. If every mode is blocked, retain only the mode
-    # with the largest clearance so the controller always has a fallback.
+
     suppress_blocked_modes: bool = True
     mode_blocking_clearance: float = 0.02
     mode_blocking_substeps: int = 2
 
-    # Common rollout objective. Rollouts become absorbing after first entry
-    # into the goal region, matching the position-only trial termination.
+
     w_goal: float = 110.0
     w_time_to_goal: float = 20.0
     rollout_goal_tolerance: float = 0.30
     w_obstacle: float = 500.0
     w_control: float = 0.004
     w_control_smooth: float = 0.40
-    # Dynamic-state regularization. These terms discourage entering the goal
-    # while carrying a large steering angle or yaw rate.
+
+
     w_steering_angle: float = 2.0
     w_yaw_rate: float = 1.0
     w_heading: float = 0.0
     w_mode_prior: float = 0.25
     sigma_floor: float = 0.25
 
-    # Explicit reference tracking remains disabled. Priors affect proposal
-    # sampling while all retained modes are pooled in one MPPI update.
+
     w_reference_tracking: float = 1.20
 
-    # Relative control and control-difference penalties.
+
     smooth_accel_weight: float = 0.5
     smooth_steering_rate_weight: float = 2.0
 
     max_precision: float = 10.0
 
-    # Monotonic progress tracking for local reference extraction.
+
     use_monotonic_reference_progress: bool = True
     max_reference_index_advance: int = 4
 
-    # Applied-command filtering and slew limits in control space.
+
     apply_control_lowpass: bool = False
     control_lowpass_alpha: float = 0.0
     max_delta_accel: float = 1.20
@@ -181,14 +153,12 @@ class MPPIConfig:
     enforce_one_step_safety: bool = True
     one_step_safety_clearance: float = 0.0
 
-    # Proposal variants all use the same rollout objective.
 
-    # Frenet proposal parameters.
     frenet_lateral_noise_scale: float = 0.75
     frenet_longitudinal_noise_scale: float = 0.35
     frenet_control_noise_scale: float = 0.30
 
-    # Proposal shaping.
+
     low_noise_proposal_count: int = 0
     low_noise_proposal_scale: float = 0.15
     min_curve_speed: float = 0.16
@@ -225,10 +195,6 @@ class MPPIConfig:
             raise ValueError("steering_rate_min must not exceed steering_rate_max.")
 
 
-# =============================================================================
-# Trajectory mixture extraction
-# =============================================================================
-
 def resample_path(path: Array, K: int) -> Array:
     p = np.asarray(path, dtype=np.float64)
     if p.ndim != 2 or p.shape[1] != 2:
@@ -255,16 +221,8 @@ def snap_path_end_to_goal(
     snap_radius: float = 0.2,
     straight_tail_points: int = 8,
 ) -> Array:
-    """
-    Snap the terminal part of a swarm trajectory to the exact goal.
 
-    If the path enters a radius-snap_radius ball around the goal, keep the path
-    until the first entry point and replace the remaining terminal segment by a
-    straight line to the exact goal.
 
-    This is applied before fitting the homotopy mixture, so Gaussian means,
-    corridors, and empirical control banks all terminate cleanly.
-    """
     p = np.asarray(path, dtype=np.float64)
     if goal is None:
         return p
@@ -289,7 +247,7 @@ def snap_path_end_to_goal(
     else:
         snapped = np.vstack([p[:entry], tail])
 
-    # Remove duplicate / near-duplicate points.
+
     keep = [0]
     for i in range(1, len(snapped)):
         if np.linalg.norm(snapped[i] - snapped[keep[-1]]) > 1e-10:
@@ -368,9 +326,7 @@ def fit_topological_trajectory_mixture(
     if len(raw_paths) == 0:
         raise RuntimeError("Swarm planner produced zero trajectory samples.")
 
-    # Snap only the terminal segment of paths that already enter the goal ball.
-    # Quality costs are evaluated on the snapped paths, but homotopy groups are
-    # preserved via original object IDs below.
+
     all_paths = [
         snap_path_end_to_goal(
             p,
@@ -474,10 +430,6 @@ def mixture_to_mppi_modes(mixture: TopologicalTrajectoryMixture) -> List[MPPIHom
     return modes
 
 
-# =============================================================================
-# Geometry
-# =============================================================================
-
 def _poly_vertices(obs) -> Array:
     if hasattr(obs, "vertices"):
         return np.asarray(obs.vertices, dtype=np.float64)[:, :2]
@@ -547,17 +499,8 @@ def obstacle_bounding_circles(
     max_segment_length: float = 0.10,
     wall_max_segment_length: float = 0.15,
 ) -> List[Tuple[Array, float]]:
-    """Build conservative circle covers for fast MPPI obstacle costs.
 
-    Compact polygons retain the original single bounding-circle approximation.
-    Elongated polygons, including the inserted rectangular walls, are covered by
-    a chain of overlapping circles along their principal axis. This avoids
-    replacing a thin wall with one very large circular forbidden region while
-    keeping the existing Numba circle-cost kernels unchanged.
 
-    The chain conservatively covers the polygon's PCA-aligned bounding box.
-    Exact collision classification still uses polygon signed distance.
-    """
     circles: List[Tuple[Array, float]] = []
 
     for obs in obstacles:
@@ -591,12 +534,7 @@ def obstacle_bounding_circles(
             circles.append((center, radius))
             continue
 
-        # Divide the major-axis interval into short strips. A circle centered in
-        # each strip has a radius large enough to cover the strip's far corner.
-        # Inserted walls are four-vertex elongated rectangles. Use a denser
-        # circle chain for them while retaining a slightly coarser cover for
-        # other elongated polygons. The radius still covers each strip's far
-        # corner, so the complete wall remains conservatively covered.
+
         target_segment_length = (
             wall_max_segment_length if len(poly) == 4 else max_segment_length
         )
@@ -644,23 +582,19 @@ def path_length(states: Array) -> float:
 
 
 def control_effort(controls: Array) -> float:
-    """Quadratic effort with a weak steering-rate contribution."""
+
     if len(controls) == 0:
         return 0.0
     return float(np.sum(controls[:, 0] ** 2 + 0.15 * controls[:, 1] ** 2))
 
 
 def control_smoothness(controls: Array) -> float:
-    """Quadratic variation with weak steering-rate smoothing."""
+
     if len(controls) < 2:
         return 0.0
     dU = np.diff(controls, axis=0)
     return float(np.sum(dU[:, 0] ** 2 + 0.2 * dU[:, 1] ** 2))
 
-
-# =============================================================================
-# Dynamics and reference localization
-# =============================================================================
 
 def wrap_angle(a):
     return (a + np.pi) % (2.0 * np.pi) - np.pi
@@ -671,12 +605,8 @@ def _dynamic_ackermann_derivatives(
     control: Array,
     cfg: MPPIConfig,
 ) -> Array:
-    """Continuous-time dynamic single-track Ackermann equations.
 
-    The state is ``[p_x, p_y, psi, v_x, v_y, yaw_rate, delta]`` and the
-    control is ``[longitudinal_acceleration, steering_rate]``. Front and rear
-    lateral tire forces use a linear slip-angle model with friction saturation.
-    """
+
     px, py, psi, vx, vy, yaw_rate, steering = np.asarray(state, dtype=np.float64)
     accel, steering_rate = np.asarray(control, dtype=np.float64)
 
@@ -691,9 +621,7 @@ def _dynamic_ackermann_derivatives(
     mass = float(cfg.mass)
     inertia = float(cfg.yaw_inertia)
 
-    # Regularize slip angles near standstill and fade lateral tire forces to
-    # zero as longitudinal speed vanishes. This avoids nonphysical lateral
-    # forces while preserving the full dynamic model once the vehicle moves.
+
     slip_speed = max(abs(float(vx)), float(cfg.minimum_tire_speed))
     speed_scale = min(1.0, abs(float(vx)) / float(cfg.minimum_tire_speed))
     alpha_front = math.atan2(vy + lf * yaw_rate, slip_speed) - steering
@@ -733,10 +661,8 @@ def _dynamic_ackermann_derivatives(
 
 
 def ackermann_step(x: Array, u: Array, cfg: MPPIConfig) -> Array:
-    """Advance the full dynamic Ackermann bicycle model by one sample.
 
-    A substepped semi-implicit integration is used for numerical stability.
-    """
+
     state = np.asarray(x, dtype=np.float64).copy()
     control = np.asarray(u, dtype=np.float64)
     substeps = max(1, int(cfg.dynamics_substeps))
@@ -762,7 +688,7 @@ def segment_goal_entry_state(
     goal: Array,
     goal_tolerance: float,
 ) -> Tuple[bool, Array]:
-    """Return the first dynamic Ackermann state entering the goal circle."""
+
     p0 = np.asarray(x0[:2], dtype=np.float64)
     p1 = np.asarray(x1[:2], dtype=np.float64)
     g = np.asarray(goal, dtype=np.float64)
@@ -806,11 +732,9 @@ def goal_pose_satisfied(
     goal_tolerance: float,
     cfg: MPPIConfig,
 ) -> bool:
-    """Return true when the vehicle position enters the goal region.
 
-    No terminal heading is used by the objective, controller, or success criterion.
-    """
-    _ = cfg  # Retained for call-site compatibility.
+
+    _ = cfg
     return bool(
         np.linalg.norm(np.asarray(state[:2]) - np.asarray(goal))
         <= goal_tolerance
@@ -880,10 +804,6 @@ def rollout_ackermann_batch(x0: Array, U: Array, cfg: MPPIConfig) -> Array:
 def softplus(z):
     return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
 
-
-# =============================================================================
-# Numba-accelerated kernels
-# =============================================================================
 
 if njit is not None:
     @njit(cache=True)
@@ -1236,13 +1156,12 @@ if njit is not None:
                 px = X[n, t + 1, 0]
                 py = X[n, t + 1, 1]
 
-                # Running goal cost at every predicted state. Divide by H so
-                # w_goal keeps approximately the same scale as the old terminal cost.
+
                 gx = px - goal[0]
                 gy = py - goal[1]
                 cost += (w_goal / H) * (gx * gx + gy * gy)
 
-                # Default Sigma is sigma_floor^2 I.
+
                 s00 = sigma_floor * sigma_floor
                 s01 = 0.0
                 s11 = sigma_floor * sigma_floor
@@ -1258,9 +1177,8 @@ if njit is not None:
                     s11 = cov_blocks[t, 1, 1] + sigma_floor * sigma_floor
 
                     if use_gaussian_tracking:
-                        # Closed-form eigenvalue clamp for a 2x2 covariance.
-                        # This caps the precision matrix so narrow covariance
-                        # tubes do not create non-smooth control reactions.
+
+
                         trace = s00 + s11
                         diff = s00 - s11
                         disc = math.sqrt(diff * diff + 4.0 * s01 * s01)
@@ -1280,14 +1198,13 @@ if njit is not None:
                         if p2 > max_precision:
                             p2 = max_precision
 
-                        # Eigenvectors for symmetric 2x2. If nearly diagonal,
-                        # use axis-aligned basis.
+
                         if abs(s01) < 1e-12 and abs(diff) < 1e-12:
                             inv00 = p1
                             inv01 = 0.0
                             inv11 = p2
                         else:
-                            # Eigenvector for lam1.
+
                             vx = s01
                             vy = lam1 - s00
                             norm_v = math.sqrt(vx * vx + vy * vy)
@@ -1298,7 +1215,7 @@ if njit is not None:
                                 vx /= norm_v
                                 vy /= norm_v
 
-                            # Orthogonal eigenvector for lam2.
+
                             wx = -vy
                             wy = vx
 
@@ -1307,9 +1224,9 @@ if njit is not None:
                             inv11 = p1 * vy * vy + p2 * wy * wy
 
                         mahal = ex * (inv00 * ex + inv01 * ey) + ey * (inv01 * ex + inv11 * ey)
-                        # No J_reference term: the Gaussian is a sampling/uncertainty prior only.
+
                     else:
-                        # No J_reference term: mean paths do not constrain rollout ranking.
+
                         pass
 
                     if t < H - 1:
@@ -1318,7 +1235,7 @@ if njit is not None:
                         if math.sqrt(tx * tx + ty * ty) > 1e-9:
                             ref_heading = math.atan2(ty, tx)
                             dh = _wrap_angle_nb(X[n, t + 1, 2] - ref_heading)
-                            # No reference-heading term.
+
 
                 for j in range(M):
                     dx = px - circle_centers[j, 0]
@@ -1381,13 +1298,8 @@ if njit is not None:
         w_steering_angle,
         w_yaw_rate,
     ):
-        """Position-only, first-arrival rollout objective.
 
-        Once a rollout enters the goal region, later states and controls are not
-        scored. This matches the closed-loop trial, which terminates at the
-        first positional goal entry. Steering angle and yaw rate are penalized
-        on the scored prefix so arrival along a persistent broad arc is costly.
-        """
+
         N = U.shape[0]
         H = horizon
         M = circle_radii.shape[0]
@@ -1405,14 +1317,11 @@ if njit is not None:
                 gy = py - goal[1]
                 goal_distance_sq = gx * gx + gy * gy
 
-                # Constant alive cost directly rewards earlier first arrival.
+
                 cost += w_time_to_goal / H
                 cost += (w_goal / H) * goal_distance_sq
 
-                # Penalize persistent curvature and rotational motion directly.
-                # Steering-rate effort alone does not penalize holding a large
-                # steering angle, so without these terms a rollout can coast
-                # into the goal along a broad arc.
+
                 yaw_rate = X[n, t + 1, 5]
                 steering_angle = X[n, t + 1, 6]
                 cost += w_steering_angle * steering_angle * steering_angle
@@ -1460,7 +1369,7 @@ if njit is not None:
         hard_collision_clearance,
         hard_collision_penalty,
     ):
-        """Extra obstacle cost at interior rollout points plus a near-hard term."""
+
         N = X.shape[0]
         H = X.shape[1] - 1
         M = circle_radii.shape[0]
@@ -1477,8 +1386,7 @@ if njit is not None:
                 x1 = X[n, t + 1, 0]
                 y1 = X[n, t + 1, 1]
 
-                # q == substeps + 1 is the endpoint. Endpoints already receive
-                # the normal soft obstacle cost, but still need the hard check.
+
                 for q in range(1, substeps + 2):
                     alpha = q / denominator
                     px = x0 + alpha * (x1 - x0)
@@ -1610,7 +1518,7 @@ def apply_smooth_safe_control(
     obstacle_circles: List[Tuple[Array, float]],
     cfg: MPPIConfig,
 ) -> Array:
-    """Filter acceleration/steering-rate commands and apply one-step braking."""
+
     cmd = np.asarray(u, dtype=np.float64).copy()
 
     if previous_control is not None:
@@ -1649,8 +1557,8 @@ def apply_smooth_safe_control(
         moving_deeper = next_clearance < current_clearance - 1e-4
         below_required = next_clearance < cfg.one_step_safety_clearance
         if below_required and moving_deeper:
-            # An Ackermann vehicle cannot stop or rotate instantaneously. Apply
-            # the strongest admissible braking command and keep steering active.
+
+
             cmd[0] = cfg.accel_min if x_current[3] > 0.0 else min(0.0, cmd[0])
     return cmd
 
@@ -1660,7 +1568,7 @@ def interpolated_obstacle_penalty(
     obstacle_circles: List[Tuple[Array, float]],
     cfg: MPPIConfig,
 ) -> Array:
-    """Evaluate interior rollout points and apply a near-hard collision cost."""
+
     N = int(X.shape[0])
     if not obstacle_circles:
         return np.zeros(N, dtype=np.float64)
@@ -1719,7 +1627,7 @@ def path_min_clearance_to_circles(
     robot_radius: float,
     substeps: int = 2,
 ) -> float:
-    """Minimum robot clearance along a polyline under the circle approximation."""
+
     p = np.asarray(path, dtype=np.float64)
     if len(p) == 0 or not obstacle_circles:
         return float("inf")
@@ -1744,12 +1652,8 @@ def unblocked_mode_indices(
     obstacle_circles: List[Tuple[Array, float]],
     cfg: MPPIConfig,
 ) -> Tuple[List[int], Array]:
-    """Return usable mode indices and optional local centerline clearances.
 
-    Clearance evaluation is intentionally skipped when mode suppression is
-    disabled. This avoids repeated path interpolation and circle-distance work
-    in the default optimized configuration.
-    """
+
     if not cfg.suppress_blocked_modes or len(local_modes) <= 1:
         return (
             list(range(len(local_modes))),
@@ -1794,12 +1698,8 @@ def localize_mode_for_state_with_index(
     previous_idx: Optional[int] = None,
     max_advance: Optional[int] = None,
 ) -> Tuple[MPPIHomotopyMode, int]:
-    """
-    Localize a global homotopy path into a receding-horizon reference.
 
-    If previous_idx is provided, the selected path index is forced to move
-    monotonically. This avoids reference-window jumps and non-smooth controls.
-    """
+
     mu = mode.mean_path
     d = np.linalg.norm(mu - x_current[:2], axis=1)
     nearest_idx = int(np.argmin(d))
@@ -1955,10 +1855,6 @@ def nominal_controls_to_goal(x0: Array, goal: Array, cfg: MPPIConfig) -> Array:
     return U
 
 
-# =============================================================================
-# MPPI costs and steps
-# =============================================================================
-
 def build_empirical_nominal_bank(
     x_current: Array,
     global_mode: MPPIHomotopyMode,
@@ -1986,12 +1882,8 @@ def build_empirical_nominal_bank(
 
 
 def capped_inverse_covariance(Sigma: Array, sigma_floor: float, max_precision: float) -> Array:
-    """
-    Invert a 2x2 covariance with eigenvalue/precision clipping.
 
-    This is the non-numba fallback. The numba kernel implements the same idea
-    inline for speed.
-    """
+
     S = 0.5 * (Sigma + Sigma.T)
     vals, vecs = np.linalg.eigh(S)
     vals = np.maximum(vals, sigma_floor ** 2)
@@ -2012,7 +1904,7 @@ def fast_swarm_prior_costs(
     use_mode_prior: bool,
     use_mean_reference: bool,
 ) -> Array:
-    """Use swarm information only to generate proposals, never to alter cost."""
+
     del mode, use_gaussian_tracking, use_uncertainty_margin, use_mode_prior, use_mean_reference
     return standard_mppi_costs_batch(X, U, obstacle_circles, goal, cfg)
 
@@ -2024,7 +1916,7 @@ def standard_mppi_costs_batch(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-    """Score only the rollout prefix before first positional goal entry."""
+
     if standard_mppi_costs_batch_nb is not None:
         centers, radii = obstacle_circles_to_arrays(obstacle_circles)
         return standard_mppi_costs_batch_nb(
@@ -2087,10 +1979,6 @@ def standard_mppi_costs_batch(
     return costs
 
 
-# =============================================================================
-# Proposal-distribution MPPI variants
-# =============================================================================
-
 REP_GAUSSIAN = 1
 REP_CORRIDOR = 2
 REP_FRENET = 3
@@ -2108,11 +1996,8 @@ def stable_representation_costs(
     rep_type: int,
     use_mode_prior: bool = False,
 ) -> Array:
-    """Score every proposal variant with the identical base MPPI objective.
 
-    ``mode``, ``rep_type``, and ``use_mode_prior`` affect proposal construction or
-    diagnostics only. They intentionally do not modify rollout costs.
-    """
+
     del mode, rep_type, use_mode_prior
     return standard_mppi_costs_batch(X, U, obstacle_circles, goal, cfg)
 
@@ -2158,15 +2043,14 @@ def build_nominal_bank_for_mode(
     else:
         bank = [mean_nominal]
 
-    # Every prior-based variant receives one exact direct-to-goal proposal.
-    # This is an additional proposal only; it does not alter the shared cost.
+
     if not any(np.allclose(candidate, goal_nominal) for candidate in bank):
         bank.append(goal_nominal)
     return bank
 
 
 def enforce_ackermann_control_bounds(U: Array, cfg: MPPIConfig) -> Array:
-    """Clip sampled acceleration and steering-rate commands."""
+
     U = np.asarray(U, dtype=np.float64)
     if U.size == 0:
         return U
@@ -2199,9 +2083,7 @@ def sample_controls_from_nominal_bank(
     noise = make_temporally_correlated_noise(n, cfg.horizon, cfg, rng)
     U += noise
 
-    # Preserve every bank member exactly, then place low-noise proposals around
-    # all members rather than only around nominal_bank[0]. This keeps the control
-    # bank effective even with high exploration noise and only 150 rollouts.
+
     bank_count = len(nominal_bank)
     exact_count = min(bank_count, n)
     for j in range(exact_count):
@@ -2227,14 +2109,8 @@ def sample_gaussian_controls(
     cfg: MPPIConfig,
     rng: np.random.Generator,
 ) -> Array:
-    """Sample Cartesian path proposals from the mode Gaussian.
 
-    At each prediction index, offsets are drawn from the localized 2-D
-    covariance block Sigma_{h,t}. The offsets are smoothed over time for
-    dynamically usable paths, converted to Ackermann acceleration/steering-rate controls, and optionally
-    given a small residual control perturbation. Rollout scoring remains the
-    common task objective.
-    """
+
     H = int(cfg.horizon)
     if n <= 0:
         return np.zeros((0, H, 2), dtype=np.float64)
@@ -2259,8 +2135,7 @@ def sample_gaussian_controls(
             rng.normal(size=(n, 2)) @ transform.T
         ) * covariance_scale
 
-    # Smooth the sampled Cartesian offsets and release them gradually from the
-    # current state. The first proposal remains the exact Gaussian mean path.
+
     alpha = float(np.clip(cfg.temporal_noise_smoothing, 0.0, 0.98))
     for t in range(1, H):
         offsets[:, t, :] = (
@@ -2293,13 +2168,8 @@ def sample_frenet_controls(
     cfg: MPPIConfig,
     rng: np.random.Generator,
 ) -> Array:
-    """Generate proposals by perturbing the reference in its Frenet frame.
 
-    This is intentionally different from Cartesian/control-space sampling. Smooth
-    longitudinal and lateral offsets are sampled along the local centerline, the
-    displaced paths are converted to Ackermann acceleration/steering-rate controls, and only a small residual
-    control perturbation is added. All resulting rollouts use the common cost.
-    """
+
     H = int(cfg.horizon)
     if n <= 0:
         return np.zeros((0, H, 2), dtype=np.float64)
@@ -2329,8 +2199,7 @@ def sample_frenet_controls(
         lat[:, t] = alpha * lat[:, t - 1] + (1.0 - alpha) * lat[:, t]
         lon[:, t] = alpha * lon[:, t - 1] + (1.0 - alpha) * lon[:, t]
 
-    # Start each proposal close to the current state and gradually release the
-    # Frenet perturbation. Keep one exact centerline proposal in every batch.
+
     ramp = np.linspace(0.0, 1.0, H, dtype=np.float64)
     lat *= ramp[None, :]
     lon *= ramp[None, :]
@@ -2359,12 +2228,8 @@ def nearby_mode_indices(
     cfg: MPPIConfig,
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
 ) -> List[int]:
-    """Return a small set of nearby, currently useful priors.
 
-    Distance to the robot remains the primary locality measure. A cheap local
-    centerline-clearance term only changes the ranking, rather than discarding a
-    mode, so a route that is slightly farther but bypasses a new wall is retained.
-    """
+
     if not global_modes:
         return []
     p = np.asarray(x_current[:2], dtype=np.float64)
@@ -2380,8 +2245,7 @@ def nearby_mode_indices(
     if not local_pool:
         local_pool = [int(locality_order[0])]
 
-    # Cheap obstacle-aware ranking among local modes. This does not score extra
-    # rollouts and does not hard-reject a blocked mean path.
+
     scores = []
     for i in local_pool:
         blocked_term = 0.0
@@ -2403,7 +2267,7 @@ def nearby_mode_indices(
 
 
 def balanced_rollout_counts(total: int, groups: int) -> List[int]:
-    """Split a fixed rollout budget across groups, with counts summing to total."""
+
     total = max(1, int(total))
     groups = max(1, min(int(groups), total))
     base, remainder = divmod(total, groups)
@@ -2425,12 +2289,8 @@ def stable_swarm_mppi_step(
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
     record_optimal_traj: bool = True,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
-    """Pooled prior-proposal MPPI with one fixed total rollout budget.
 
-    Gaussian, corridor, Frenet, and control-bank variants differ only in how
-    their proposals are generated. Rollouts from all retained modes are pooled
-    before the single MPPI weighted update.
-    """
+
     if rep_type not in {
         REP_GAUSSIAN, REP_CORRIDOR, REP_FRENET, REP_CONTROL_BANK
     }:
@@ -2586,7 +2446,7 @@ def rollout_collision_mask(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-    """Return collisions occurring before first positional goal entry."""
+
     if not obstacle_circles or X.shape[0] == 0:
         return np.zeros(X.shape[0], dtype=bool)
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
@@ -2620,11 +2480,8 @@ def reject_colliding_rollouts(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-    """Reject collisions only along the scored pre-arrival rollout prefix.
 
-    If every rollout is colliding, the original costs are retained as a fallback
-    so the controller can still produce a command.
-    """
+
     if not obstacle_circles or X.shape[0] == 0:
         return costs
 
@@ -2679,7 +2536,7 @@ def update_display_trajectory(
     goal: Array,
     cfg: MPPIConfig,
 ) -> None:
-    """Display only the scored trajectory prefix through first goal entry."""
+
     sequence = info.get("planned_control_sequence")
     if sequence is None:
         return
@@ -2699,7 +2556,7 @@ def update_display_trajectory(
 
 
 def best_output_trajectory_from_costs(costs: Array, X: Array) -> Array:
-    """Return the lowest-cost predicted output trajectory from an MPPI batch."""
+
     best_idx = int(np.argmin(costs))
     return np.asarray(X[best_idx], dtype=np.float64).copy()
 
@@ -2743,10 +2600,6 @@ def standard_mppi_step(
     }
 
 
-# =============================================================================
-# Scene and swarm planner
-# =============================================================================
-
 def build_default_scene():
     scale = 4.0
     bounds_xy = (np.array([0.0, 0.0]), np.array([10.0, 10.0]))
@@ -2770,7 +2623,7 @@ def build_default_scene():
 
 def run_swarm_planner(start, goal, obstacles, scale, bounds_xy, *, seed=3):
     segs = obstacles_to_segs(obstacles, scale=scale)
-    base_action = pickle.load(open("save/best_policy.pkl", "rb"))["best_theta"]
+    base_action = pickle.load(open("save/policy.pkl", "rb"))["best_theta"]
 
     graph_goals, graph_W = build_full_graph(
         obstacles=obstacles,
@@ -2800,13 +2653,8 @@ def run_swarm_planner(start, goal, obstacles, scale, bounds_xy, *, seed=3):
     )
 
 
-# =============================================================================
-# Controller runners and metrics
-# =============================================================================
-
-
 def initial_pose(start: Array, goal: Array) -> Array:
-    """Initial dynamic Ackermann state [x, y, heading, v_x, v_y, yaw_rate, steering]."""
+
     direction = goal - start
     heading = math.atan2(direction[1], direction[0])
     return np.array([
@@ -2820,11 +2668,8 @@ def ensure_direct_goal_prior(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-    """Reserve one rollout as the exact direct-to-goal nominal.
 
-    The remaining rollouts keep the variant-specific proposal distribution.
-    The rollout objective remains identical for every controller variant.
-    """
+
     proposals = np.asarray(U, dtype=np.float64)
     if proposals.ndim != 3 or proposals.shape[0] == 0:
         return proposals
@@ -2850,7 +2695,7 @@ def run_controller_variant(
     effective_goal_tolerance = float(goal_tolerance) + max(
         0.0, float(getattr(mppi_cfg, "goal_acceptance_epsilon", 0.0))
     )
-    # Keep rollout scoring consistent with the position-only success region.
+
     mppi_cfg.rollout_goal_tolerance = effective_goal_tolerance
 
     x = initial_pose(start, goal)
@@ -2927,8 +2772,8 @@ def run_controller_variant(
             raise ValueError(f"Unknown variant {variant}")
 
         if "mppi" in variant.value:
-            # No post-hoc terminal steering: the first-arrival objective already
-            # matches the position-only stopping rule.
+
+
             u = apply_smooth_safe_control(
                 x, u, previous_control, obstacle_circles, step_cfg
             )
@@ -2938,7 +2783,7 @@ def run_controller_variant(
 
         previous_control = u.copy()
         x_next = ackermann_step(x, u, step_cfg)
-        # Success is position-only: terminate upon entering the goal region.
+
         arrived = goal_pose_satisfied(x_next, goal, effective_goal_tolerance, step_cfg)
         x = x_next
 
@@ -2992,10 +2837,6 @@ def summarize_result(result: Dict[str, object], obstacles, goal, robot_radius: f
     }
 
 
-# =============================================================================
-# Plotting
-# =============================================================================
-
 def setup_workspace(ax, obstacles, start, goal, bounds, title=None):
     xmin, xmax, ymin, ymax = normalize_plot_bounds(bounds)
 
@@ -3027,17 +2868,13 @@ def plot_paths(results: List[Dict[str, object]], obstacles, start, goal, bounds,
     fig.savefig(save_path, dpi=220, bbox_inches="tight")
 
 
-# =============================================================================
-# Dynamic blockage experiment
-# =============================================================================
-
 def obstacle_center(obs) -> Array:
-    """Return the geometric center of a polygon obstacle."""
+
     return _poly_vertices(obs).mean(axis=0)
 
 
 def translate_obstacle_to_center(obs, target_center: Array):
-    """Return a copy of ``obs`` translated so its center is ``target_center``."""
+
     vertices = _poly_vertices(obs).copy()
     shift = np.asarray(target_center, dtype=np.float64) - vertices.mean(axis=0)
     return PolyObstacle(vertices + shift[None, :])
@@ -3048,13 +2885,8 @@ def random_obstacle_center_swap(
     *,
     seed: int,
 ) -> Tuple[List[object], Tuple[int, ...]]:
-    """Randomly permute obstacle centers while preserving obstacle shapes.
 
-    Obstacle ``i`` keeps its original polygon shape but is translated to the
-    original center of obstacle ``permutation[i]``. A Sattolo shuffle is used,
-    so every obstacle moves to a different center when at least two obstacles
-    are present. The returned permutation makes each trial layout reproducible.
-    """
+
     n = len(obstacles)
     if n < 2:
         return list(obstacles), tuple(range(n))
@@ -3062,7 +2894,7 @@ def random_obstacle_center_swap(
     rng = np.random.default_rng(int(seed))
     permutation = np.arange(n, dtype=np.int64)
 
-    # Sattolo's algorithm: one random cycle, hence no fixed points.
+
     for i in range(n - 1, 0, -1):
         j = int(rng.integers(0, i))
         permutation[i], permutation[j] = permutation[j], permutation[i]
@@ -3076,27 +2908,13 @@ def random_obstacle_center_swap(
 
 
 def obstacle_center_permutation_text(permutation: Sequence[int]) -> str:
-    """Serialize an obstacle-to-original-center assignment for the trial CSV."""
+
     return ";".join(f"{i}->{int(target)}" for i, target in enumerate(permutation))
 
 
 def make_wall_between_points(p0: Array, p1: Array, width: float = 0.35, extension: float = 0.0):
-    """
-    Create a rectangular wall obstacle between two points.
 
-    Args:
-        p0, p1:
-            Endpoints of the wall centerline.
-        width:
-            Wall thickness, perpendicular to the segment p0-p1.
-        extension:
-            Optional extension at both ends along the segment direction. This is
-            useful if the wall should overlap slightly with the two obstacles it
-            connects, preventing small gaps.
 
-    Returns:
-        PolyObstacle with four vertices.
-    """
     p0 = np.asarray(p0, dtype=np.float64)
     p1 = np.asarray(p1, dtype=np.float64)
 
@@ -3129,13 +2947,8 @@ def make_wall_between_obstacles(
     width: float = 0.35,
     extension: float = 0.15,
 ):
-    """
-    Create a wall from the center of obstacle idx_a to the center of obstacle idx_b.
 
-    Indices are zero-based. For example:
-        (0, 1) connects obstacle 1 and obstacle 2 in human counting.
-        (1, 2) connects obstacle 2 and obstacle 3 in human counting.
-    """
+
     c0 = obstacle_center(obstacles[idx_a])
     c1 = obstacle_center(obstacles[idx_b])
     return make_wall_between_points(c0, c1, width=width, extension=extension)
@@ -3147,15 +2960,8 @@ def make_wall_blockers_between_obstacles(
     width: float = 0.35,
     extension: float = 0.15,
 ):
-    """
-    Create one or more wall blockers between obstacle-center pairs.
 
-    Example:
-        pairs=[(0, 1), (1, 2)]
-    creates:
-        wall from obstacle 1 center to obstacle 2 center
-        wall from obstacle 2 center to obstacle 3 center
-    """
+
     centers = [obstacle_center(obs).copy() for obs in obstacles]
     return make_wall_blockers_between_centers(
         centers=centers,
@@ -3171,13 +2977,8 @@ def make_wall_blockers_between_centers(
     width: float = 0.35,
     extension: float = 0.15,
 ):
-    """Create wall blockers between fixed spatial center anchors.
 
-    Unlike ``make_wall_blockers_between_obstacles``, this helper does not inspect
-    the current obstacle layout. It is therefore the preferred constructor when
-    obstacle shapes are later permuted between center locations but the walls
-    must remain on the same original center-to-center segments.
-    """
+
     fixed_centers = [
         np.asarray(center, dtype=np.float64).reshape(2).copy()
         for center in centers
@@ -3212,14 +3013,14 @@ def as_blocker_list(blocker_or_blockers):
 
 
 def active_obstacles_for_step(base_obstacles, blocker, step, block_step):
-    """Legacy step-based obstacle activation helper used by plotting utilities."""
+
     if step >= block_step:
         return list(base_obstacles) + as_blocker_list(blocker)
     return list(base_obstacles)
 
 
 def spatial_progress_along_start_goal(x: Array, start: Array, goal: Array) -> float:
-    """Return normalized projection progress along the start-to-goal direction."""
+
     start = np.asarray(start, dtype=np.float64)
     goal = np.asarray(goal, dtype=np.float64)
     position = np.asarray(x[:2], dtype=np.float64)
@@ -3261,19 +3062,14 @@ def run_dynamic_blockage_controller(
     record_infos: bool = True,
     record_obstacle_history: bool = True,
 ):
-    """Simulate one controller under no-wall, static-wall, or dynamic-wall conditions.
 
-    Dynamic walls activate at the earlier of the spatial progress trigger or a
-    clearance-preview trigger. The latter inserts the wall before the robot gets
-    closer than the configurable reaction distance. ``block_step`` is retained
-    only for backwards compatibility.
-    """
+
     rng = np.random.default_rng(seed)
     mppi_cfg = MPPIConfig() if mppi_cfg is None else mppi_cfg
     effective_goal_tolerance = float(goal_tolerance) + max(
         0.0, float(getattr(mppi_cfg, "goal_acceptance_epsilon", 0.0))
     )
-    # Keep rollout scoring consistent with the position-only success region.
+
     mppi_cfg.rollout_goal_tolerance = effective_goal_tolerance
 
     x = initial_pose(start, goal)
@@ -3298,8 +3094,7 @@ def run_dynamic_blockage_controller(
             mppi_cfg.robot_radius,
         )
 
-    # The obstacle geometry has only two states during a trial. Build both circle
-    # covers once, outside the timed controller loop, and reuse them at every step.
+
     base_obstacle_circles = obstacle_bounding_circles(base_obstacles)
     blocked_obstacles = list(base_obstacles) + blockers
     blocked_obstacle_circles = (
@@ -3419,8 +3214,8 @@ def run_dynamic_blockage_controller(
             raise ValueError(f"Unsupported variant: {variant}")
 
         if "mppi" in variant.value:
-            # No post-hoc terminal steering: the first-arrival objective already
-            # matches the position-only stopping rule.
+
+
             u = apply_smooth_safe_control(
                 x, u, previous_control, active_obstacle_circles, step_cfg
             )
@@ -3430,7 +3225,7 @@ def run_dynamic_blockage_controller(
 
         previous_control = u.copy()
         x_next = ackermann_step(x, u, step_cfg)
-        # Success is position-only: terminate upon entering the goal region.
+
         arrived = goal_pose_satisfied(x_next, goal, effective_goal_tolerance, step_cfg)
         x = x_next
         states.append(x.copy())
@@ -3479,7 +3274,7 @@ def run_dynamic_blockage_controller(
 
 
 def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius, goal_tolerance=0.15):
-    """Summarize a trial and classify every unsuccessful run."""
+
     states = result["states"]
     controls = result["controls"]
     condition = str(result.get("condition", "dynamic_wall"))
@@ -3487,8 +3282,7 @@ def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius
     if activation_step is not None:
         activation_step = int(activation_step)
 
-    # For static-wall baselines, the complete trajectory is considered the
-    # post-wall interval. No-wall baselines have no post-wall interval.
+
     if condition == "static_wall":
         metric_start_step: Optional[int] = 0
     elif condition == "dynamic_wall":
@@ -3625,12 +3419,8 @@ def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius
 
 
 def make_variant_color_map(results):
-    """
-    Assign one stable color per variant.
 
-    Uses tab20 for up to 20 variants. If there are more than 20, falls back to
-    evenly spaced HSV colors.
-    """
+
     variant_names = sorted({res["variant"] for res in results})
     n = len(variant_names)
 
@@ -3653,7 +3443,7 @@ def plot_dynamic_paths(results, base_obstacles, blocker, start, goal, bounds, sa
 
     color_by_variant = make_variant_color_map(results)
 
-    # Draw dynamic blocker walls distinctly.
+
     for bi, bobs in enumerate(as_blocker_list(blocker)):
         p = _poly_vertices(bobs)
         label = "dynamic wall blocker" if bi == 0 else None
@@ -3669,7 +3459,7 @@ def plot_dynamic_paths(results, base_obstacles, blocker, start, goal, bounds, sa
         b = min(res["block_step"], len(states) - 1)
         color = color_by_variant[res["variant"]]
 
-        # Before blockage: dashed, same color.
+
         ax.plot(
             states[:b+1, 0],
             states[:b+1, 1],
@@ -3679,7 +3469,7 @@ def plot_dynamic_paths(results, base_obstacles, blocker, start, goal, bounds, sa
             label=res["variant"],
         )
 
-        # After blockage: solid, same color.
+
         ax.plot(
             states[b:, 0],
             states[b:, 1],
@@ -3688,7 +3478,7 @@ def plot_dynamic_paths(results, base_obstacles, blocker, start, goal, bounds, sa
             color=color,
         )
 
-        # Mark the blockage-time state.
+
         if b < len(states):
             ax.scatter(
                 [states[b, 0]],
@@ -3712,7 +3502,7 @@ def plot_dynamic_paths(results, base_obstacles, blocker, start, goal, bounds, sa
 
 
 def safe_variant_filename(name: str) -> str:
-    """Return a filesystem-safe variant name for image/GIF outputs."""
+
     import re
     return re.sub(r"[^A-Za-z0-9_.-]+", "_", str(name)).strip("_")
 
@@ -3725,14 +3515,8 @@ def tracked_reference_for_frame(
     *,
     mppi_cfg: Optional[MPPIConfig] = None,
 ) -> Optional[Array]:
-    """
-    Return the reference path to overlay in the per-variant animation.
 
-    The simulation logic is intentionally unchanged. This function reconstructs
-    the visual reference from the recorded state:
-      - prior-conditioned controllers display the nearest homotopy mean;
-      - Standard MPPI displays a short current-to-goal guide.
-    """
+
     if not modes:
         return None
 
@@ -3754,7 +3538,7 @@ def tracked_reference_for_frame(
 
 
 def optimal_trajectory_for_frame(result: Dict[str, object], frame: int) -> Optional[Array]:
-    """Return the recorded optimal predicted horizon trajectory for a frame."""
+
     infos = result.get("infos", [])
     if not infos:
         return None
@@ -3782,7 +3566,7 @@ def draw_control_input_arrows(
     min_length: float = 0.08,
     max_length: float = 0.35,
 ):
-    """Draw the vehicle velocity direction along the executed trajectory."""
+
     if controls is None or len(controls) == 0:
         return
     last = min(int(upto_step), len(controls) - 1, len(states) - 1)
@@ -3821,12 +3605,8 @@ def animate_dynamic_blockage_one_variant(
     mppi_cfg: Optional[MPPIConfig] = None,
     fps: int = 8,
 ):
-    """
-    Save one GIF per controller variant.
 
-    The robot path and the tracked reference use the exact same variant color as
-    plot_dynamic_paths. The reference is dashed and updated at every frame.
-    """
+
     try:
         from matplotlib.animation import FuncAnimation, PillowWriter
     except Exception as exc:
@@ -3973,7 +3753,7 @@ def animate_dynamic_blockage_by_variant(
     *,
     mppi_cfg: Optional[MPPIConfig] = None,
 ):
-    """Save one tracked-reference GIF for each result/variant."""
+
     from pathlib import Path
 
     out_dir = Path(output_dir)
@@ -3995,10 +3775,8 @@ def animate_dynamic_blockage_by_variant(
         )
 
 def animate_dynamic_blockage(results, base_obstacles, blocker, start, goal, bounds, save_path):
-    """
-    Save a simple GIF animation of the robot moving and the blocker appearing.
-    Requires pillow. If unavailable, this function prints a warning and returns.
-    """
+
+
     try:
         from matplotlib.animation import FuncAnimation, PillowWriter
     except Exception as exc:
@@ -4024,7 +3802,7 @@ def animate_dynamic_blockage(results, base_obstacles, blocker, start, goal, boun
                 linewidth=1.0,
             )
 
-        # Draw blocker after the common block step.
+
         block_step = min(r["block_step"] for r in results)
         if frame >= block_step:
             for bi, bobs in enumerate(as_blocker_list(blocker)):
@@ -4120,29 +3898,13 @@ def main_dynamic_blockage():
     for i, m in enumerate(modes):
         print(f"  h{i}: sig={m.signature}, pi={m.probability:.3f}, samples={len(m.sample_paths or [])}")
 
-    # Dynamic wall-blocker configuration.
-    # Indices are zero-based:
-    #   (0, 1) means "wall from obstacle 1 center to obstacle 2 center"
-    #   (1, 2) means "wall from obstacle 2 center to obstacle 3 center"
-    #
-    # Change these values to choose which corridors close.
+
     wall_pairs = []
     wall_width = 0.40
     wall_extension = 0.20
     block_step = 150
     seed = 2
 
-    # wall_pairs = [(0, 1), (1, 2)]
-    # wall_width = 0.40
-    # wall_extension = 0.20
-    # block_step = 25
-    # seed = 2
-
-    # wall_pairs = [(0, 2), (1, 2)]
-    # wall_width = 0.40
-    # wall_extension = 0.20
-    # block_step = 30
-    # seed = 2
 
     blocker = make_wall_blockers_between_obstacles(
         obstacles=base_obstacles,
@@ -4228,14 +3990,6 @@ def main_dynamic_blockage():
         results.append(res)
         rows.append(row)
 
-    # if pd is not None:
-    #     df = pd.DataFrame(rows)
-    #     df.to_csv("dynamic_block_soft_metrics.csv", index=False)
-    #     print("Saved metrics: dynamic_block_soft_metrics.csv")
-    #     print(df)
-    # else:
-    #     for row in rows:
-    #         print(row)
 
     from pathlib import Path
     output_dir = Path("dynamic_block_soft")
@@ -4265,10 +4019,6 @@ def main_dynamic_blockage():
 
     plt.show()
 
-
-# =============================================================================
-# Main experiment
-# =============================================================================
 
 def main():
     print("Variant file: dynamic_block_soft")
@@ -4306,7 +4056,7 @@ def main():
     for i, m in enumerate(modes):
         print(f"  h{i}: sig={m.signature}, pi={m.probability:.3f}, samples={len(m.sample_paths or [])}")
 
-    # Keep settings identical where possible.
+
     mppi_cfg = MPPIConfig(
         horizon=50,
         num_rollouts=32,
@@ -4423,19 +4173,6 @@ def main():
         for row in rows:
             print(row)
 
-    # # Plot one seed's trajectories for all variants.
-    # one_seed_results = [r for r in all_results if r["seed"] == RUN_SEEDS[0]]
-    # if one_seed_results:
-    #     plot_path = f"{OUTPUT_PREFIX}_paths.png"
-    #     plot_paths(one_seed_results, obstacles, start, goal, bounds_xy, plot_path)
-    #     print(f"Saved path plot: {plot_path}")
-
-    # plt.show()
-
-
-# =============================================================================
-# Lightweight repeated robustness experiment
-# =============================================================================
 
 @dataclass(frozen=True)
 class DynamicWallScenario:
@@ -4447,7 +4184,7 @@ class DynamicWallScenario:
 
 
 def default_dynamic_wall_scenarios() -> List[DynamicWallScenario]:
-    """Smoke-test scenarios using a common spatial activation threshold."""
+
     return [
         DynamicWallScenario("wall_0_1", ((0, 1),), trigger_progress=0.25),
         DynamicWallScenario("wall_0_2", ((0, 2),), trigger_progress=0.25),
@@ -4476,7 +4213,7 @@ def validate_dynamic_wall_scenario(scenario: DynamicWallScenario, obstacle_count
 
 
 def append_csv_row(path, row, fieldnames):
-    """Append one row immediately so long experiments preserve partial results."""
+
     path = str(path)
     write_header = not Path(path).exists() or Path(path).stat().st_size == 0
     with open(path, "a", newline="") as f:
@@ -4546,7 +4283,7 @@ def save_robustness_summaries(
         group = all_group[all_group["failure_reason"] != "controller_error"]
         n = int(len(group))
         successes = int(group["success"].sum()) if n else 0
-        exposed = group[group["exposed_to_blocker"] == True]  # noqa: E712
+        exposed = group[group["exposed_to_blocker"] == True]
         exposed_n = int(len(exposed))
         exposed_successes = int(exposed["success"].sum()) if exposed_n else 0
         lo, hi = wilson_interval(successes, n)
@@ -4592,7 +4329,7 @@ def save_robustness_summaries(
     ).reset_index()
     by_scenario.to_csv(scenario_summary_csv, index=False)
 
-    # Compact matrix requested for quickly comparing success by scenario.
+
     success_matrix = by_scenario.pivot_table(
         index=["condition", "scenario_id"],
         columns="variant",
@@ -4602,15 +4339,9 @@ def save_robustness_summaries(
     success_matrix.to_csv(success_per_scenario_csv)
 
 
-def main_dynamic_robustness():
-    """Run paired robustness trials with randomized obstacle-center layouts.
+def main():
 
-    For each controller seed, obstacle polygon shapes are reassigned to the
-    original obstacle centers using a seeded derangement. The same permuted
-    layout is shared by every controller variant and every condition for that
-    seed. Dynamic and static walls are built once from the original scene, so
-    their geometry remains fixed even though obstacle shapes exchange centers.
-    """
+
     controller_seeds = RUN_SEEDS
     swarm_seeds = [RUN_SWARM_SEED]
     scenarios = default_dynamic_wall_scenarios()
@@ -4626,8 +4357,7 @@ def main_dynamic_robustness():
         ControllerVariant.STANDARD_MPPI,
     ]
 
-    # Homotopy-conditioned proposals plus swept-path collision rejection.
-    # Command smoothing retains bounded reaction through explicit slew limits.
+
     cfg = MPPIConfig(
         horizon=50,
         num_rollouts=32,
@@ -4660,15 +4390,13 @@ def main_dynamic_robustness():
     for scenario in scenarios:
         validate_dynamic_wall_scenario(scenario, len(original_obstacles))
 
-    # Freeze the original spatial center anchors before any obstacle swapping.
-    # Wall-pair indices refer to these center slots, not to obstacle identities.
+
     fixed_wall_centers = tuple(
         obstacle_center(obs).copy()
         for obs in original_obstacles
     )
 
-    # Build walls from the frozen anchors exactly once. These objects are reused
-    # for every randomized obstacle layout, so wall positions never move.
+
     fixed_blockers = {
         scenario.scenario_id: make_wall_blockers_between_centers(
             centers=fixed_wall_centers,
@@ -4823,8 +4551,8 @@ def main_dynamic_robustness():
 
     for swarm_seed in swarm_seeds:
         for controller_seed in controller_seeds:
-            # Use controller_seed as the layout seed so all swarm seeds, variants,
-            # and wall conditions can be compared on the same obstacle layouts.
+
+
             obstacle_layout_seed = int(controller_seed)
             swapped_obstacles, center_permutation = random_obstacle_center_swap(
                 original_obstacles,
@@ -4856,7 +4584,7 @@ def main_dynamic_robustness():
                 base_setup_error = repr(exc)
                 print(f"  Random-layout prior failed: {base_setup_error}")
 
-            # Baseline 1: randomized obstacles, no wall.
+
             execute_condition_trials(
                 condition="no_wall",
                 scenario_id="no_wall",
@@ -4876,12 +4604,11 @@ def main_dynamic_robustness():
             )
 
             for scenario in scenarios:
-                # This blocker was built from fixed_wall_centers, not from the
-                # swapped layout, and therefore stays on the original segment.
+
+
                 blocker = fixed_blockers[scenario.scenario_id]
 
-                # Main test: prior matches randomized obstacles but not the wall
-                # that appears later at the fixed original-scene position.
+
                 execute_condition_trials(
                     condition="dynamic_wall",
                     scenario_id=scenario.scenario_id,
@@ -4900,8 +4627,7 @@ def main_dynamic_robustness():
                     setup_error=base_setup_error,
                 )
 
-                # Baseline 2: oracle prior knows the fixed wall from t=0 while
-                # using the same randomized obstacle layout.
+
                 static_obstacles = list(swapped_obstacles) + list(blocker)
                 if base_setup_error:
                     static_modes = None
@@ -4962,4 +4688,4 @@ def main_dynamic_robustness():
 
 
 if __name__ == "__main__":
-    main_dynamic_robustness()
+    main()
