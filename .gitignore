@@ -1,5 +1,6 @@
 /.venv_rtb
 /__pycache__
+*.pyc
 /geometry/__pycache__
 /graph/__pycache__
 /planner/__pycache__
