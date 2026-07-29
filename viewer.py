@@ -34,9 +34,9 @@ from matplotlib.patches import Circle, Ellipse, Polygon
 UNICYCLE_VARIANTS = [
     ("Standard MPPI", "standard_mppi"),
     ("Control bank", "control_bank_mppi"),
-    ("Gaussian prior", "gaussian_prior_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
-    ("Frenet prior", "frenet_corridor_mppi"),
+    ("Gaussian prior", "gaussian_prior_mppi"),
+    ("Frenet prior", "frenet_prior_mppi"),
     ("Mode-selecting Gaussian", "mode_selecting_gaussian_mppi"),
     ("Mode-selecting corridor", "mode_selecting_corridor_mppi"),
 ]
@@ -44,9 +44,9 @@ UNICYCLE_VARIANTS = [
 ACKERMAN_VARIANTS = [
     ("Standard MPPI", "standard_mppi"),
     ("Control bank", "control_bank_mppi"),
-    ("Gaussian prior", "gaussian_prior_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
-    ("Frenet prior", "frenet_corridor_mppi"),
+    ("Gaussian prior", "gaussian_prior_mppi"),
+    ("Frenet prior", "frenet_prior_mppi"),
 ]
 
 VARIANTS = list(UNICYCLE_VARIANTS)

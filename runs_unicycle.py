@@ -50,7 +50,7 @@ class ControllerVariant(str, Enum):
     GAUSSIAN_PRIOR_MPPI = "gaussian_prior_mppi"
 
     CORRIDOR_PRIOR_MPPI = "corridor_prior_mppi"
-    FRENET_CORRIDOR_MPPI = "frenet_corridor_mppi"
+    FRENET_PRIOR_MPPI = "frenet_prior_mppi"
     CONTROL_BANK_MPPI = "control_bank_mppi"
     MODE_SELECTING_GAUSSIAN_MPPI = "mode_selecting_gaussian_mppi"
     MODE_SELECTING_CORRIDOR_MPPI = "mode_selecting_corridor_mppi"
@@ -278,6 +278,50 @@ class MPPIHomotopyMode:
     mean_path: Array
     cov_blocks: Array
     sample_paths: Optional[List[Array]] = None
+    arc_length: Optional[Array] = None
+    gaussian_variance: Optional[Array] = None
+    longitudinal_variance: Optional[Array] = None
+    lateral_variance: Optional[Array] = None
+
+
+def prepare_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
+    """Precompute geometry and covariance projections once for a global mode."""
+    mean_path = np.asarray(mode.mean_path, dtype=np.float64)
+    cov_blocks = np.asarray(mode.cov_blocks, dtype=np.float64)
+    count = len(mean_path)
+
+    arc_length = np.zeros(count, dtype=np.float64)
+    if count > 1:
+        arc_length[1:] = np.cumsum(np.linalg.norm(np.diff(mean_path, axis=0), axis=1))
+
+    tangent = np.empty_like(mean_path)
+    if count <= 1:
+        tangent[:] = np.array([1.0, 0.0])
+    else:
+        tangent[0] = mean_path[1] - mean_path[0]
+        tangent[-1] = mean_path[-1] - mean_path[-2]
+        if count > 2:
+            tangent[1:-1] = mean_path[2:] - mean_path[:-2]
+        norms = np.linalg.norm(tangent, axis=1)
+        valid = norms > 1e-12
+        tangent[valid] /= norms[valid, None]
+        tangent[~valid] = np.array([1.0, 0.0])
+
+    normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+    symmetric_cov = 0.5 * (cov_blocks + np.swapaxes(cov_blocks, 1, 2))
+    gaussian_variance = 0.5 * np.trace(symmetric_cov, axis1=1, axis2=2)
+    longitudinal_variance = np.einsum(
+        'ni,nij,nj->n', tangent, symmetric_cov, tangent, optimize=True
+    )
+    lateral_variance = np.einsum(
+        'ni,nij,nj->n', normal, symmetric_cov, normal, optimize=True
+    )
+
+    mode.arc_length = np.ascontiguousarray(arc_length)
+    mode.gaussian_variance = np.ascontiguousarray(np.maximum(gaussian_variance, 0.0))
+    mode.longitudinal_variance = np.ascontiguousarray(np.maximum(longitudinal_variance, 0.0))
+    mode.lateral_variance = np.ascontiguousarray(np.maximum(lateral_variance, 0.0))
+    return mode
 
 
 def fit_topological_trajectory_mixture(
@@ -390,13 +434,13 @@ def mixture_to_mppi_modes(mixture: TopologicalTrajectoryMixture) -> List[MPPIHom
 
         sample_paths = [unflatten_path(v) for v in mode.samples]
 
-        modes.append(MPPIHomotopyMode(
+        modes.append(prepare_mode_prior_cache(MPPIHomotopyMode(
             signature=sig,
             probability=mode.probability,
             mean_path=mean_path,
             cov_blocks=cov_blocks,
             sample_paths=sample_paths,
-        ))
+        )))
 
     modes.sort(key=lambda m: m.probability, reverse=True)
     return modes
@@ -653,7 +697,87 @@ def softplus(z):
     return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
 
 
+def _ensure_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
+    if (
+        mode.arc_length is None
+        or mode.gaussian_variance is None
+        or mode.longitudinal_variance is None
+        or mode.lateral_variance is None
+    ):
+        return prepare_mode_prior_cache(mode)
+    return mode
+
+
 if njit is not None:
+    @njit(cache=True)
+    def localize_prior_horizon_nb(
+        mean_path, cov_blocks, arc_length,
+        gaussian_variance, longitudinal_variance, lateral_variance,
+        start_index, horizon,
+    ):
+        count = mean_path.shape[0]
+        H = max(1, int(horizon))
+        local_mean = np.empty((H, 2), dtype=np.float64)
+        local_cov = np.empty((H, 2, 2), dtype=np.float64)
+        local_gaussian = np.empty(H, dtype=np.float64)
+        local_longitudinal = np.empty(H, dtype=np.float64)
+        local_lateral = np.empty(H, dtype=np.float64)
+
+        start = min(max(int(start_index), 0), max(0, count - 1))
+        s0 = arc_length[start]
+        s1 = arc_length[count - 1]
+
+        cursor = start
+        for t in range(H):
+            alpha_h = 0.0 if H == 1 else t / (H - 1.0)
+            target = s0 + alpha_h * (s1 - s0)
+            while cursor + 1 < count and arc_length[cursor + 1] < target:
+                cursor += 1
+            right = min(cursor + 1, count - 1)
+            left = cursor
+            denom = arc_length[right] - arc_length[left]
+            alpha = 0.0 if denom <= 1e-12 else (target - arc_length[left]) / denom
+            beta = 1.0 - alpha
+
+            for j in range(2):
+                local_mean[t, j] = beta * mean_path[left, j] + alpha * mean_path[right, j]
+                for k in range(2):
+                    local_cov[t, j, k] = (
+                        beta * cov_blocks[left, j, k]
+                        + alpha * cov_blocks[right, j, k]
+                    )
+            local_gaussian[t] = beta * gaussian_variance[left] + alpha * gaussian_variance[right]
+            local_longitudinal[t] = beta * longitudinal_variance[left] + alpha * longitudinal_variance[right]
+            local_lateral[t] = beta * lateral_variance[left] + alpha * lateral_variance[right]
+
+        return local_mean, local_cov, local_gaussian, local_longitudinal, local_lateral
+
+    @njit(cache=True)
+    def apply_gaussian_prior_noise_nb(noise, variance, sigma_floor, covariance_scale):
+        floor_var = sigma_floor * sigma_floor
+        reference_std = max(sigma_floor, 1e-9)
+        for t in range(noise.shape[1]):
+            var = max(variance[t], floor_var)
+            scale = covariance_scale * math.sqrt(var) / reference_std
+            for n in range(noise.shape[0]):
+                noise[n, t, 0] *= scale
+                noise[n, t, 1] *= scale
+        return noise
+
+    @njit(cache=True)
+    def apply_frenet_prior_noise_nb(
+        noise, longitudinal_variance, lateral_variance,
+        sigma_floor, longitudinal_scale, lateral_scale,
+    ):
+        floor_var = sigma_floor * sigma_floor
+        reference_std = max(sigma_floor, 1e-9)
+        for t in range(noise.shape[1]):
+            lon = longitudinal_scale * math.sqrt(max(longitudinal_variance[t], floor_var)) / reference_std
+            lat = lateral_scale * math.sqrt(max(lateral_variance[t], floor_var)) / reference_std
+            for n in range(noise.shape[0]):
+                noise[n, t, 0] *= lon
+                noise[n, t, 1] *= lat
+        return noise
     @njit(cache=True)
     def _wrap_angle_nb(a):
         return (a + np.pi) % (2.0 * np.pi) - np.pi
@@ -1177,6 +1301,9 @@ if njit is not None:
         return best
 
 else:
+    localize_prior_horizon_nb = None
+    apply_gaussian_prior_noise_nb = None
+    apply_frenet_prior_noise_nb = None
     rollout_unicycle_batch_nb = None
     rollout_unicycle_single_nb = None
     nominal_controls_to_track_path_nb = None
@@ -1444,11 +1571,9 @@ def localize_mode_for_state_with_index(
     previous_idx: Optional[int] = None,
     max_advance: Optional[int] = None,
 ) -> Tuple[MPPIHomotopyMode, int]:
-
-
-    mu = mode.mean_path
-    d = np.linalg.norm(mu - x_current[:2], axis=1)
-    nearest_idx = int(np.argmin(d))
+    mode = _ensure_mode_prior_cache(mode)
+    mu = np.asarray(mode.mean_path, dtype=np.float64)
+    nearest_idx = int(np.argmin(np.sum((mu - x_current[:2]) ** 2, axis=1)))
 
     if previous_idx is None:
         idx = nearest_idx
@@ -1458,13 +1583,39 @@ def localize_mode_for_state_with_index(
             idx = min(idx, int(previous_idx) + int(max_advance))
         idx = min(idx, len(mu) - 2)
 
-    tail = mu[idx:] if idx < len(mu) - 1 else mu[-2:]
-    local_mu = resample_path(tail, H)
+    args = (
+        np.asarray(mode.mean_path, dtype=np.float64),
+        np.asarray(mode.cov_blocks, dtype=np.float64),
+        np.asarray(mode.arc_length, dtype=np.float64),
+        np.asarray(mode.gaussian_variance, dtype=np.float64),
+        np.asarray(mode.longitudinal_variance, dtype=np.float64),
+        np.asarray(mode.lateral_variance, dtype=np.float64),
+        idx,
+        H,
+    )
+    if localize_prior_horizon_nb is not None:
+        local_mu, local_cov, local_gaussian, local_longitudinal, local_lateral = (
+            localize_prior_horizon_nb(*args)
+        )
+    else:
+        source_s = np.linspace(mode.arc_length[idx], mode.arc_length[-1], H)
+        local_mu = np.column_stack([
+            np.interp(source_s, mode.arc_length, mode.mean_path[:, 0]),
+            np.interp(source_s, mode.arc_length, mode.mean_path[:, 1]),
+        ])
+        local_cov = np.empty((H, 2, 2), dtype=np.float64)
+        for row in range(2):
+            for col in range(2):
+                local_cov[:, row, col] = np.interp(
+                    source_s, mode.arc_length, mode.cov_blocks[:, row, col]
+                )
+        local_gaussian = np.interp(source_s, mode.arc_length, mode.gaussian_variance)
+        local_longitudinal = np.interp(source_s, mode.arc_length, mode.longitudinal_variance)
+        local_lateral = np.interp(source_s, mode.arc_length, mode.lateral_variance)
 
-    source_ids = np.linspace(idx, len(mu) - 1, H)
-    local_cov = np.zeros((H, 2, 2), dtype=np.float64)
-    for t, j in enumerate(source_ids):
-        local_cov[t] = mode.cov_blocks[int(round(j))]
+    local_arc = np.zeros(H, dtype=np.float64)
+    if H > 1:
+        local_arc[1:] = np.cumsum(np.linalg.norm(np.diff(local_mu, axis=0), axis=1))
 
     return MPPIHomotopyMode(
         signature=mode.signature,
@@ -1472,8 +1623,11 @@ def localize_mode_for_state_with_index(
         mean_path=local_mu,
         cov_blocks=local_cov,
         sample_paths=None,
+        arc_length=local_arc,
+        gaussian_variance=local_gaussian,
+        longitudinal_variance=local_longitudinal,
+        lateral_variance=local_lateral,
     ), idx
-
 
 def localize_mode_for_state(mode: MPPIHomotopyMode, x_current: Array, H: int) -> MPPIHomotopyMode:
     local_mode, _ = localize_mode_for_state_with_index(
@@ -1811,6 +1965,44 @@ def sample_controls_from_nominal_bank(
     return enforce_forward_curve_proposals(U, cfg)
 
 
+def sample_exact_control_bank(
+    x_current: Array,
+    global_mode: MPPIHomotopyMode,
+    fallback_nominal: Array,
+    n: int,
+    cfg: MPPIConfig,
+    rng: np.random.Generator,
+    previous_idx: Optional[int] = None,
+) -> Array:
+    """Use inverse controls of empirical trajectories without added control noise."""
+    if n <= 0:
+        return np.zeros((0, cfg.horizon, 2), dtype=np.float64)
+
+    candidates: List[Array] = []
+    if global_mode.sample_paths:
+        order = rng.permutation(len(global_mode.sample_paths))
+        for sid in order:
+            local_path, _ = localize_path_for_state_with_index(
+                global_mode.sample_paths[int(sid)],
+                x_current,
+                cfg.horizon,
+                previous_idx=(
+                    previous_idx if cfg.use_monotonic_reference_progress else None
+                ),
+                max_advance=(
+                    cfg.max_reference_index_advance
+                    if cfg.use_monotonic_reference_progress else None
+                ),
+            )
+            candidates.append(nominal_controls_to_track_path(x_current, local_path, cfg))
+
+    if not candidates:
+        candidates = [np.asarray(fallback_nominal, dtype=np.float64).copy()]
+
+    U = np.stack([candidates[i % len(candidates)].copy() for i in range(n)], axis=0)
+    return enforce_forward_curve_proposals(U, cfg)
+
+
 def sample_gaussian_controls(
     x_current: Array,
     local_mode: MPPIHomotopyMode,
@@ -1818,57 +2010,34 @@ def sample_gaussian_controls(
     cfg: MPPIConfig,
     rng: np.random.Generator,
 ) -> Array:
-
-
+    """Sample in control space with Numba-scaled isotropic prior uncertainty."""
     H = int(cfg.horizon)
     if n <= 0:
         return np.zeros((0, H, 2), dtype=np.float64)
 
+    local_mode = _ensure_mode_prior_cache(local_mode)
     mean_path = np.asarray(local_mode.mean_path, dtype=np.float64)
-    if len(mean_path) != H:
-        mean_path = resample_path(mean_path, H)
+    nominal = nominal_controls_to_track_path(x_current, mean_path, cfg)
+    noise = make_temporally_correlated_noise(n, H, cfg, rng)
 
-    offsets = np.zeros((n, H, 2), dtype=np.float64)
-    covariance_scale = max(0.0, float(cfg.gaussian_covariance_scale))
-    variance_floor = float(cfg.sigma_floor) ** 2
-
-    for t in range(H):
-        S = 0.5 * (
-            np.asarray(local_mode.cov_blocks[t], dtype=np.float64)
-            + np.asarray(local_mode.cov_blocks[t], dtype=np.float64).T
+    variance = np.asarray(local_mode.gaussian_variance, dtype=np.float64)
+    if apply_gaussian_prior_noise_nb is not None:
+        noise = apply_gaussian_prior_noise_nb(
+            noise,
+            variance,
+            float(cfg.sigma_floor),
+            float(cfg.gaussian_covariance_scale),
         )
-        values, vectors = np.linalg.eigh(S)
-        values = np.maximum(values, variance_floor)
-        transform = vectors @ np.diag(np.sqrt(values))
-        offsets[:, t, :] = (
-            rng.normal(size=(n, 2)) @ transform.T
-        ) * covariance_scale
+    else:
+        floor_var = float(cfg.sigma_floor) ** 2
+        scale = float(cfg.gaussian_covariance_scale) * np.sqrt(
+            np.maximum(variance, floor_var)
+        ) / max(float(cfg.sigma_floor), 1e-9)
+        noise *= scale[None, :, None]
 
-
-    alpha = float(np.clip(cfg.temporal_noise_smoothing, 0.0, 0.98))
-    for t in range(1, H):
-        offsets[:, t, :] = (
-            alpha * offsets[:, t - 1, :]
-            + (1.0 - alpha) * offsets[:, t, :]
-        )
-    offsets *= np.linspace(0.0, 1.0, H, dtype=np.float64)[None, :, None]
-
-    low_noise_count = min(max(1, int(cfg.low_noise_proposal_count)), n)
-    offsets[:low_noise_count] *= float(cfg.low_noise_proposal_scale)
-    offsets[0, :, :] = 0.0
-
-    U = np.zeros((n, H, 2), dtype=np.float64)
-    for i in range(n):
-        path_i = mean_path + offsets[i]
-        U[i] = nominal_controls_to_track_path(x_current, path_i, cfg)
-
-    if n > 1 and cfg.gaussian_control_noise_scale > 0.0:
-        residual = make_temporally_correlated_noise(n - 1, H, cfg, rng)
-        U[1:] += float(cfg.gaussian_control_noise_scale) * residual
-
-    U[0] = nominal_controls_to_track_path(x_current, mean_path, cfg)
+    U = nominal[None, :, :] + noise
+    U[0] = nominal
     return enforce_forward_curve_proposals(U, cfg)
-
 
 def sample_frenet_controls(
     x_current: Array,
@@ -1877,59 +2046,44 @@ def sample_frenet_controls(
     cfg: MPPIConfig,
     rng: np.random.Generator,
 ) -> Array:
-
-
+    """Sample in control space with Numba-scaled Frenet prior uncertainty."""
     H = int(cfg.horizon)
     if n <= 0:
         return np.zeros((0, H, 2), dtype=np.float64)
 
+    local_mode = _ensure_mode_prior_cache(local_mode)
     mean_path = np.asarray(local_mode.mean_path, dtype=np.float64)
-    if len(mean_path) != H:
-        mean_path = resample_path(mean_path, H)
+    nominal = nominal_controls_to_track_path(x_current, mean_path, cfg)
+    noise = make_temporally_correlated_noise(n, H, cfg, rng)
 
-    tangent = np.gradient(mean_path, axis=0)
-    tangent_norm = np.linalg.norm(tangent, axis=1, keepdims=True)
-    tangent = tangent / np.maximum(tangent_norm, 1e-9)
-    normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
+    longitudinal = np.asarray(local_mode.longitudinal_variance, dtype=np.float64)
+    lateral = np.asarray(local_mode.lateral_variance, dtype=np.float64)
+    if apply_frenet_prior_noise_nb is not None:
+        noise = apply_frenet_prior_noise_nb(
+            noise,
+            longitudinal,
+            lateral,
+            float(cfg.sigma_floor),
+            float(cfg.frenet_longitudinal_noise_scale),
+            float(cfg.frenet_lateral_noise_scale),
+        )
+    else:
+        floor_var = float(cfg.sigma_floor) ** 2
+        reference_std = max(float(cfg.sigma_floor), 1e-9)
+        noise[:, :, 0] *= (
+            float(cfg.frenet_longitudinal_noise_scale)
+            * np.sqrt(np.maximum(longitudinal, floor_var))
+            / reference_std
+        )[None, :]
+        noise[:, :, 1] *= (
+            float(cfg.frenet_lateral_noise_scale)
+            * np.sqrt(np.maximum(lateral, floor_var))
+            / reference_std
+        )[None, :]
 
-    lateral_std = np.empty(H, dtype=np.float64)
-    longitudinal_std = np.empty(H, dtype=np.float64)
-    for t in range(H):
-        S = 0.5 * (local_mode.cov_blocks[t] + local_mode.cov_blocks[t].T)
-        lat_var = float(normal[t] @ S @ normal[t])
-        lon_var = float(tangent[t] @ S @ tangent[t])
-        lateral_std[t] = cfg.frenet_lateral_noise_scale * math.sqrt(max(lat_var, cfg.sigma_floor ** 2))
-        longitudinal_std[t] = cfg.frenet_longitudinal_noise_scale * math.sqrt(max(lon_var, cfg.sigma_floor ** 2))
-
-    lat = rng.normal(size=(n, H)) * lateral_std[None, :]
-    lon = rng.normal(size=(n, H)) * longitudinal_std[None, :]
-    alpha = float(np.clip(cfg.temporal_noise_smoothing, 0.0, 0.98))
-    for t in range(1, H):
-        lat[:, t] = alpha * lat[:, t - 1] + (1.0 - alpha) * lat[:, t]
-        lon[:, t] = alpha * lon[:, t - 1] + (1.0 - alpha) * lon[:, t]
-
-
-    ramp = np.linspace(0.0, 1.0, H, dtype=np.float64)
-    lat *= ramp[None, :]
-    lon *= ramp[None, :]
-    k = min(max(1, int(cfg.low_noise_proposal_count)), n)
-    lat[:k] *= float(cfg.low_noise_proposal_scale)
-    lon[:k] *= float(cfg.low_noise_proposal_scale)
-    lat[0, :] = 0.0
-    lon[0, :] = 0.0
-
-    U = np.zeros((n, H, 2), dtype=np.float64)
-    for i in range(n):
-        path_i = mean_path + lon[i, :, None] * tangent + lat[i, :, None] * normal
-        U[i] = nominal_controls_to_track_path(x_current, path_i, cfg)
-
-    if n > 1 and cfg.frenet_control_noise_scale > 0.0:
-        residual = make_temporally_correlated_noise(n - 1, H, cfg, rng)
-        U[1:] += float(cfg.frenet_control_noise_scale) * residual
-
-    U[0] = nominal_controls_to_track_path(x_current, mean_path, cfg)
+    U = nominal[None, :, :] + noise
+    U[0] = nominal
     return enforce_forward_curve_proposals(U, cfg)
-
 
 def nearby_mode_indices(
     global_modes: Sequence[MPPIHomotopyMode],
@@ -2072,16 +2226,22 @@ def stable_swarm_mppi_step(
             U = sample_gaussian_controls(x_current, local_mode, n, cfg, rng)
         elif rep_type == REP_FRENET:
             U = sample_frenet_controls(x_current, local_mode, n, cfg, rng)
+        elif rep_type == REP_CONTROL_BANK:
+            U = sample_exact_control_bank(
+                x_current, global_mode, nominal_bank[0], n, cfg, rng,
+                previous_idx=progress_by_mode.get(key),
+            )
         else:
+            # Corridor prior: one mean-control center with ordinary MPPI noise.
+            mean_nominal = nominal_controls_to_track_path(
+                x_current, local_mode.mean_path, cfg
+            )
             U = sample_controls_from_nominal_bank(
-                nominal_bank,
-                n,
-                cfg,
-                rng,
-                prefer_empirical=use_empirical_init,
+                [mean_nominal], n, cfg, rng, prefer_empirical=False
             )
 
-        U = ensure_direct_goal_prior(U, x_current, goal, cfg)
+        if rep_type != REP_CONTROL_BANK:
+            U = ensure_direct_goal_prior(U, x_current, goal, cfg)
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
         costs = stable_representation_costs(
             X,
@@ -2193,26 +2353,17 @@ def mode_selecting_stable_mppi_step(
                 x_current, local_mode, rollouts_per_mode, cfg, rng
             )
         else:
-            nominal_bank = build_nominal_bank_for_mode(
-                x_current,
-                local_mode,
-                global_mode,
-                goal,
-                cfg,
-                rng,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                previous_idx=progress_by_mode.get(str(global_mode.signature)),
+            mean_nominal = nominal_controls_to_track_path(
+                x_current, local_mode.mean_path, cfg
             )
             U = sample_controls_from_nominal_bank(
-                nominal_bank,
+                [mean_nominal],
                 rollouts_per_mode,
                 cfg,
                 rng,
                 prefer_empirical=False,
             )
 
-        U = ensure_direct_goal_prior(U, x_current, goal, cfg)
         X = rollout_unicycle_batch(x_current, U, cfg.dt)
         costs = stable_representation_costs(
             X,
@@ -2708,7 +2859,7 @@ def run_controller_variant(
                 record_optimal_traj=record_infos,
             )
 
-        elif variant == ControllerVariant.FRENET_CORRIDOR_MPPI:
+        elif variant == ControllerVariant.FRENET_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
                 x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_FRENET,
@@ -3176,7 +3327,7 @@ def run_dynamic_blockage_controller(
                 record_optimal_traj=record_infos,
             )
 
-        elif variant == ControllerVariant.FRENET_CORRIDOR_MPPI:
+        elif variant == ControllerVariant.FRENET_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
                 x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_FRENET,
@@ -4046,7 +4197,7 @@ def main_dynamic_blockage():
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        ControllerVariant.FRENET_CORRIDOR_MPPI,
+        ControllerVariant.FRENET_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
         ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI,
         ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
@@ -4186,7 +4337,7 @@ def main():
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        ControllerVariant.FRENET_CORRIDOR_MPPI,
+        ControllerVariant.FRENET_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
         ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI,
         ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
@@ -4447,7 +4598,7 @@ def main():
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        ControllerVariant.FRENET_CORRIDOR_MPPI,
+        ControllerVariant.FRENET_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
         ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI,
         ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI,
@@ -4622,15 +4773,6 @@ def main():
                         record_infos=False,
                         record_obstacle_history=False,
                     )
-                    row = summarize_dynamic_result(
-                        result,
-                        controller_base_obstacles,
-                        blocker,
-                        goal,
-                        cfg.robot_radius,
-                        goal_tolerance=goal_tolerance,
-                    )
-                    row.update(base_row)
                 except Exception as exc:
                     row = dict(base_row)
                     row.update({
@@ -4641,11 +4783,34 @@ def main():
                         "not_reaching": False,
                         "error": repr(exc),
                     })
+                else:
+                    try:
+                        row = summarize_dynamic_result(
+                            result,
+                            controller_base_obstacles,
+                            blocker,
+                            goal,
+                            cfg.robot_radius,
+                            goal_tolerance=goal_tolerance,
+                        )
+                        row.update(base_row)
+                    except Exception as exc:
+                        reached_goal = bool(result.get("reached_goal", False))
+                        row = dict(base_row)
+                        row.update({
+                            "success": reached_goal,
+                            "failure_reason": "summary_error",
+                            "reached_goal": reached_goal,
+                            "collision": False,
+                            "not_reaching": not reached_goal,
+                            "error": repr(exc),
+                        })
 
             append_csv_row(detail_csv, row, fieldnames)
             print(
                 f"  success={row.get('success')} "
                 f"failure={row.get('failure_reason') or '-'} "
+                f"error={row.get('error') or '-'}"
             )
 
     for swarm_seed in swarm_seeds:
