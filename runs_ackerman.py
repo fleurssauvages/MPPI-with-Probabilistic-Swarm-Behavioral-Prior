@@ -122,6 +122,11 @@ class MPPIConfig:
     w_time_to_goal: float = 20.0
     rollout_goal_tolerance: float = 0.30
     w_obstacle: float = 500.0
+    w_boundary: float = 500.0
+    boundary_xmin: float = 0.0
+    boundary_xmax: float = 10.0
+    boundary_ymin: float = 0.0
+    boundary_ymax: float = 10.0
     w_control: float = 0.004
     w_control_smooth: float = 0.40
 
@@ -1415,6 +1420,59 @@ if njit is not None:
         return extras
 
     @njit(cache=True)
+    def boundary_penalty_nb(
+        X,
+        xmin,
+        xmax,
+        ymin,
+        ymax,
+        robot_radius,
+        base_safety_margin,
+        w_boundary,
+        collision_substeps,
+        hard_collision_clearance,
+        hard_collision_penalty,
+    ):
+        N = X.shape[0]
+        H = X.shape[1] - 1
+        extras = np.zeros(N, dtype=np.float64)
+        substeps = max(0, int(collision_substeps))
+        denominator = float(substeps + 1)
+        required_margin = robot_radius + base_safety_margin
+
+        for n in range(N):
+            cost = 0.0
+            for t in range(H):
+                x0 = X[n, t, 0]
+                y0 = X[n, t, 1]
+                x1 = X[n, t + 1, 0]
+                y1 = X[n, t + 1, 1]
+
+                for q in range(1, substeps + 2):
+                    alpha = q / denominator
+                    px = x0 + alpha * (x1 - x0)
+                    py = y0 + alpha * (y1 - y0)
+
+                    clearance = min(
+                        px - xmin,
+                        xmax - px,
+                        py - ymin,
+                        ymax - py,
+                    ) - robot_radius
+
+                    if q <= substeps:
+                        sp = _softplus_scalar_nb(8.0 * (required_margin - (clearance + robot_radius)))
+                        cost += (w_boundary / denominator) * sp * sp
+
+                    if clearance < hard_collision_clearance:
+                        penetration = hard_collision_clearance - clearance
+                        cost += hard_collision_penalty * (1.0 + penetration * penetration)
+
+            extras[n] = cost
+
+        return extras
+
+    @njit(cache=True)
     def point_in_poly_nb(px, py, poly):
         inside = False
         n = poly.shape[0]
@@ -1500,6 +1558,7 @@ else:
     fast_swarm_prior_costs_nb = None
     standard_mppi_costs_batch_nb = None
     interpolated_obstacle_penalty_nb = None
+    boundary_penalty_nb = None
     min_clearance_nb = None
 
 
@@ -1909,6 +1968,55 @@ def fast_swarm_prior_costs(
     return standard_mppi_costs_batch(X, U, obstacle_circles, goal, cfg)
 
 
+def boundary_penalty(X: Array, cfg: MPPIConfig) -> Array:
+    states = np.asarray(X, dtype=np.float64)
+    if states.shape[0] == 0:
+        return np.zeros(0, dtype=np.float64)
+
+    if boundary_penalty_nb is not None:
+        return boundary_penalty_nb(
+            states,
+            float(cfg.boundary_xmin),
+            float(cfg.boundary_xmax),
+            float(cfg.boundary_ymin),
+            float(cfg.boundary_ymax),
+            float(cfg.robot_radius),
+            float(cfg.base_safety_margin),
+            float(cfg.w_boundary),
+            int(cfg.collision_substeps),
+            float(cfg.hard_collision_clearance),
+            float(cfg.hard_collision_penalty),
+        )
+
+    N = states.shape[0]
+    extras = np.zeros(N, dtype=np.float64)
+    substeps = max(0, int(cfg.collision_substeps))
+    denominator = float(substeps + 1)
+    required_margin = float(cfg.robot_radius + cfg.base_safety_margin)
+
+    for t in range(states.shape[1] - 1):
+        p0 = states[:, t, :2]
+        p1 = states[:, t + 1, :2]
+        for q in range(1, substeps + 2):
+            alpha = q / denominator
+            p = p0 + alpha * (p1 - p0)
+            wall_distance = np.minimum.reduce([
+                p[:, 0] - cfg.boundary_xmin,
+                cfg.boundary_xmax - p[:, 0],
+                p[:, 1] - cfg.boundary_ymin,
+                cfg.boundary_ymax - p[:, 1],
+            ])
+            clearance = wall_distance - cfg.robot_radius
+            if q <= substeps:
+                extras += (cfg.w_boundary / denominator) * (
+                    softplus(8.0 * (required_margin - wall_distance)) ** 2
+                )
+            penetration = np.maximum(0.0, cfg.hard_collision_clearance - clearance)
+            extras += cfg.hard_collision_penalty * (penetration > 0.0) * (1.0 + penetration ** 2)
+
+    return extras
+
+
 def standard_mppi_costs_batch(
     X: Array,
     U: Array,
@@ -1919,7 +2027,7 @@ def standard_mppi_costs_batch(
 
     if standard_mppi_costs_batch_nb is not None:
         centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        return standard_mppi_costs_batch_nb(
+        costs = standard_mppi_costs_batch_nb(
             np.asarray(X, dtype=np.float64),
             np.asarray(U, dtype=np.float64),
             centers,
@@ -1937,6 +2045,7 @@ def standard_mppi_costs_batch(
             float(cfg.w_steering_angle),
             float(cfg.w_yaw_rate),
         )
+        return costs + boundary_penalty(X, cfg)
 
     N, H, _ = U.shape
     costs = np.zeros(N, dtype=np.float64)
@@ -1976,7 +2085,7 @@ def standard_mppi_costs_batch(
                 dU[:, 0] ** 2 + 0.2 * dU[:, 1] ** 2
             )
 
-    return costs
+    return costs + boundary_penalty(X, cfg)
 
 
 REP_GAUSSIAN = 1

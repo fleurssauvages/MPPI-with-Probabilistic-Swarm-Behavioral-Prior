@@ -950,28 +950,28 @@ class InteractiveMPPIViewer:
             f"{VARIANT_TO_DISPLAY.get(bundle.variant_value, bundle.variant_value)} | "
             f"{bundle.condition.replace('_', ' ')} | step {frame}/{len(states)-1}"
         )
-        self.ax.set_title(title)
+        # self.ax.set_title(title)
         status = f"control: {control_text}\ndisplayed mode: {mode_text}\nwall: {wall_state}"
         if extra_text:
             status += "\n" + extra_text
-        self.ax.text(
-            0.01,
-            0.99,
-            status,
-            transform=self.ax.transAxes,
-            va="top",
-            ha="left",
-            fontsize=8.5,
-            bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.82, edgecolor="0.7"),
-            zorder=20,
-        )
+        # self.ax.text(
+        #     0.01,
+        #     0.99,
+        #     status,
+        #     transform=self.ax.transAxes,
+        #     va="top",
+        #     ha="left",
+        #     fontsize=8.5,
+        #     bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.82, edgecolor="0.7"),
+        #     zorder=20,
+        # )
 
         legend_handles = [
             Line2D([0], [0], color="#1f77b4", linewidth=2.4, label="executed path"),
             Line2D([0], [0], color="#ff7f0e", linewidth=2.2, linestyle="--", label="MPPI output"),
             Line2D([0], [0], color="#9467bd", linewidth=2.0, label="displayed prior"),
         ]
-        self.ax.legend(handles=legend_handles, loc="lower right", fontsize=8, framealpha=0.88)
+        # self.ax.legend(handles=legend_handles, loc="lower right", fontsize=8, framealpha=0.88)
 
         self.frame_label_var.set(f"Frame {frame} / {len(states) - 1}")
         self.canvas.draw_idle()
@@ -1118,7 +1118,7 @@ class InteractiveMPPIViewer:
                     angle=angle,
                     facecolor="#9467bd",
                     edgecolor="#9467bd",
-                    alpha=0.10,
+                    alpha=0.20,
                     linewidth=0.8,
                     zorder=2,
                 )
