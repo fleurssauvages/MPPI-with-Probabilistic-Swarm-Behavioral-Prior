@@ -36,7 +36,6 @@ UNICYCLE_VARIANTS = [
     ("Control bank", "control_bank_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
     ("Gaussian prior", "gaussian_prior_mppi"),
-    ("Frenet prior", "frenet_prior_mppi"),
     ("Mode-selecting Gaussian", "mode_selecting_gaussian_mppi"),
     ("Mode-selecting corridor", "mode_selecting_corridor_mppi"),
 ]
@@ -46,7 +45,6 @@ ACKERMAN_VARIANTS = [
     ("Control bank", "control_bank_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
     ("Gaussian prior", "gaussian_prior_mppi"),
-    ("Frenet prior", "frenet_prior_mppi"),
 ]
 
 VARIANTS = list(UNICYCLE_VARIANTS)
@@ -1084,8 +1082,6 @@ class InteractiveMPPIViewer:
 
         if variant in gaussian_variants:
             self._draw_covariance_ellipses(local_mode)
-        elif variant == "frenet_corridor_mppi":
-            self._draw_frenet_covariance(local_mode)
         elif variant in empirical_variants:
             self._draw_empirical_samples(global_mode, state)
         elif variant in corridor_variants:
@@ -1119,37 +1115,6 @@ class InteractiveMPPIViewer:
                     facecolor="#9467bd",
                     edgecolor="#9467bd",
                     alpha=0.20,
-                    linewidth=0.8,
-                    zorder=2,
-                )
-            )
-
-    def _draw_frenet_covariance(self, local_mode: Any) -> None:
-
-        assert self.bundle is not None
-        mean = np.asarray(local_mode.mean_path, dtype=float)
-        covariances = np.asarray(local_mode.cov_blocks, dtype=float)
-        tangent = np.gradient(mean, axis=0)
-        tangent /= np.maximum(np.linalg.norm(tangent, axis=1, keepdims=True), 1e-9)
-        normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
-        lateral_scale = float(getattr(self.bundle.cfg, "frenet_lateral_noise_scale", 1.0))
-        longitudinal_scale = float(getattr(self.bundle.cfg, "frenet_longitudinal_noise_scale", 1.0))
-
-        for index in range(0, len(mean), 4):
-            covariance = np.asarray(covariances[index], dtype=float)[:2, :2]
-            covariance = 0.5 * (covariance + covariance.T)
-            lateral_variance = max(float(normal[index] @ covariance @ normal[index]), 0.0)
-            longitudinal_variance = max(float(tangent[index] @ covariance @ tangent[index]), 0.0)
-            angle = math.degrees(math.atan2(tangent[index, 1], tangent[index, 0]))
-            self.ax.add_patch(
-                Ellipse(
-                    mean[index],
-                    width=2.0 * longitudinal_scale * math.sqrt(longitudinal_variance),
-                    height=2.0 * lateral_scale * math.sqrt(lateral_variance),
-                    angle=angle,
-                    facecolor="#9467bd",
-                    edgecolor="#9467bd",
-                    alpha=0.10,
                     linewidth=0.8,
                     zorder=2,
                 )

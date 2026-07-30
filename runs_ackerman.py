@@ -41,7 +41,7 @@ except Exception as exc:
 Array = np.ndarray
 
 
-RUN_SEEDS = list(range(100))
+RUN_SEEDS = list(range(5))
 RUN_SWARM_SEED = 5
 OUTPUT_PREFIX = "dynamic_block_soft"
 
@@ -51,7 +51,6 @@ class ControllerVariant(str, Enum):
 
 
     CORRIDOR_PRIOR_MPPI = "corridor_prior_mppi"
-    FRENET_PRIOR_MPPI = "frenet_prior_mppi"
     CONTROL_BANK_MPPI = "control_bank_mppi"
 
     STANDARD_MPPI = "standard_mppi"
@@ -97,9 +96,7 @@ class MPPIConfig:
     noise_steering_rate: float = 0.70
     temporal_noise_smoothing: float = 0.72
 
-
-    gaussian_covariance_scale: float = 1.0
-    gaussian_control_noise_scale: float = 0.15
+    gaussian_covariance_scale: float = 2.0
 
     swarm_init_probability: float = 0.60
     max_empirical_nominals_per_mode: int = 16
@@ -136,7 +133,7 @@ class MPPIConfig:
     w_yaw_rate: float = 1.0
     w_heading: float = 0.0
     w_mode_prior: float = 0.25
-    sigma_floor: float = 0.25
+    sigma_floor: float = 1.0
 
 
     w_reference_tracking: float = 1.20
@@ -158,11 +155,6 @@ class MPPIConfig:
     max_delta_steering_rate: float = 4.00
     enforce_one_step_safety: bool = True
     one_step_safety_clearance: float = 0.0
-
-
-    frenet_lateral_noise_scale: float = 0.75
-    frenet_longitudinal_noise_scale: float = 0.35
-    frenet_control_noise_scale: float = 0.30
 
 
     low_noise_proposal_count: int = 0
@@ -314,12 +306,10 @@ class MPPIHomotopyMode:
     sample_paths: Optional[List[Array]] = None
     arc_length: Optional[Array] = None
     gaussian_variance: Optional[Array] = None
-    longitudinal_variance: Optional[Array] = None
-    lateral_variance: Optional[Array] = None
 
 
 def prepare_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
-    """Precompute geometry and covariance projections once for a global mode."""
+    """Precompute arc length and isotropic covariance once for a global mode."""
     mean_path = np.asarray(mode.mean_path, dtype=np.float64)
     cov_blocks = np.asarray(mode.cov_blocks, dtype=np.float64)
     count = len(mean_path)
@@ -328,33 +318,11 @@ def prepare_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
     if count > 1:
         arc_length[1:] = np.cumsum(np.linalg.norm(np.diff(mean_path, axis=0), axis=1))
 
-    tangent = np.empty_like(mean_path)
-    if count <= 1:
-        tangent[:] = np.array([1.0, 0.0])
-    else:
-        tangent[0] = mean_path[1] - mean_path[0]
-        tangent[-1] = mean_path[-1] - mean_path[-2]
-        if count > 2:
-            tangent[1:-1] = mean_path[2:] - mean_path[:-2]
-        norms = np.linalg.norm(tangent, axis=1)
-        valid = norms > 1e-12
-        tangent[valid] /= norms[valid, None]
-        tangent[~valid] = np.array([1.0, 0.0])
-
-    normal = np.column_stack((-tangent[:, 1], tangent[:, 0]))
     symmetric_cov = 0.5 * (cov_blocks + np.swapaxes(cov_blocks, 1, 2))
     gaussian_variance = 0.5 * np.trace(symmetric_cov, axis1=1, axis2=2)
-    longitudinal_variance = np.einsum(
-        'ni,nij,nj->n', tangent, symmetric_cov, tangent, optimize=True
-    )
-    lateral_variance = np.einsum(
-        'ni,nij,nj->n', normal, symmetric_cov, normal, optimize=True
-    )
 
     mode.arc_length = np.ascontiguousarray(arc_length)
     mode.gaussian_variance = np.ascontiguousarray(np.maximum(gaussian_variance, 0.0))
-    mode.longitudinal_variance = np.ascontiguousarray(np.maximum(longitudinal_variance, 0.0))
-    mode.lateral_variance = np.ascontiguousarray(np.maximum(lateral_variance, 0.0))
     return mode
 
 
@@ -856,12 +824,7 @@ def softplus(z):
 
 
 def _ensure_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
-    if (
-        mode.arc_length is None
-        or mode.gaussian_variance is None
-        or mode.longitudinal_variance is None
-        or mode.lateral_variance is None
-    ):
+    if mode.arc_length is None or mode.gaussian_variance is None:
         return prepare_mode_prior_cache(mode)
     return mode
 
@@ -869,17 +832,13 @@ def _ensure_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
 if njit is not None:
     @njit(cache=True)
     def localize_prior_horizon_nb(
-        mean_path, cov_blocks, arc_length,
-        gaussian_variance, longitudinal_variance, lateral_variance,
-        start_index, horizon,
+        mean_path, cov_blocks, arc_length, gaussian_variance, start_index, horizon,
     ):
         count = mean_path.shape[0]
         H = max(1, int(horizon))
         local_mean = np.empty((H, 2), dtype=np.float64)
         local_cov = np.empty((H, 2, 2), dtype=np.float64)
         local_gaussian = np.empty(H, dtype=np.float64)
-        local_longitudinal = np.empty(H, dtype=np.float64)
-        local_lateral = np.empty(H, dtype=np.float64)
 
         start = min(max(int(start_index), 0), max(0, count - 1))
         s0 = arc_length[start]
@@ -905,10 +864,8 @@ if njit is not None:
                         + alpha * cov_blocks[right, j, k]
                     )
             local_gaussian[t] = beta * gaussian_variance[left] + alpha * gaussian_variance[right]
-            local_longitudinal[t] = beta * longitudinal_variance[left] + alpha * longitudinal_variance[right]
-            local_lateral[t] = beta * lateral_variance[left] + alpha * lateral_variance[right]
 
-        return local_mean, local_cov, local_gaussian, local_longitudinal, local_lateral
+        return local_mean, local_cov, local_gaussian
 
     @njit(cache=True)
     def apply_gaussian_prior_noise_nb(noise, variance, sigma_floor, covariance_scale):
@@ -922,20 +879,6 @@ if njit is not None:
                 noise[n, t, 1] *= scale
         return noise
 
-    @njit(cache=True)
-    def apply_frenet_prior_noise_nb(
-        noise, longitudinal_variance, lateral_variance,
-        sigma_floor, longitudinal_scale, lateral_scale,
-    ):
-        floor_var = sigma_floor * sigma_floor
-        reference_std = max(sigma_floor, 1e-9)
-        for t in range(noise.shape[1]):
-            lon = longitudinal_scale * math.sqrt(max(longitudinal_variance[t], floor_var)) / reference_std
-            lat = lateral_scale * math.sqrt(max(lateral_variance[t], floor_var)) / reference_std
-            for n in range(noise.shape[0]):
-                noise[n, t, 0] *= lon
-                noise[n, t, 1] *= lat
-        return noise
     @njit(cache=True)
     def _wrap_angle_nb(a):
         return (a + np.pi) % (2.0 * np.pi) - np.pi
@@ -1677,7 +1620,6 @@ if njit is not None:
 else:
     localize_prior_horizon_nb = None
     apply_gaussian_prior_noise_nb = None
-    apply_frenet_prior_noise_nb = None
     rollout_ackermann_batch_nb = None
     rollout_ackermann_single_nb = None
     nominal_controls_to_track_path_nb = None
@@ -1902,15 +1844,11 @@ def localize_mode_for_state_with_index(
         np.asarray(mode.cov_blocks, dtype=np.float64),
         np.asarray(mode.arc_length, dtype=np.float64),
         np.asarray(mode.gaussian_variance, dtype=np.float64),
-        np.asarray(mode.longitudinal_variance, dtype=np.float64),
-        np.asarray(mode.lateral_variance, dtype=np.float64),
         idx,
         H,
     )
     if localize_prior_horizon_nb is not None:
-        local_mu, local_cov, local_gaussian, local_longitudinal, local_lateral = (
-            localize_prior_horizon_nb(*args)
-        )
+        local_mu, local_cov, local_gaussian = localize_prior_horizon_nb(*args)
     else:
         source_s = np.linspace(mode.arc_length[idx], mode.arc_length[-1], H)
         local_mu = np.column_stack([
@@ -1924,8 +1862,6 @@ def localize_mode_for_state_with_index(
                     source_s, mode.arc_length, mode.cov_blocks[:, row, col]
                 )
         local_gaussian = np.interp(source_s, mode.arc_length, mode.gaussian_variance)
-        local_longitudinal = np.interp(source_s, mode.arc_length, mode.longitudinal_variance)
-        local_lateral = np.interp(source_s, mode.arc_length, mode.lateral_variance)
 
     local_arc = np.zeros(H, dtype=np.float64)
     if H > 1:
@@ -1939,8 +1875,6 @@ def localize_mode_for_state_with_index(
         sample_paths=None,
         arc_length=local_arc,
         gaussian_variance=local_gaussian,
-        longitudinal_variance=local_longitudinal,
-        lateral_variance=local_lateral,
     ), idx
 
 def localize_mode_for_state(mode: MPPIHomotopyMode, x_current: Array, H: int) -> MPPIHomotopyMode:
@@ -2245,8 +2179,7 @@ def standard_mppi_costs_batch(
 
 REP_GAUSSIAN = 1
 REP_CORRIDOR = 2
-REP_FRENET = 3
-REP_CONTROL_BANK = 4
+REP_CONTROL_BANK = 3
 
 
 def stable_representation_costs(
@@ -2440,52 +2373,6 @@ def sample_gaussian_controls(
     U[0] = nominal
     return enforce_ackermann_control_bounds(U, cfg)
 
-def sample_frenet_controls(
-    x_current: Array,
-    local_mode: MPPIHomotopyMode,
-    n: int,
-    cfg: MPPIConfig,
-    rng: np.random.Generator,
-) -> Array:
-    """Sample in control space with Numba-scaled Frenet prior uncertainty."""
-    H = int(cfg.horizon)
-    if n <= 0:
-        return np.zeros((0, H, 2), dtype=np.float64)
-
-    local_mode = _ensure_mode_prior_cache(local_mode)
-    mean_path = np.asarray(local_mode.mean_path, dtype=np.float64)
-    nominal = nominal_controls_to_track_path(x_current, mean_path, cfg)
-    noise = make_temporally_correlated_noise(n, H, cfg, rng)
-
-    longitudinal = np.asarray(local_mode.longitudinal_variance, dtype=np.float64)
-    lateral = np.asarray(local_mode.lateral_variance, dtype=np.float64)
-    if apply_frenet_prior_noise_nb is not None:
-        noise = apply_frenet_prior_noise_nb(
-            noise,
-            longitudinal,
-            lateral,
-            float(cfg.sigma_floor),
-            float(cfg.frenet_longitudinal_noise_scale),
-            float(cfg.frenet_lateral_noise_scale),
-        )
-    else:
-        floor_var = float(cfg.sigma_floor) ** 2
-        reference_std = max(float(cfg.sigma_floor), 1e-9)
-        noise[:, :, 0] *= (
-            float(cfg.frenet_longitudinal_noise_scale)
-            * np.sqrt(np.maximum(longitudinal, floor_var))
-            / reference_std
-        )[None, :]
-        noise[:, :, 1] *= (
-            float(cfg.frenet_lateral_noise_scale)
-            * np.sqrt(np.maximum(lateral, floor_var))
-            / reference_std
-        )[None, :]
-
-    U = nominal[None, :, :] + noise
-    U[0] = nominal
-    return enforce_ackermann_control_bounds(U, cfg)
-
 def nearby_mode_indices(
     global_modes: Sequence[MPPIHomotopyMode],
     x_current: Array,
@@ -2556,7 +2443,7 @@ def stable_swarm_mppi_step(
 
 
     if rep_type not in {
-        REP_GAUSSIAN, REP_CORRIDOR, REP_FRENET, REP_CONTROL_BANK
+        REP_GAUSSIAN, REP_CORRIDOR, REP_CONTROL_BANK
     }:
         raise ValueError(f"Unsupported pooled proposal representation: {rep_type}")
 
@@ -2625,8 +2512,6 @@ def stable_swarm_mppi_step(
 
         if rep_type == REP_GAUSSIAN:
             U = sample_gaussian_controls(x_current, local_mode, n, cfg, rng)
-        elif rep_type == REP_FRENET:
-            U = sample_frenet_controls(x_current, local_mode, n, cfg, rng)
         elif rep_type == REP_CONTROL_BANK:
             U = sample_exact_control_bank(
                 x_current, global_mode, nominal_bank[0], n, cfg, rng,
@@ -2999,18 +2884,6 @@ def run_controller_variant(
             u, info, swarm_progress = stable_swarm_mppi_step(
                 x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_CORRIDOR,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
-                progress_by_mode=swarm_progress,
-                obstacle_circles=obstacle_circles,
-                record_optimal_traj=record_infos,
-            )
-
-        elif variant == ControllerVariant.FRENET_PRIOR_MPPI:
-            u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, obstacles, goal, step_cfg, rng,
-                rep_type=REP_FRENET,
                 use_empirical_init=False,
                 use_mean_nominal=True,
                 use_mode_prior=False,
@@ -3449,18 +3322,6 @@ def run_dynamic_blockage_controller(
             u, info, swarm_progress = stable_swarm_mppi_step(
                 x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_CORRIDOR,
-                use_empirical_init=False,
-                use_mean_nominal=True,
-                use_mode_prior=False,
-                progress_by_mode=swarm_progress,
-                obstacle_circles=active_obstacle_circles,
-                record_optimal_traj=record_infos,
-            )
-
-        elif variant == ControllerVariant.FRENET_PRIOR_MPPI:
-            u, info, swarm_progress = stable_swarm_mppi_step(
-                x, modes, active_obstacles, goal, step_cfg, rng,
-                rep_type=REP_FRENET,
                 use_empirical_init=False,
                 use_mean_nominal=True,
                 use_mode_prior=False,
@@ -4242,12 +4103,11 @@ def main_dynamic_blockage():
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
-        ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        ControllerVariant.FRENET_PRIOR_MPPI,
-        ControllerVariant.CONTROL_BANK_MPPI,
+        # ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        # ControllerVariant.CONTROL_BANK_MPPI,
 
-        ControllerVariant.STANDARD_MPPI,
-        ControllerVariant.STANDARD_MPPI_128,
+        # ControllerVariant.STANDARD_MPPI,
+        # ControllerVariant.STANDARD_MPPI_128,
     ]
 
     results = []
@@ -4380,12 +4240,11 @@ def main():
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
-        ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        ControllerVariant.FRENET_PRIOR_MPPI,
-        ControllerVariant.CONTROL_BANK_MPPI,
+        # ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        # ControllerVariant.CONTROL_BANK_MPPI,
 
-        ControllerVariant.STANDARD_MPPI,
-        ControllerVariant.STANDARD_MPPI_128,
+        # ControllerVariant.STANDARD_MPPI,
+        # ControllerVariant.STANDARD_MPPI_128,
     ]
 
     all_results = []
@@ -4639,11 +4498,10 @@ def main():
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
-        ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        ControllerVariant.FRENET_PRIOR_MPPI,
-        ControllerVariant.CONTROL_BANK_MPPI,
-        ControllerVariant.STANDARD_MPPI,
-        ControllerVariant.STANDARD_MPPI_128,
+        # ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        # ControllerVariant.CONTROL_BANK_MPPI,
+        # ControllerVariant.STANDARD_MPPI,
+        # ControllerVariant.STANDARD_MPPI_128,
     ]
 
 
