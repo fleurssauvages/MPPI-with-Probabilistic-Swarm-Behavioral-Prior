@@ -33,7 +33,7 @@
 </p>
 
 <p align="center">
-  <img src="figures/all_variants_three_conditions.png" alt="Controller trajectories across no-wall, static-wall, and dynamic two-wall scenarios with every MPPI variant" width="100%">
+  <img src="figures/ackermann_all_variants.png" alt="Controller trajectories across no-wall, static-wall, and dynamic two-wall scenarios with every MPPI variant" width="100%">
 </p>
 
 <p align="center">
@@ -199,7 +199,6 @@ Each controller is evaluated under three environmental conditions.
 ├── runs_ackerman.py          Ackermann dynamics and controller variants
 ├── viewer.py                 Interactive visualization interface
 ├── requirements.txt          Project dependencies
-├── gifs/                     Generated animations
 ```
 
 ## Getting started

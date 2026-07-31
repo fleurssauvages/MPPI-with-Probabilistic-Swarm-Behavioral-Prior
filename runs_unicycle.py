@@ -79,7 +79,7 @@ class MPPIConfig:
     gaussian_noise_v: float = 0.5
     gaussian_noise_omega: float = 0.9
 
-    gaussian_covariance_scale: float = 1.0
+    gaussian_covariance_scale: float = 4.0
 
     swarm_init_probability: float = 0.60
     max_empirical_nominals_per_mode: int = 16
@@ -109,7 +109,7 @@ class MPPIConfig:
     w_control_smooth: float = 0.40
     w_heading: float = 0.0
     w_mode_prior: float = 0.25
-    sigma_floor: float = 1.0
+    sigma_floor: float = 0.25
 
 
     w_reference_tracking: float = 1.20
@@ -3073,7 +3073,7 @@ def run_dynamic_blockage_controller(
     *,
     seed: int,
     trigger_progress: Optional[float] = 0.25,
-    activation_preview_clearance: Optional[float] = 0.75,
+    activation_preview_clearance: Optional[float] = None,
     blocker_active_from_start: bool = False,
     condition: str = "dynamic_wall",
     block_step: Optional[int] = None,
@@ -4292,7 +4292,6 @@ def default_dynamic_wall_scenarios() -> List[DynamicWallScenario]:
 
     return [
         DynamicWallScenario("wall_0_1", ((0, 1),), trigger_progress=0.25),
-        DynamicWallScenario("wall_0_2", ((0, 2),), trigger_progress=0.25),
         DynamicWallScenario("wall_1_2", ((1, 2),), trigger_progress=0.25),
         DynamicWallScenario(
             "walls_0_1__1_2",
@@ -4452,7 +4451,7 @@ def main():
     scenarios = default_dynamic_wall_scenarios()
     max_steps = 200
     goal_tolerance = 0.30
-    activation_preview_clearance = 0.75
+    activation_preview_clearance = None
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,

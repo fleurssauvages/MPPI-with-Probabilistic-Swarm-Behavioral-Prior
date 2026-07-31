@@ -41,7 +41,7 @@ except Exception as exc:
 Array = np.ndarray
 
 
-RUN_SEEDS = list(range(5))
+RUN_SEEDS = list(range(100))
 RUN_SWARM_SEED = 5
 OUTPUT_PREFIX = "dynamic_block_soft"
 
@@ -54,7 +54,7 @@ class ControllerVariant(str, Enum):
     CONTROL_BANK_MPPI = "control_bank_mppi"
 
     STANDARD_MPPI = "standard_mppi"
-    STANDARD_MPPI_128 = "standard_mppi_128_rollouts"
+    STANDARD_MPPI_128 = "standard_mppi_256_rollouts"
 
 
 @dataclass
@@ -96,11 +96,16 @@ class MPPIConfig:
     noise_steering_rate: float = 0.70
     temporal_noise_smoothing: float = 0.72
 
-    gaussian_covariance_scale: float = 2.0
+    gaussian_covariance_scale: float = 4.0
 
     swarm_init_probability: float = 0.60
     max_empirical_nominals_per_mode: int = 16
 
+    # Oriented rectangular collision footprint. These dimensions match
+    # the Ackermann body drawn by the viewer: wheelbase + 0.26 by 0.36 m.
+    vehicle_length: float = 0.81
+    vehicle_width: float = 0.36
+    # Retained for backward compatibility with existing callers/plots.
     robot_radius: float = 0.18
     base_safety_margin: float = 0.0
     uncertainty_margin_gain: float = 0.25
@@ -117,7 +122,7 @@ class MPPIConfig:
 
 
     w_goal: float = 110.0
-    w_time_to_goal: float = 20.0
+    w_time_to_goal: float = 0.0
     rollout_goal_tolerance: float = 0.30
     w_obstacle: float = 500.0
     w_boundary: float = 500.0
@@ -129,11 +134,11 @@ class MPPIConfig:
     w_control_smooth: float = 0.40
 
 
-    w_steering_angle: float = 2.0
-    w_yaw_rate: float = 1.0
+    w_steering_angle: float = 0.0
+    w_yaw_rate: float = 0.0
     w_heading: float = 0.0
     w_mode_prior: float = 0.25
-    sigma_floor: float = 1.0
+    sigma_floor: float = 0.25
 
 
     w_reference_tracking: float = 1.20
@@ -182,6 +187,8 @@ class MPPIConfig:
             raise ValueError("tire_friction_coefficient must be positive.")
         if self.minimum_tire_speed <= 0.0:
             raise ValueError("minimum_tire_speed must be positive.")
+        if self.vehicle_length <= 0.0 or self.vehicle_width <= 0.0:
+            raise ValueError("vehicle footprint dimensions must be positive.")
         self.dynamics_substeps = max(1, int(self.dynamics_substeps))
         if self.v_min > self.v_max:
             raise ValueError("v_min must not exceed v_max.")
@@ -569,27 +576,220 @@ def obstacle_bounding_circles(
     return circles
 
 
-def min_clearance(states: Array, obstacles: Sequence, robot_radius: float) -> float:
+def ackermann_rectangle_corners(
+    state: Array,
+    vehicle_length: float,
+    vehicle_width: float,
+) -> Array:
+    """Return the four world-frame corners of the centered Ackermann body."""
+    x, y, heading = map(float, np.asarray(state, dtype=np.float64)[:3])
+    half_length = 0.5 * float(vehicle_length)
+    half_width = 0.5 * float(vehicle_width)
+    local = np.array([
+        [-half_length, -half_width],
+        [ half_length, -half_width],
+        [ half_length,  half_width],
+        [-half_length,  half_width],
+    ], dtype=np.float64)
+    c = math.cos(heading)
+    s = math.sin(heading)
+    rotation = np.array([[c, -s], [s, c]], dtype=np.float64)
+    return local @ rotation.T + np.array([x, y], dtype=np.float64)
+
+
+def rectangle_circle_clearance(
+    state: Array,
+    circle_center: Array,
+    circle_radius: float,
+    vehicle_length: float,
+    vehicle_width: float,
+) -> float:
+    """Signed clearance between an oriented rectangle and a circle."""
+    x, y, heading = map(float, np.asarray(state, dtype=np.float64)[:3])
+    center = np.asarray(circle_center, dtype=np.float64)
+    dx = float(center[0] - x)
+    dy = float(center[1] - y)
+    c = math.cos(heading)
+    s = math.sin(heading)
+    local_x = c * dx + s * dy
+    local_y = -s * dx + c * dy
+    qx = abs(local_x) - 0.5 * float(vehicle_length)
+    qy = abs(local_y) - 0.5 * float(vehicle_width)
+    outside = math.hypot(max(qx, 0.0), max(qy, 0.0))
+    inside = min(max(qx, qy), 0.0)
+    return outside + inside - float(circle_radius)
+
+
+def minimum_rectangle_circle_clearance(
+    state: Array,
+    centers: Array,
+    radii: Array,
+    vehicle_length: float,
+    vehicle_width: float,
+) -> float:
+    state_array = np.asarray(state, dtype=np.float64)
+    center_array = np.asarray(centers, dtype=np.float64)
+    radius_array = np.asarray(radii, dtype=np.float64)
+    if radius_array.size == 0:
+        return float("inf")
+    if minimum_rectangle_circle_clearance_nb is not None:
+        return float(minimum_rectangle_circle_clearance_nb(
+            state_array, center_array, radius_array,
+            float(vehicle_length), float(vehicle_width),
+        ))
+    return float(min(
+        rectangle_circle_clearance(
+            state_array, center_array[j], radius_array[j],
+            vehicle_length, vehicle_width,
+        )
+        for j in range(len(radius_array))
+    ))
+
+
+def _point_in_oriented_rectangle(
+    point: Array,
+    state: Array,
+    vehicle_length: float,
+    vehicle_width: float,
+) -> bool:
+    x, y, heading = map(float, np.asarray(state, dtype=np.float64)[:3])
+    dx = float(point[0] - x)
+    dy = float(point[1] - y)
+    c = math.cos(heading)
+    s = math.sin(heading)
+    local_x = c * dx + s * dy
+    local_y = -s * dx + c * dy
+    return bool(
+        abs(local_x) <= 0.5 * float(vehicle_length) + 1e-12
+        and abs(local_y) <= 0.5 * float(vehicle_width) + 1e-12
+    )
+
+
+def _orientation_2d(a: Array, b: Array, c: Array) -> float:
+    return float((b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]))
+
+
+def _point_on_segment(point: Array, a: Array, b: Array, eps: float = 1e-12) -> bool:
+    if abs(_orientation_2d(a, b, point)) > eps:
+        return False
+    return bool(
+        min(a[0], b[0]) - eps <= point[0] <= max(a[0], b[0]) + eps
+        and min(a[1], b[1]) - eps <= point[1] <= max(a[1], b[1]) + eps
+    )
+
+
+def _segments_intersect(a: Array, b: Array, c: Array, d: Array) -> bool:
+    o1 = _orientation_2d(a, b, c)
+    o2 = _orientation_2d(a, b, d)
+    o3 = _orientation_2d(c, d, a)
+    o4 = _orientation_2d(c, d, b)
+    if ((o1 > 0.0 and o2 < 0.0) or (o1 < 0.0 and o2 > 0.0)) and (
+        (o3 > 0.0 and o4 < 0.0) or (o3 < 0.0 and o4 > 0.0)
+    ):
+        return True
+    return bool(
+        (abs(o1) <= 1e-12 and _point_on_segment(c, a, b))
+        or (abs(o2) <= 1e-12 and _point_on_segment(d, a, b))
+        or (abs(o3) <= 1e-12 and _point_on_segment(a, c, d))
+        or (abs(o4) <= 1e-12 and _point_on_segment(b, c, d))
+    )
+
+
+def _point_segment_distance(point: Array, a: Array, b: Array) -> float:
+    ab = np.asarray(b, dtype=np.float64) - np.asarray(a, dtype=np.float64)
+    denom = float(ab @ ab)
+    if denom <= 1e-16:
+        return float(np.linalg.norm(np.asarray(point) - np.asarray(a)))
+    t = float(np.clip(((np.asarray(point) - np.asarray(a)) @ ab) / denom, 0.0, 1.0))
+    closest = np.asarray(a) + t * ab
+    return float(np.linalg.norm(np.asarray(point) - closest))
+
+
+def _segment_segment_distance(a: Array, b: Array, c: Array, d: Array) -> float:
+    if _segments_intersect(a, b, c, d):
+        return 0.0
+    return min(
+        _point_segment_distance(a, c, d),
+        _point_segment_distance(b, c, d),
+        _point_segment_distance(c, a, b),
+        _point_segment_distance(d, a, b),
+    )
+
+
+def rectangle_polygon_clearance(
+    state: Array,
+    obstacle,
+    vehicle_length: float,
+    vehicle_width: float,
+) -> float:
+    """Signed rectangle--polygon clearance; negative means overlap."""
+    rectangle = ackermann_rectangle_corners(state, vehicle_length, vehicle_width)
+    polygon = _poly_vertices(obstacle)
+
+    if any(point_in_poly(corner, polygon) for corner in rectangle):
+        return -1e-9
+    if any(
+        _point_in_oriented_rectangle(vertex, state, vehicle_length, vehicle_width)
+        for vertex in polygon
+    ):
+        return -1e-9
+
+    minimum = float("inf")
+    for i in range(len(rectangle)):
+        a = rectangle[i]
+        b = rectangle[(i + 1) % len(rectangle)]
+        for j in range(len(polygon)):
+            c = polygon[j]
+            d = polygon[(j + 1) % len(polygon)]
+            distance = _segment_segment_distance(a, b, c, d)
+            if distance <= 1e-12:
+                return -1e-9
+            minimum = min(minimum, distance)
+    return minimum
+
+
+def min_clearance(
+    states: Array,
+    obstacles: Sequence,
+    robot_radius: float = 0.18,
+    vehicle_length: float = 0.81,
+    vehicle_width: float = 0.36,
+) -> float:
+    """Minimum signed clearance using the oriented rectangular body."""
+    del robot_radius  # Kept in the signature for compatibility with older callers.
+    state_array = np.asarray(states, dtype=np.float64)
+    if state_array.size == 0 or not obstacles:
+        return float("inf")
     if min_clearance_nb is not None:
         padded, lengths = obstacles_to_padded_arrays(obstacles)
         return float(min_clearance_nb(
-            np.asarray(states, dtype=np.float64),
-            padded,
-            lengths,
-            float(robot_radius),
+            state_array, padded, lengths,
+            float(vehicle_length), float(vehicle_width),
         ))
+    values = [
+        rectangle_polygon_clearance(
+            state, obstacle, vehicle_length, vehicle_width
+        )
+        for state in state_array
+        for obstacle in obstacles
+    ]
+    return float(np.min(values)) if values else float("inf")
 
-    vals = []
-    for x in states:
-        p = x[:2]
-        for obs in obstacles:
-            d, _ = polygon_signed_distance_and_normal(p, obs)
-            vals.append(d - robot_radius)
-    return float(np.min(vals)) if vals else float("inf")
 
-
-def path_collided(states: Array, obstacles: Sequence, robot_radius: float) -> bool:
-    return min_clearance(states, obstacles, robot_radius) < 0.0
+def path_collided(
+    states: Array,
+    obstacles: Sequence,
+    robot_radius: float = 0.18,
+    vehicle_length: float = 0.81,
+    vehicle_width: float = 0.36,
+) -> bool:
+    return min_clearance(
+        states,
+        obstacles,
+        robot_radius,
+        vehicle_length=vehicle_length,
+        vehicle_width=vehicle_width,
+    ) < 0.0
 
 
 def path_length(states: Array) -> float:
@@ -1188,6 +1388,202 @@ if njit is not None:
         return noise
 
     @njit(cache=True)
+    def rectangle_circle_clearance_nb(
+        px, py, heading, circle_x, circle_y, circle_radius,
+        vehicle_length, vehicle_width,
+    ):
+        dx = circle_x - px
+        dy = circle_y - py
+        c = math.cos(heading)
+        s = math.sin(heading)
+        local_x = c * dx + s * dy
+        local_y = -s * dx + c * dy
+        qx = abs(local_x) - 0.5 * vehicle_length
+        qy = abs(local_y) - 0.5 * vehicle_width
+        outside_x = max(qx, 0.0)
+        outside_y = max(qy, 0.0)
+        outside = math.sqrt(outside_x * outside_x + outside_y * outside_y)
+        inside = min(max(qx, qy), 0.0)
+        return outside + inside - circle_radius
+
+    @njit(cache=True)
+    def minimum_rectangle_circle_clearance_nb(
+        state, circle_centers, circle_radii, vehicle_length, vehicle_width
+    ):
+        if circle_radii.shape[0] == 0:
+            return 1e18
+        px = state[0]
+        py = state[1]
+        heading = state[2]
+        best = 1e18
+        for j in range(circle_radii.shape[0]):
+            clearance = rectangle_circle_clearance_nb(
+                px, py, heading,
+                circle_centers[j, 0], circle_centers[j, 1], circle_radii[j],
+                vehicle_length, vehicle_width,
+            )
+            if clearance < best:
+                best = clearance
+        return best
+
+    @njit(cache=True)
+    def path_min_clearance_to_circles_nb(
+        path, circle_centers, circle_radii, vehicle_length, vehicle_width, substeps
+    ):
+        count = path.shape[0]
+        if count == 0 or circle_radii.shape[0] == 0:
+            return 1e18
+
+        headings = np.zeros(count, dtype=np.float64)
+        if count > 1:
+            for i in range(count):
+                if i == 0:
+                    dx = path[1, 0] - path[0, 0]
+                    dy = path[1, 1] - path[0, 1]
+                elif i == count - 1:
+                    dx = path[count - 1, 0] - path[count - 2, 0]
+                    dy = path[count - 1, 1] - path[count - 2, 1]
+                else:
+                    dx = path[i + 1, 0] - path[i - 1, 0]
+                    dy = path[i + 1, 1] - path[i - 1, 1]
+                headings[i] = math.atan2(dy, dx)
+            for i in range(1, count):
+                headings[i] = headings[i - 1] + _wrap_angle_nb(
+                    headings[i] - headings[i - 1]
+                )
+
+        best = 1e18
+        for i in range(count):
+            state = np.empty(3, dtype=np.float64)
+            state[0] = path[i, 0]
+            state[1] = path[i, 1]
+            state[2] = headings[i]
+            clearance = minimum_rectangle_circle_clearance_nb(
+                state, circle_centers, circle_radii, vehicle_length, vehicle_width
+            )
+            if clearance < best:
+                best = clearance
+
+        interpolation_count = max(0, int(substeps))
+        if count > 1 and interpolation_count > 0:
+            denominator = float(interpolation_count + 1)
+            state = np.empty(3, dtype=np.float64)
+            for i in range(count - 1):
+                dh = _wrap_angle_nb(headings[i + 1] - headings[i])
+                for q in range(1, interpolation_count + 1):
+                    alpha = q / denominator
+                    state[0] = path[i, 0] + alpha * (path[i + 1, 0] - path[i, 0])
+                    state[1] = path[i, 1] + alpha * (path[i + 1, 1] - path[i, 1])
+                    state[2] = _wrap_angle_nb(headings[i] + alpha * dh)
+                    clearance = minimum_rectangle_circle_clearance_nb(
+                        state, circle_centers, circle_radii,
+                        vehicle_length, vehicle_width,
+                    )
+                    if clearance < best:
+                        best = clearance
+        return best
+
+    @njit(cache=True)
+    def rollout_collision_mask_nb(
+        X, circle_centers, circle_radii, goal,
+        vehicle_length, vehicle_width, hard_collision_clearance,
+        rollout_goal_tolerance,
+    ):
+        N = X.shape[0]
+        H = X.shape[1] - 1
+        mask = np.zeros(N, dtype=np.bool_)
+        goal_radius_sq = rollout_goal_tolerance * rollout_goal_tolerance
+
+        for n in range(N):
+            for t in range(H):
+                state = X[n, t + 1]
+                clearance = minimum_rectangle_circle_clearance_nb(
+                    state, circle_centers, circle_radii,
+                    vehicle_length, vehicle_width,
+                )
+                if clearance < hard_collision_clearance:
+                    mask[n] = True
+                    break
+
+                gx = state[0] - goal[0]
+                gy = state[1] - goal[1]
+                if gx * gx + gy * gy <= goal_radius_sq:
+                    break
+        return mask
+
+    @njit(cache=True)
+    def apply_smooth_safe_control_nb(
+        x_current, u, previous_control, has_previous_control,
+        circle_centers, circle_radii,
+        apply_control_lowpass, control_lowpass_alpha,
+        max_delta_accel, max_delta_steering_rate,
+        enforce_one_step_safety, one_step_safety_clearance,
+        vehicle_length, vehicle_width,
+        dt, front_axle_distance, rear_axle_distance,
+        mass, yaw_inertia, cornering_stiffness_front,
+        cornering_stiffness_rear, tire_friction_coefficient,
+        gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+        minimum_tire_speed, dynamics_substeps, v_min, v_max,
+        lateral_velocity_limit, yaw_rate_limit,
+        accel_min, accel_max, steering_min, steering_max,
+        steering_rate_min, steering_rate_max,
+    ):
+        cmd = np.empty(2, dtype=np.float64)
+        cmd[0] = u[0]
+        cmd[1] = u[1]
+
+        if has_previous_control:
+            if apply_control_lowpass:
+                alpha = min(max(control_lowpass_alpha, 0.0), 1.0)
+                cmd[0] = alpha * previous_control[0] + (1.0 - alpha) * cmd[0]
+                cmd[1] = alpha * previous_control[1] + (1.0 - alpha) * cmd[1]
+
+            delta_accel = cmd[0] - previous_control[0]
+            delta_accel = min(max(delta_accel, -max_delta_accel), max_delta_accel)
+            delta_steering_rate = cmd[1] - previous_control[1]
+            delta_steering_rate = min(
+                max(delta_steering_rate, -max_delta_steering_rate),
+                max_delta_steering_rate,
+            )
+            cmd[0] = previous_control[0] + delta_accel
+            cmd[1] = previous_control[1] + delta_steering_rate
+
+        cmd[0] = min(max(cmd[0], accel_min), accel_max)
+        cmd[1] = min(max(cmd[1], steering_rate_min), steering_rate_max)
+
+        if enforce_one_step_safety and circle_radii.shape[0] > 0:
+            values = _dynamic_ackermann_step_nb(
+                x_current, cmd[0], cmd[1],
+                dt, front_axle_distance, rear_axle_distance,
+                mass, yaw_inertia, cornering_stiffness_front,
+                cornering_stiffness_rear, tire_friction_coefficient,
+                gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+                minimum_tire_speed, dynamics_substeps, v_min, v_max,
+                lateral_velocity_limit, yaw_rate_limit, accel_min, accel_max,
+                steering_min, steering_max, steering_rate_min, steering_rate_max,
+            )
+            x_next = np.empty(7, dtype=np.float64)
+            for j in range(7):
+                x_next[j] = values[j]
+
+            current_clearance = minimum_rectangle_circle_clearance_nb(
+                x_current, circle_centers, circle_radii,
+                vehicle_length, vehicle_width,
+            )
+            next_clearance = minimum_rectangle_circle_clearance_nb(
+                x_next, circle_centers, circle_radii,
+                vehicle_length, vehicle_width,
+            )
+            moving_deeper = next_clearance < current_clearance - 1e-4
+            below_required = next_clearance < one_step_safety_clearance
+            if below_required and moving_deeper:
+                if x_current[3] > 0.0:
+                    cmd[0] = accel_min
+                else:
+                    cmd[0] = min(0.0, cmd[0])
+        return cmd
+
+    @njit(cache=True)
     def fast_swarm_prior_costs_nb(
         X,
         U,
@@ -1198,7 +1594,8 @@ if njit is not None:
         circle_radii,
         goal,
         horizon,
-        robot_radius,
+        vehicle_length,
+        vehicle_width,
         base_safety_margin,
         uncertainty_margin_gain,
         w_goal,
@@ -1310,15 +1707,20 @@ if njit is not None:
                             dh = _wrap_angle_nb(X[n, t + 1, 2] - ref_heading)
 
 
+                heading = X[n, t + 1, 2]
                 for j in range(M):
                     dx = px - circle_centers[j, 0]
                     dy = py - circle_centers[j, 1]
                     norm = math.sqrt(dx * dx + dy * dy) + 1e-12
                     nx = dx / norm
                     ny = dy / norm
-                    d = norm - circle_radii[j]
+                    clearance = rectangle_circle_clearance_nb(
+                        px, py, heading,
+                        circle_centers[j, 0], circle_centers[j, 1], circle_radii[j],
+                        vehicle_length, vehicle_width,
+                    )
 
-                    margin = robot_radius + base_safety_margin
+                    margin = base_safety_margin
 
                     if use_uncertainty_margin and use_mean_reference:
                         sigma_n_sq = nx * (s00 * nx + s01 * ny) + ny * (s01 * nx + s11 * ny)
@@ -1326,7 +1728,7 @@ if njit is not None:
                             sigma_n_sq = 0.0
                         margin += uncertainty_margin_gain * math.sqrt(sigma_n_sq)
 
-                    z = 8.0 * (margin - d)
+                    z = 8.0 * (margin - clearance)
                     sp = _softplus_scalar_nb(z)
                     cost += w_obstacle * sp * sp
 
@@ -1360,7 +1762,8 @@ if njit is not None:
         circle_radii,
         goal,
         horizon,
-        robot_radius,
+        vehicle_length,
+        vehicle_width,
         base_safety_margin,
         w_goal,
         w_time_to_goal,
@@ -1400,12 +1803,14 @@ if njit is not None:
                 cost += w_steering_angle * steering_angle * steering_angle
                 cost += w_yaw_rate * yaw_rate * yaw_rate
 
+                heading = X[n, t + 1, 2]
                 for j in range(M):
-                    dx = px - circle_centers[j, 0]
-                    dy = py - circle_centers[j, 1]
-                    d = math.sqrt(dx * dx + dy * dy) - circle_radii[j]
-                    margin = robot_radius + base_safety_margin
-                    sp = _softplus_scalar_nb(8.0 * (margin - d))
+                    clearance = rectangle_circle_clearance_nb(
+                        px, py, heading,
+                        circle_centers[j, 0], circle_centers[j, 1], circle_radii[j],
+                        vehicle_length, vehicle_width,
+                    )
+                    sp = _softplus_scalar_nb(8.0 * (base_safety_margin - clearance))
                     cost += w_obstacle * sp * sp
 
                 if goal_distance_sq <= goal_radius_sq:
@@ -1435,19 +1840,18 @@ if njit is not None:
         X,
         circle_centers,
         circle_radii,
-        robot_radius,
+        vehicle_length,
+        vehicle_width,
         base_safety_margin,
         w_obstacle,
         collision_substeps,
         hard_collision_clearance,
         hard_collision_penalty,
     ):
-
         N = X.shape[0]
         H = X.shape[1] - 1
         M = circle_radii.shape[0]
         extras = np.zeros(N, dtype=np.float64)
-
         substeps = max(0, int(collision_substeps))
         denominator = float(substeps + 1)
 
@@ -1456,27 +1860,31 @@ if njit is not None:
             for t in range(H):
                 x0 = X[n, t, 0]
                 y0 = X[n, t, 1]
+                h0 = X[n, t, 2]
                 x1 = X[n, t + 1, 0]
                 y1 = X[n, t + 1, 1]
-
+                dh = _wrap_angle_nb(X[n, t + 1, 2] - h0)
 
                 for q in range(1, substeps + 2):
                     alpha = q / denominator
                     px = x0 + alpha * (x1 - x0)
                     py = y0 + alpha * (y1 - y0)
+                    heading = _wrap_angle_nb(h0 + alpha * dh)
                     min_clearance = 1e18
 
                     for j in range(M):
-                        dx = px - circle_centers[j, 0]
-                        dy = py - circle_centers[j, 1]
-                        d = math.sqrt(dx * dx + dy * dy) - circle_radii[j]
-                        clearance = d - robot_radius
+                        clearance = rectangle_circle_clearance_nb(
+                            px, py, heading,
+                            circle_centers[j, 0], circle_centers[j, 1], circle_radii[j],
+                            vehicle_length, vehicle_width,
+                        )
                         if clearance < min_clearance:
                             min_clearance = clearance
 
                         if q <= substeps:
-                            margin = robot_radius + base_safety_margin
-                            sp = _softplus_scalar_nb(8.0 * (margin - d))
+                            sp = _softplus_scalar_nb(
+                                8.0 * (base_safety_margin - clearance)
+                            )
                             cost += (w_obstacle / denominator) * sp * sp
 
                     if min_clearance < hard_collision_clearance:
@@ -1494,7 +1902,8 @@ if njit is not None:
         xmax,
         ymin,
         ymax,
-        robot_radius,
+        vehicle_length,
+        vehicle_width,
         base_safety_margin,
         w_boundary,
         collision_substeps,
@@ -1506,30 +1915,39 @@ if njit is not None:
         extras = np.zeros(N, dtype=np.float64)
         substeps = max(0, int(collision_substeps))
         denominator = float(substeps + 1)
-        required_margin = robot_radius + base_safety_margin
+        half_length = 0.5 * vehicle_length
+        half_width = 0.5 * vehicle_width
 
         for n in range(N):
             cost = 0.0
             for t in range(H):
                 x0 = X[n, t, 0]
                 y0 = X[n, t, 1]
+                h0 = X[n, t, 2]
                 x1 = X[n, t + 1, 0]
                 y1 = X[n, t + 1, 1]
+                dh = _wrap_angle_nb(X[n, t + 1, 2] - h0)
 
                 for q in range(1, substeps + 2):
                     alpha = q / denominator
                     px = x0 + alpha * (x1 - x0)
                     py = y0 + alpha * (y1 - y0)
-
+                    heading = _wrap_angle_nb(h0 + alpha * dh)
+                    c = abs(math.cos(heading))
+                    s = abs(math.sin(heading))
+                    extent_x = half_length * c + half_width * s
+                    extent_y = half_length * s + half_width * c
                     clearance = min(
-                        px - xmin,
-                        xmax - px,
-                        py - ymin,
-                        ymax - py,
-                    ) - robot_radius
+                        px - xmin - extent_x,
+                        xmax - px - extent_x,
+                        py - ymin - extent_y,
+                        ymax - py - extent_y,
+                    )
 
                     if q <= substeps:
-                        sp = _softplus_scalar_nb(8.0 * (required_margin - (clearance + robot_radius)))
+                        sp = _softplus_scalar_nb(
+                            8.0 * (base_safety_margin - clearance)
+                        )
                         cost += (w_boundary / denominator) * sp * sp
 
                     if clearance < hard_collision_clearance:
@@ -1541,23 +1959,36 @@ if njit is not None:
         return extras
 
     @njit(cache=True)
-    def point_in_poly_nb(px, py, poly):
+    def point_in_poly_nb(px, py, poly, n):
         inside = False
-        n = poly.shape[0]
         for i in range(n):
-            xi = poly[i, 0]
-            yi = poly[i, 1]
             j = i + 1
             if j == n:
                 j = 0
+            xi = poly[i, 0]
+            yi = poly[i, 1]
             xj = poly[j, 0]
             yj = poly[j, 1]
-
             if (yi > py) != (yj > py):
                 x_cross = xi + (py - yi) * (xj - xi) / ((yj - yi) + 1e-18)
                 if px < x_cross:
                     inside = not inside
         return inside
+
+    @njit(cache=True)
+    def point_in_oriented_rectangle_nb(
+        px, py, cx, cy, heading, half_length, half_width
+    ):
+        dx = px - cx
+        dy = py - cy
+        c = math.cos(heading)
+        s = math.sin(heading)
+        local_x = c * dx + s * dy
+        local_y = -s * dx + c * dy
+        return (
+            abs(local_x) <= half_length + 1e-12
+            and abs(local_y) <= half_width + 1e-12
+        )
 
     @njit(cache=True)
     def point_segment_dist_nb(px, py, ax, ay, bx, by):
@@ -1580,41 +2011,111 @@ if njit is not None:
         return math.sqrt(dx * dx + dy * dy)
 
     @njit(cache=True)
-    def min_clearance_nb(states, polys_padded, poly_lengths, robot_radius):
+    def orientation_2d_nb(ax, ay, bx, by, cx, cy):
+        return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax)
+
+    @njit(cache=True)
+    def point_on_segment_nb(px, py, ax, ay, bx, by):
+        if abs(orientation_2d_nb(ax, ay, bx, by, px, py)) > 1e-12:
+            return False
+        return (
+            min(ax, bx) - 1e-12 <= px <= max(ax, bx) + 1e-12
+            and min(ay, by) - 1e-12 <= py <= max(ay, by) + 1e-12
+        )
+
+    @njit(cache=True)
+    def segments_intersect_nb(ax, ay, bx, by, cx, cy, dx, dy):
+        o1 = orientation_2d_nb(ax, ay, bx, by, cx, cy)
+        o2 = orientation_2d_nb(ax, ay, bx, by, dx, dy)
+        o3 = orientation_2d_nb(cx, cy, dx, dy, ax, ay)
+        o4 = orientation_2d_nb(cx, cy, dx, dy, bx, by)
+        if (((o1 > 0.0 and o2 < 0.0) or (o1 < 0.0 and o2 > 0.0)) and
+                ((o3 > 0.0 and o4 < 0.0) or (o3 < 0.0 and o4 > 0.0))):
+            return True
+        return (
+            (abs(o1) <= 1e-12 and point_on_segment_nb(cx, cy, ax, ay, bx, by))
+            or (abs(o2) <= 1e-12 and point_on_segment_nb(dx, dy, ax, ay, bx, by))
+            or (abs(o3) <= 1e-12 and point_on_segment_nb(ax, ay, cx, cy, dx, dy))
+            or (abs(o4) <= 1e-12 and point_on_segment_nb(bx, by, cx, cy, dx, dy))
+        )
+
+    @njit(cache=True)
+    def segment_segment_distance_nb(ax, ay, bx, by, cx, cy, dx, dy):
+        if segments_intersect_nb(ax, ay, bx, by, cx, cy, dx, dy):
+            return 0.0
+        return min(
+            point_segment_dist_nb(ax, ay, cx, cy, dx, dy),
+            point_segment_dist_nb(bx, by, cx, cy, dx, dy),
+            point_segment_dist_nb(cx, cy, ax, ay, bx, by),
+            point_segment_dist_nb(dx, dy, ax, ay, bx, by),
+        )
+
+    @njit(cache=True)
+    def rectangle_polygon_clearance_nb(
+        state, poly, n, vehicle_length, vehicle_width
+    ):
+        cx = state[0]
+        cy = state[1]
+        heading = state[2]
+        half_length = 0.5 * vehicle_length
+        half_width = 0.5 * vehicle_width
+        c = math.cos(heading)
+        s = math.sin(heading)
+
+        corners = np.empty((4, 2), dtype=np.float64)
+        local_x = np.array((-half_length, half_length, half_length, -half_length))
+        local_y = np.array((-half_width, -half_width, half_width, half_width))
+        for i in range(4):
+            corners[i, 0] = cx + c * local_x[i] - s * local_y[i]
+            corners[i, 1] = cy + s * local_x[i] + c * local_y[i]
+            if point_in_poly_nb(corners[i, 0], corners[i, 1], poly, n):
+                return -1e-9
+
+        for i in range(n):
+            if point_in_oriented_rectangle_nb(
+                poly[i, 0], poly[i, 1], cx, cy, heading,
+                half_length, half_width,
+            ):
+                return -1e-9
+
         best = 1e18
-        S = states.shape[0]
-        M = poly_lengths.shape[0]
+        for i in range(4):
+            ni = i + 1
+            if ni == 4:
+                ni = 0
+            ax = corners[i, 0]
+            ay = corners[i, 1]
+            bx = corners[ni, 0]
+            by = corners[ni, 1]
+            for j in range(n):
+                nj = j + 1
+                if nj == n:
+                    nj = 0
+                distance = segment_segment_distance_nb(
+                    ax, ay, bx, by,
+                    poly[j, 0], poly[j, 1], poly[nj, 0], poly[nj, 1],
+                )
+                if distance <= 1e-12:
+                    return -1e-9
+                if distance < best:
+                    best = distance
+        return best
 
-        for s in range(S):
-            px = states[s, 0]
-            py = states[s, 1]
-
-            for m in range(M):
-                n = poly_lengths[m]
-                poly = polys_padded[m]
-
-                min_d = 1e18
-                for i in range(n):
-                    j = i + 1
-                    if j == n:
-                        j = 0
-                    d = point_segment_dist_nb(
-                        px, py,
-                        poly[i, 0], poly[i, 1],
-                        poly[j, 0], poly[j, 1],
-                    )
-                    if d < min_d:
-                        min_d = d
-
-                if point_in_poly_nb(px, py, poly[:n]):
-                    signed = -min_d
-                else:
-                    signed = min_d
-
-                clearance = signed - robot_radius
+    @njit(cache=True)
+    def min_clearance_nb(
+        states, polys_padded, poly_lengths, vehicle_length, vehicle_width
+    ):
+        best = 1e18
+        for state_index in range(states.shape[0]):
+            state = states[state_index]
+            for polygon_index in range(poly_lengths.shape[0]):
+                n = int(poly_lengths[polygon_index])
+                clearance = rectangle_polygon_clearance_nb(
+                    state, polys_padded[polygon_index], n,
+                    vehicle_length, vehicle_width,
+                )
                 if clearance < best:
                     best = clearance
-
         return best
 
 else:
@@ -1629,6 +2130,10 @@ else:
     standard_mppi_costs_batch_nb = None
     interpolated_obstacle_penalty_nb = None
     boundary_penalty_nb = None
+    minimum_rectangle_circle_clearance_nb = None
+    path_min_clearance_to_circles_nb = None
+    rollout_collision_mask_nb = None
+    apply_smooth_safe_control_nb = None
     min_clearance_nb = None
 
 
@@ -1647,48 +2152,55 @@ def apply_smooth_safe_control(
     obstacle_circles: List[Tuple[Array, float]],
     cfg: MPPIConfig,
 ) -> Array:
+    state = np.asarray(x_current, dtype=np.float64)
+    command = np.asarray(u, dtype=np.float64)
+    centers, radii = obstacle_circles_to_arrays(obstacle_circles)
 
-    cmd = np.asarray(u, dtype=np.float64).copy()
+    if apply_smooth_safe_control_nb is not None:
+        has_previous = previous_control is not None
+        previous = (
+            np.asarray(previous_control, dtype=np.float64)
+            if has_previous else np.zeros(2, dtype=np.float64)
+        )
+        return apply_smooth_safe_control_nb(
+            state, command, previous, has_previous, centers, radii,
+            bool(cfg.apply_control_lowpass), float(cfg.control_lowpass_alpha),
+            float(cfg.max_delta_accel), float(cfg.max_delta_steering_rate),
+            bool(cfg.enforce_one_step_safety),
+            float(cfg.one_step_safety_clearance),
+            float(cfg.vehicle_length), float(cfg.vehicle_width),
+            *_dynamic_model_arguments(cfg),
+        )
 
+    cmd = command.copy()
     if previous_control is not None:
+        previous = np.asarray(previous_control, dtype=np.float64)
         if cfg.apply_control_lowpass:
             alpha = float(np.clip(cfg.control_lowpass_alpha, 0.0, 1.0))
-            cmd = alpha * previous_control + (1.0 - alpha) * cmd
-        da = float(np.clip(
-            cmd[0] - previous_control[0],
-            -cfg.max_delta_accel,
-            cfg.max_delta_accel,
+            cmd = alpha * previous + (1.0 - alpha) * cmd
+        cmd[0] = previous[0] + float(np.clip(
+            cmd[0] - previous[0], -cfg.max_delta_accel, cfg.max_delta_accel
         ))
-        dsteer_rate = float(np.clip(
-            cmd[1] - previous_control[1],
-            -cfg.max_delta_steering_rate,
-            cfg.max_delta_steering_rate,
+        cmd[1] = previous[1] + float(np.clip(
+            cmd[1] - previous[1],
+            -cfg.max_delta_steering_rate, cfg.max_delta_steering_rate,
         ))
-        cmd[0] = previous_control[0] + da
-        cmd[1] = previous_control[1] + dsteer_rate
 
     cmd[0] = np.clip(cmd[0], cfg.accel_min, cfg.accel_max)
-    cmd[1] = np.clip(
-        cmd[1], cfg.steering_rate_min, cfg.steering_rate_max
-    )
-
-    if cfg.enforce_one_step_safety and obstacle_circles:
-        x_next = ackermann_step(x_current, cmd, cfg)
-        centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        current_clearance = float(np.min(
-            np.linalg.norm(x_current[None, :2] - centers, axis=1)
-            - radii - cfg.robot_radius
-        ))
-        next_clearance = float(np.min(
-            np.linalg.norm(x_next[None, :2] - centers, axis=1)
-            - radii - cfg.robot_radius
-        ))
-        moving_deeper = next_clearance < current_clearance - 1e-4
-        below_required = next_clearance < cfg.one_step_safety_clearance
-        if below_required and moving_deeper:
-
-
-            cmd[0] = cfg.accel_min if x_current[3] > 0.0 else min(0.0, cmd[0])
+    cmd[1] = np.clip(cmd[1], cfg.steering_rate_min, cfg.steering_rate_max)
+    if cfg.enforce_one_step_safety and len(radii) > 0:
+        x_next = ackermann_step(state, cmd, cfg)
+        current_clearance = minimum_rectangle_circle_clearance(
+            state, centers, radii, cfg.vehicle_length, cfg.vehicle_width
+        )
+        next_clearance = minimum_rectangle_circle_clearance(
+            x_next, centers, radii, cfg.vehicle_length, cfg.vehicle_width
+        )
+        if (
+            next_clearance < cfg.one_step_safety_clearance
+            and next_clearance < current_clearance - 1e-4
+        ):
+            cmd[0] = cfg.accel_min if state[3] > 0.0 else min(0.0, cmd[0])
     return cmd
 
 
@@ -1697,7 +2209,6 @@ def interpolated_obstacle_penalty(
     obstacle_circles: List[Tuple[Array, float]],
     cfg: MPPIConfig,
 ) -> Array:
-
     N = int(X.shape[0])
     if not obstacle_circles:
         return np.zeros(N, dtype=np.float64)
@@ -1708,7 +2219,8 @@ def interpolated_obstacle_penalty(
             np.asarray(X, dtype=np.float64),
             centers,
             radii,
-            float(cfg.robot_radius),
+            float(cfg.vehicle_length),
+            float(cfg.vehicle_width),
             float(cfg.base_safety_margin),
             float(cfg.w_obstacle),
             int(cfg.collision_substeps),
@@ -1719,61 +2231,99 @@ def interpolated_obstacle_penalty(
     extras = np.zeros(N, dtype=np.float64)
     substeps = max(0, int(cfg.collision_substeps))
     denominator = float(substeps + 1)
-
-    for t in range(X.shape[1] - 1):
-        p0 = X[:, t, :2]
-        p1 = X[:, t + 1, :2]
-        for q in range(1, substeps + 2):
-            alpha = q / denominator
-            p = p0 + alpha * (p1 - p0)
-            d = np.linalg.norm(
-                p[:, None, :] - centers[None, :, :], axis=2
-            ) - radii[None, :]
-            clearance = d - cfg.robot_radius
-
-            if q <= substeps:
-                margin = cfg.robot_radius + cfg.base_safety_margin
-                extras += (cfg.w_obstacle / denominator) * np.sum(
-                    softplus(8.0 * (margin - d)) ** 2,
-                    axis=1,
+    for n in range(N):
+        for t in range(X.shape[1] - 1):
+            h0 = float(X[n, t, 2])
+            dh = wrap_angle(float(X[n, t + 1, 2]) - h0)
+            for q in range(1, substeps + 2):
+                alpha = q / denominator
+                state = np.asarray(X[n, t], dtype=np.float64).copy()
+                state[:2] = X[n, t, :2] + alpha * (
+                    X[n, t + 1, :2] - X[n, t, :2]
                 )
-
-            min_clearance = np.min(clearance, axis=1)
-            penetration = np.maximum(
-                0.0,
-                cfg.hard_collision_clearance - min_clearance,
-            )
-            extras += cfg.hard_collision_penalty * (
-                penetration > 0.0
-            ) * (1.0 + penetration ** 2)
-
+                state[2] = wrap_angle(h0 + alpha * dh)
+                clearances = np.array([
+                    rectangle_circle_clearance(
+                        state,
+                        centers[j],
+                        radii[j],
+                        cfg.vehicle_length,
+                        cfg.vehicle_width,
+                    )
+                    for j in range(len(radii))
+                ], dtype=np.float64)
+                if q <= substeps:
+                    extras[n] += (cfg.w_obstacle / denominator) * np.sum(
+                        softplus(8.0 * (cfg.base_safety_margin - clearances)) ** 2
+                    )
+                min_value = float(np.min(clearances))
+                if min_value < cfg.hard_collision_clearance:
+                    penetration = cfg.hard_collision_clearance - min_value
+                    extras[n] += cfg.hard_collision_penalty * (
+                        1.0 + penetration ** 2
+                    )
     return extras
+
+
+def _path_tangent_headings(path: Array) -> Array:
+    p = np.asarray(path, dtype=np.float64)
+    if len(p) <= 1:
+        return np.zeros(len(p), dtype=np.float64)
+    tangent = np.empty_like(p)
+    tangent[0] = p[1] - p[0]
+    tangent[-1] = p[-1] - p[-2]
+    if len(p) > 2:
+        tangent[1:-1] = p[2:] - p[:-2]
+    headings = np.arctan2(tangent[:, 1], tangent[:, 0])
+    for i in range(1, len(headings)):
+        headings[i] = headings[i - 1] + wrap_angle(headings[i] - headings[i - 1])
+    return headings
 
 
 def path_min_clearance_to_circles(
     path: Array,
     obstacle_circles: List[Tuple[Array, float]],
-    robot_radius: float,
+    vehicle_length: float,
+    vehicle_width: float,
     substeps: int = 2,
 ) -> float:
-
     p = np.asarray(path, dtype=np.float64)
     if len(p) == 0 or not obstacle_circles:
         return float("inf")
 
     centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-    samples = [p]
+    if path_min_clearance_to_circles_nb is not None:
+        return float(path_min_clearance_to_circles_nb(
+            p, centers, radii, float(vehicle_length), float(vehicle_width),
+            int(substeps),
+        ))
+    headings = _path_tangent_headings(p)
+    states = [np.column_stack([p, headings])]
     if len(p) > 1:
-        for q in range(1, max(0, int(substeps)) + 1):
-            alpha = q / float(max(0, int(substeps)) + 1)
-            samples.append(p[:-1] + alpha * (p[1:] - p[:-1]))
-    points = np.vstack(samples)
-    clearance = (
-        np.linalg.norm(points[:, None, :] - centers[None, :, :], axis=2)
-        - radii[None, :]
-        - float(robot_radius)
-    )
-    return float(np.min(clearance))
+        count = max(0, int(substeps))
+        for q in range(1, count + 1):
+            alpha = q / float(count + 1)
+            positions = p[:-1] + alpha * (p[1:] - p[:-1])
+            delta_heading = np.array([
+                wrap_angle(headings[i + 1] - headings[i])
+                for i in range(len(headings) - 1)
+            ])
+            interp_heading = headings[:-1] + alpha * delta_heading
+            states.append(np.column_stack([positions, interp_heading]))
+
+    minimum = float("inf")
+    for state in np.vstack(states):
+        minimum = min(
+            minimum,
+            minimum_rectangle_circle_clearance(
+                state,
+                centers,
+                radii,
+                vehicle_length,
+                vehicle_width,
+            ),
+        )
+    return minimum
 
 
 def unblocked_mode_indices(
@@ -1793,7 +2343,8 @@ def unblocked_mode_indices(
         path_min_clearance_to_circles(
             mode.mean_path,
             obstacle_circles,
-            cfg.robot_radius,
+            cfg.vehicle_length,
+            cfg.vehicle_width,
             substeps=cfg.mode_blocking_substeps,
         )
         for mode in local_modes
@@ -2069,7 +2620,8 @@ def boundary_penalty(X: Array, cfg: MPPIConfig) -> Array:
             float(cfg.boundary_xmax),
             float(cfg.boundary_ymin),
             float(cfg.boundary_ymax),
-            float(cfg.robot_radius),
+            float(cfg.vehicle_length),
+            float(cfg.vehicle_width),
             float(cfg.base_safety_margin),
             float(cfg.w_boundary),
             int(cfg.collision_substeps),
@@ -2081,28 +2633,38 @@ def boundary_penalty(X: Array, cfg: MPPIConfig) -> Array:
     extras = np.zeros(N, dtype=np.float64)
     substeps = max(0, int(cfg.collision_substeps))
     denominator = float(substeps + 1)
-    required_margin = float(cfg.robot_radius + cfg.base_safety_margin)
+    half_length = 0.5 * float(cfg.vehicle_length)
+    half_width = 0.5 * float(cfg.vehicle_width)
 
-    for t in range(states.shape[1] - 1):
-        p0 = states[:, t, :2]
-        p1 = states[:, t + 1, :2]
-        for q in range(1, substeps + 2):
-            alpha = q / denominator
-            p = p0 + alpha * (p1 - p0)
-            wall_distance = np.minimum.reduce([
-                p[:, 0] - cfg.boundary_xmin,
-                cfg.boundary_xmax - p[:, 0],
-                p[:, 1] - cfg.boundary_ymin,
-                cfg.boundary_ymax - p[:, 1],
-            ])
-            clearance = wall_distance - cfg.robot_radius
-            if q <= substeps:
-                extras += (cfg.w_boundary / denominator) * (
-                    softplus(8.0 * (required_margin - wall_distance)) ** 2
+    for n in range(N):
+        for t in range(states.shape[1] - 1):
+            h0 = float(states[n, t, 2])
+            dh = wrap_angle(float(states[n, t + 1, 2]) - h0)
+            for q in range(1, substeps + 2):
+                alpha = q / denominator
+                px, py = states[n, t, :2] + alpha * (
+                    states[n, t + 1, :2] - states[n, t, :2]
                 )
-            penetration = np.maximum(0.0, cfg.hard_collision_clearance - clearance)
-            extras += cfg.hard_collision_penalty * (penetration > 0.0) * (1.0 + penetration ** 2)
-
+                heading = wrap_angle(h0 + alpha * dh)
+                c = abs(math.cos(heading))
+                s = abs(math.sin(heading))
+                extent_x = half_length * c + half_width * s
+                extent_y = half_length * s + half_width * c
+                clearance = min(
+                    px - cfg.boundary_xmin - extent_x,
+                    cfg.boundary_xmax - px - extent_x,
+                    py - cfg.boundary_ymin - extent_y,
+                    cfg.boundary_ymax - py - extent_y,
+                )
+                if q <= substeps:
+                    extras[n] += (cfg.w_boundary / denominator) * float(
+                        softplus(8.0 * (cfg.base_safety_margin - clearance)) ** 2
+                    )
+                if clearance < cfg.hard_collision_clearance:
+                    penetration = cfg.hard_collision_clearance - clearance
+                    extras[n] += cfg.hard_collision_penalty * (
+                        1.0 + penetration ** 2
+                    )
     return extras
 
 
@@ -2113,7 +2675,6 @@ def standard_mppi_costs_batch(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-
     if standard_mppi_costs_batch_nb is not None:
         centers, radii = obstacle_circles_to_arrays(obstacle_circles)
         costs = standard_mppi_costs_batch_nb(
@@ -2123,7 +2684,8 @@ def standard_mppi_costs_batch(
             radii,
             np.asarray(goal, dtype=np.float64),
             int(cfg.horizon),
-            float(cfg.robot_radius),
+            float(cfg.vehicle_length),
+            float(cfg.vehicle_width),
             float(cfg.base_safety_margin),
             float(cfg.w_goal),
             float(cfg.w_time_to_goal),
@@ -2139,25 +2701,30 @@ def standard_mppi_costs_batch(
     N, H, _ = U.shape
     costs = np.zeros(N, dtype=np.float64)
     goal_radius_sq = float(cfg.rollout_goal_tolerance) ** 2
-
     for n in range(N):
         arrival_index = H
         for t in range(H):
-            p = X[n, t + 1, :2]
+            state = X[n, t + 1]
+            p = state[:2]
             goal_delta = p - goal
             goal_distance_sq = float(goal_delta @ goal_delta)
             costs[n] += cfg.w_time_to_goal / H
             costs[n] += (cfg.w_goal / H) * goal_distance_sq
-            steering_angle = float(X[n, t + 1, 6])
-            yaw_rate = float(X[n, t + 1, 5])
+            steering_angle = float(state[6])
+            yaw_rate = float(state[5])
             costs[n] += cfg.w_steering_angle * steering_angle ** 2
             costs[n] += cfg.w_yaw_rate * yaw_rate ** 2
 
             for center, radius in obstacle_circles:
-                d = float(np.linalg.norm(p - center) - radius)
-                margin = cfg.robot_radius + cfg.base_safety_margin
+                clearance = rectangle_circle_clearance(
+                    state,
+                    center,
+                    radius,
+                    cfg.vehicle_length,
+                    cfg.vehicle_width,
+                )
                 costs[n] += cfg.w_obstacle * float(
-                    softplus(8.0 * (margin - d)) ** 2
+                    softplus(8.0 * (cfg.base_safety_margin - clearance)) ** 2
                 )
 
             if goal_distance_sq <= goal_radius_sq:
@@ -2405,7 +2972,8 @@ def nearby_mode_indices(
             clearance = path_min_clearance_to_circles(
                 local_mode.mean_path,
                 obstacle_circles,
-                cfg.robot_radius,
+                cfg.vehicle_length,
+                cfg.vehicle_width,
                 substeps=0,
             )
             blocked_term = max(0.0, float(cfg.mode_blocking_clearance) - clearance)
@@ -2601,26 +3169,38 @@ def rollout_collision_mask(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-
-    if not obstacle_circles or X.shape[0] == 0:
-        return np.zeros(X.shape[0], dtype=bool)
+    state_batch = np.asarray(X, dtype=np.float64)
+    if not obstacle_circles or state_batch.shape[0] == 0:
+        return np.zeros(state_batch.shape[0], dtype=bool)
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
     radii = np.asarray([r for _, r in obstacle_circles], dtype=np.float64)
-    points = np.asarray(X[:, 1:, :2], dtype=np.float64)
-    delta = points[:, :, None, :] - centers[None, None, :, :]
-    clearance = (
-        np.linalg.norm(delta, axis=-1)
-        - radii[None, None, :]
-        - float(cfg.robot_radius)
-    )
-    collision_by_step = np.any(
-        clearance < float(cfg.hard_collision_clearance), axis=2
-    )
+    goal_array = np.asarray(goal, dtype=np.float64)
+    if rollout_collision_mask_nb is not None:
+        return rollout_collision_mask_nb(
+            state_batch, centers, radii, goal_array,
+            float(cfg.vehicle_length), float(cfg.vehicle_width),
+            float(cfg.hard_collision_clearance),
+            float(cfg.rollout_goal_tolerance),
+        )
+    points = np.asarray(state_batch[:, 1:, :2], dtype=np.float64)
+    collision_by_step = np.zeros(points.shape[:2], dtype=bool)
+    for n in range(points.shape[0]):
+        for t in range(points.shape[1]):
+            clearance = minimum_rectangle_circle_clearance(
+                state_batch[n, t + 1],
+                centers,
+                radii,
+                cfg.vehicle_length,
+                cfg.vehicle_width,
+            )
+            collision_by_step[n, t] = (
+                clearance < float(cfg.hard_collision_clearance)
+            )
+
     goal_by_step = np.linalg.norm(
         points - np.asarray(goal, dtype=np.float64)[None, None, :], axis=2
     ) <= float(cfg.rollout_goal_tolerance)
-
-    colliding = np.zeros(X.shape[0], dtype=bool)
+    colliding = np.zeros(state_batch.shape[0], dtype=bool)
     for n in range(X.shape[0]):
         reached = np.flatnonzero(goal_by_step[n])
         stop = int(reached[0]) + 1 if len(reached) else points.shape[1]
@@ -2962,11 +3542,11 @@ def run_controller_variant(
     }
 
 
-def summarize_result(result: Dict[str, object], obstacles, goal, robot_radius: float, goal_tolerance: float = 0.35):
+def summarize_result(result: Dict[str, object], obstacles, goal, robot_radius: float, goal_tolerance: float = 0.35, vehicle_length: float = 0.81, vehicle_width: float = 0.36):
     states = result["states"]
     controls = result["controls"]
     final_dist = float(np.linalg.norm(states[-1, :2] - goal))
-    collision = path_collided(states, obstacles, robot_radius)
+    collision = path_collided(states, obstacles, robot_radius, vehicle_length, vehicle_width)
 
     reached_goal = bool(result.get(
         "reached_goal", final_dist <= goal_tolerance + 1e-9
@@ -2978,7 +3558,7 @@ def summarize_result(result: Dict[str, object], obstacles, goal, robot_radius: f
         "reached_goal": reached_goal,
         "collision": bool(collision),
         "final_dist": final_dist,
-        "min_clearance": min_clearance(states, obstacles, robot_radius),
+        "min_clearance": min_clearance(states, obstacles, robot_radius, vehicle_length, vehicle_width),
         "path_length": path_length(states),
         "control_effort": control_effort(controls),
         "control_smoothness": control_smoothness(controls),
@@ -3202,8 +3782,8 @@ def run_dynamic_blockage_controller(
     goal: Array,
     *,
     seed: int,
-    trigger_progress: Optional[float] = 0.25,
-    activation_preview_clearance: Optional[float] = 0.75,
+    trigger_progress: Optional[float] = 0.35,
+    activation_preview_clearance: Optional[float] = None,
     blocker_active_from_start: bool = False,
     condition: str = "dynamic_wall",
     block_step: Optional[int] = None,
@@ -3243,6 +3823,8 @@ def run_dynamic_blockage_controller(
             x[None, :],
             blockers,
             mppi_cfg.robot_radius,
+            mppi_cfg.vehicle_length,
+            mppi_cfg.vehicle_width,
         )
 
 
@@ -3264,6 +3846,8 @@ def run_dynamic_blockage_controller(
                 x[None, :],
                 blockers,
                 step_cfg.robot_radius,
+                step_cfg.vehicle_length,
+                step_cfg.vehicle_width,
             )
             progress_ready = bool(
                 trigger_progress is not None
@@ -3420,7 +4004,7 @@ def run_dynamic_blockage_controller(
     }
 
 
-def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius, goal_tolerance=0.15):
+def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius, goal_tolerance=0.15, vehicle_length: float = 0.81, vehicle_width: float = 0.36):
 
     states = result["states"]
     controls = result["controls"]
@@ -3450,7 +4034,7 @@ def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius
             step,
             activation_step,
         )
-        clearance = min_clearance(states[step:step + 1], active_obs, robot_radius)
+        clearance = min_clearance(states[step:step + 1], active_obs, robot_radius, vehicle_length, vehicle_width)
         min_vals.append(clearance)
         if metric_start_step is not None and step >= metric_start_step:
             min_vals_after_block.append(clearance)
@@ -3469,7 +4053,7 @@ def summarize_dynamic_result(result, base_obstacles, blocker, goal, robot_radius
             segment_states = states[step][None, :] + alpha * (
                 states[step + 1][None, :] - states[step][None, :]
             )
-            segment_clearance = min_clearance(segment_states, segment_obs, robot_radius)
+            segment_clearance = min_clearance(segment_states, segment_obs, robot_radius, vehicle_length, vehicle_width)
             min_vals.append(segment_clearance)
             if metric_start_step is not None and step >= metric_start_step:
                 min_vals_after_block.append(segment_clearance)
@@ -4062,7 +4646,7 @@ def main_dynamic_blockage():
 
     cfg = MPPIConfig(
         horizon=50,
-        num_rollouts=32,
+        num_rollouts=64,
         dt=0.12,
         v_min=-1.0,
         v_max=2.8,
@@ -4103,11 +4687,10 @@ def main_dynamic_blockage():
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
-        # ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        # ControllerVariant.CONTROL_BANK_MPPI,
-
-        # ControllerVariant.STANDARD_MPPI,
-        # ControllerVariant.STANDARD_MPPI_128,
+        ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        ControllerVariant.CONTROL_BANK_MPPI,
+        ControllerVariant.STANDARD_MPPI,
+        ControllerVariant.STANDARD_MPPI_128,
     ]
 
     results = []
@@ -4128,7 +4711,11 @@ def main_dynamic_blockage():
             goal_tolerance=0.3,
             mppi_cfg=cfg,
         )
-        row = summarize_dynamic_result(res, base_obstacles, blocker, goal, cfg.robot_radius)
+        row = summarize_dynamic_result(
+            res, base_obstacles, blocker, goal, cfg.robot_radius,
+            vehicle_length=cfg.vehicle_length,
+            vehicle_width=cfg.vehicle_width,
+        )
         print(
             f"  success={row['success']} collision={row['collision']} "
             f"final_dist={row['final_dist']:.3f} smooth={row['control_smoothness']:.3f} "
@@ -4206,7 +4793,7 @@ def main():
 
     mppi_cfg = MPPIConfig(
         horizon=50,
-        num_rollouts=32,
+        num_rollouts=64,
         dt=0.12,
         v_min=-1.0,
         v_max=2.8,
@@ -4240,11 +4827,10 @@ def main():
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
-        # ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        # ControllerVariant.CONTROL_BANK_MPPI,
-
-        # ControllerVariant.STANDARD_MPPI,
-        # ControllerVariant.STANDARD_MPPI_128,
+        ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        ControllerVariant.CONTROL_BANK_MPPI,
+        ControllerVariant.STANDARD_MPPI,
+        ControllerVariant.STANDARD_MPPI_128,
     ]
 
     all_results = []
@@ -4266,7 +4852,12 @@ def main():
                     goal_tolerance=0.15,
                     mppi_cfg=mppi_cfg,
                         )
-                row = summarize_result(res, obstacles, goal, robot_radius=mppi_cfg.robot_radius)
+                row = summarize_result(
+                    res, obstacles, goal,
+                    robot_radius=mppi_cfg.robot_radius,
+                    vehicle_length=mppi_cfg.vehicle_length,
+                    vehicle_width=mppi_cfg.vehicle_width,
+                )
                 print(
                     f"    success={row['success']} collision={row['collision']} "
                     f"final_dist={row['final_dist']:.3f} runtime/step={row['runtime_per_step_sec']:.3f}s"
@@ -4325,7 +4916,7 @@ def main():
 class DynamicWallScenario:
     scenario_id: str
     wall_pairs: Tuple[Tuple[int, int], ...]
-    trigger_progress: float = 0.25
+    trigger_progress: float = 0.35
     wall_width: float = 0.40
     wall_extension: float = 0.20
 
@@ -4334,7 +4925,6 @@ def default_dynamic_wall_scenarios() -> List[DynamicWallScenario]:
 
     return [
         DynamicWallScenario("wall_0_1", ((0, 1),), trigger_progress=0.25),
-        DynamicWallScenario("wall_0_2", ((0, 2),), trigger_progress=0.25),
         DynamicWallScenario("wall_1_2", ((1, 2),), trigger_progress=0.25),
         DynamicWallScenario(
             "walls_0_1__1_2",
@@ -4494,20 +5084,20 @@ def main():
     scenarios = default_dynamic_wall_scenarios()
     max_steps = 150
     goal_tolerance = 0.30
-    activation_preview_clearance = 0.75
+    activation_preview_clearance = None
 
     variants = [
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
-        # ControllerVariant.CORRIDOR_PRIOR_MPPI,
-        # ControllerVariant.CONTROL_BANK_MPPI,
-        # ControllerVariant.STANDARD_MPPI,
-        # ControllerVariant.STANDARD_MPPI_128,
+        ControllerVariant.CORRIDOR_PRIOR_MPPI,
+        ControllerVariant.CONTROL_BANK_MPPI,
+        ControllerVariant.STANDARD_MPPI,
+        ControllerVariant.STANDARD_MPPI_128,
     ]
 
 
     cfg = MPPIConfig(
         horizon=50,
-        num_rollouts=32,
+        num_rollouts=64,
         dt=0.12,
         base_safety_margin=0.0,
         collision_substeps=5,
@@ -4687,6 +5277,8 @@ def main():
                             goal,
                             cfg.robot_radius,
                             goal_tolerance=goal_tolerance,
+                            vehicle_length=cfg.vehicle_length,
+                            vehicle_width=cfg.vehicle_width,
                         )
                         row.update(base_row)
                     except Exception as exc:

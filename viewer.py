@@ -42,12 +42,13 @@ UNICYCLE_VARIANTS = [
 
 ACKERMAN_VARIANTS = [
     ("Standard MPPI", "standard_mppi"),
+    ("Standard MPPI 256", "standard_mppi_256_rollouts"),
     ("Control bank", "control_bank_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
     ("Gaussian prior", "gaussian_prior_mppi"),
 ]
 
-VARIANTS = list(UNICYCLE_VARIANTS)
+VARIANTS = list(ACKERMAN_VARIANTS)
 
 CONDITIONS = [
     ("No wall", "no_wall"),
@@ -57,7 +58,6 @@ CONDITIONS = [
 
 SCENARIOS = [
     ("Wall 0-1", "wall_0_1"),
-    ("Wall 0-2", "wall_0_2"),
     ("Wall 1-2", "wall_1_2"),
     ("Walls 0-1 and 1-2", "walls_0_1__1_2"),
 ]
@@ -205,12 +205,12 @@ def make_protocol_config(module: Any, num_rollouts: int) -> Any:
 class InteractiveMPPIViewer:
     def __init__(self, root: tk.Tk, module_paths: dict[str, Path]) -> None:
         self.root = root
-        self.root.title("Interactive MPPI viewer")
+        self.root.title("Interactive MPPI viewer - Ackermann")
         self.root.geometry("1450x900")
         self.root.minsize(1080, 700)
 
         self.module_paths = module_paths
-        self.model_key = "unicycle"
+        self.model_key = "ackerman"
         self.module_path = module_paths[self.model_key]
         self.module: Optional[Any] = None
         self.mode_cache: dict[tuple[Any, ...], list[Any]] = {}
@@ -250,13 +250,13 @@ class InteractiveMPPIViewer:
             row=0, column=0, sticky="w", pady=(0, 10)
         )
 
-        self.model_var = tk.StringVar(value="Unicycle")
+        self.model_var = tk.StringVar(value="Ackermann")
         self.variant_var = tk.StringVar(value="Gaussian prior")
         self.condition_var = tk.StringVar(value="Dynamic wall")
         self.scenario_var = tk.StringVar(value="Walls 0-1 and 1-2")
-        self.seed_var = tk.StringVar(value="1")
+        self.seed_var = tk.StringVar(value="5")
         self.swarm_seed_var = tk.StringVar(value="5")
-        self.rollouts_var = tk.StringVar(value="32")
+        self.rollouts_var = tk.StringVar(value="64")
         self.speed_var = tk.StringVar(value="4.0")
         self.show_collision_var = tk.BooleanVar(value=True)
         self.show_all_modes_var = tk.BooleanVar(value=True)
@@ -467,7 +467,7 @@ class InteractiveMPPIViewer:
         if hasattr(warm_cfg, "horizon"):
             warm_cfg.horizon = min(int(getattr(warm_cfg, "horizon", 28)), 6)
         if hasattr(warm_cfg, "num_rollouts"):
-            warm_cfg.num_rollouts = 32
+            warm_cfg.num_rollouts = 64
         if hasattr(warm_cfg, "mode_select_rollouts_per_mode"):
             warm_cfg.mode_select_rollouts_per_mode = 8
         if hasattr(warm_cfg, "max_empirical_nominals_per_mode"):
@@ -484,7 +484,7 @@ class InteractiveMPPIViewer:
             goal=goal,
             seed=seed,
             trigger_progress=trigger_progress,
-            activation_preview_clearance=0.75,
+            activation_preview_clearance=None,
             blocker_active_from_start=blocker_from_start,
             condition=condition,
             max_steps=1,
@@ -522,7 +522,7 @@ class InteractiveMPPIViewer:
         self.frame_scale.configure(state="disabled")
         self.status_var.set(
             "Loading controller and generating the trajectory prior. "
-            "The first prior construction can take several minutes."
+            "The first construction can take several minutes due to the Numba routines."
         )
 
         settings = {
@@ -632,7 +632,7 @@ class InteractiveMPPIViewer:
             goal=goal,
             seed=seed,
             trigger_progress=trigger_progress,
-            activation_preview_clearance=0.75,
+            activation_preview_clearance=None,
             blocker_active_from_start=blocker_from_start,
             condition=condition,
             max_steps=130,
@@ -885,7 +885,7 @@ class InteractiveMPPIViewer:
         if self.show_collision_var.get():
             self._draw_collision_representation(active_obstacles)
 
-        if self.show_all_modes_var.get() and bundle.variant_value != "standard_mppi":
+        if self.show_all_modes_var.get() and not bundle.variant_value.startswith("standard_mppi"):
             for mean in self._mode_mean_cache:
                 self.ax.plot(mean[:, 0], mean[:, 1], color="0.65", linewidth=0.9, alpha=0.35, zorder=1)
 
@@ -1015,7 +1015,7 @@ class InteractiveMPPIViewer:
 
     def _selected_mode_index(self, frame: int, state: np.ndarray) -> Optional[int]:
         assert self.bundle is not None
-        if self.bundle.variant_value == "standard_mppi" or not self.bundle.modes:
+        if self.bundle.variant_value.startswith("standard_mppi") or not self.bundle.modes:
             return None
         info = self._frame_info(frame)
         if info and info.get("selected_mode_index") is not None:
@@ -1052,7 +1052,7 @@ class InteractiveMPPIViewer:
         bundle = self.bundle
         variant = bundle.variant_value
 
-        if variant == "standard_mppi" or mode_index is None:
+        if variant.startswith("standard_mppi") or mode_index is None:
             self.ax.text(
                 0.99,
                 0.99,
