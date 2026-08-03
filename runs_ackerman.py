@@ -54,7 +54,7 @@ class ControllerVariant(str, Enum):
     CONTROL_BANK_MPPI = "control_bank_mppi"
 
     STANDARD_MPPI = "standard_mppi"
-    STANDARD_MPPI_128 = "standard_mppi_256_rollouts"
+    STANDARD_MPPI_128 = "standard_mppi_128_rollouts"
 
 
 @dataclass
@@ -96,7 +96,7 @@ class MPPIConfig:
     noise_steering_rate: float = 0.70
     temporal_noise_smoothing: float = 0.72
 
-    gaussian_covariance_scale: float = 4.0
+    gaussian_covariance_scale: float = 2.0
 
     swarm_init_probability: float = 0.60
     max_empirical_nominals_per_mode: int = 16
