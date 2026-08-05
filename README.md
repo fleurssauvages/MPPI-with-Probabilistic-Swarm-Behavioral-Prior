@@ -195,8 +195,7 @@ Each controller is evaluated under three environmental conditions.
 ├── geometry/                 Geometric and collision-checking utilities
 ├── graph/                    Graph construction and topology components
 ├── planner/                  Fish-school trajectory generation
-├── runs_unicycle.py          Unicycle dynamics and controller variants
-├── runs_ackerman.py          Ackermann dynamics and controller variants
+├── system/                   Implements the MPPI for the unicycle and ackermann vehicles
 ├── viewer.py                 Interactive visualization interface
 ├── requirements.txt          Project dependencies
 ```
