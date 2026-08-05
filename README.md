@@ -86,47 +86,47 @@ The geometric prior changes **where MPPI samples**. It does not replace the syst
 </table>
 
 # Animations
-The animations below compare **Standard MPPI** with **Gaussian-prior MPPI** under the same system and scenario.
+The animations below compare **Standard MPPI** with **Sensitivity-Projected-Gaussian-prior MPPI** under the same system and scenario.
 
 ### Unicycle
 
 #### No wall
 
-| Standard MPPI | Gaussian-prior MPPI |
+| Standard MPPI | Sensitivity-Projected-prior MPPI |
 |:---:|:---:|
-| ![Unicycle standard MPPI, no wall](gifs/unicycle/no_wall/standard_mppi/animation.gif) | ![Unicycle Gaussian-prior MPPI, no wall](gifs/unicycle/no_wall/gaussian_prior_mppi/animation.gif) |
+| ![Unicycle standard MPPI, no wall](gifs/unicycle/no_wall/standard_mppi/animation.gif) | ![Unicycle Gaussian-prior MPPI, no wall](gifs/unicycle/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
 
 #### Static blockage
 
-| Standard MPPI | Gaussian-prior MPPI |
+| Standard MPPI | Sensitivity-Projected-prior MPPI |
 |:---:|:---:|
-| ![Unicycle standard MPPI, static two-wall scenario](gifs/unicycle/static/standard_mppi/animation.gif) | ![Unicycle Gaussian-prior MPPI, static two-wall scenario](gifs/unicycle/static/gaussian_prior_mppi/animation.gif) |
+| ![Unicycle standard MPPI, static two-wall scenario](gifs/unicycle/static/standard_mppi/animation.gif) | ![Unicycle Sensitivity-Projected-prior MPPI, static two-wall scenario](gifs/unicycle/static/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
 
 #### Dynamic blockage
 
-| Standard MPPI | Gaussian-prior MPPI |
+| Standard MPPI | Sensitivity-Projected-prior MPPI |
 |:---:|:---:|
-| ![Unicycle standard MPPI, dynamic two-wall scenario](gifs/unicycle/dynamic/standard_mppi/animation.gif) | ![Unicycle Gaussian-prior MPPI, dynamic two-wall scenario](gifs/unicycle/dynamic/gaussian_prior_mppi/animation.gif) |
+| ![Unicycle standard MPPI, dynamic two-wall scenario](gifs/unicycle/dynamic/standard_mppi/animation.gif) | ![Unicycle Sensitivity-Projected-prior MPPI, dynamic two-wall scenario](gifs/unicycle/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
 
 ### Ackermann vehicle
 
 #### No wall
 
-| Standard MPPI | Gaussian-prior MPPI |
+| Standard MPPI | Sensitivity-Projected-prior MPPI |
 |:---:|:---:|
-| ![Ackermann standard MPPI, no wall](gifs/ackerman/no_wall/standard_mppi/animation.gif) | ![Ackermann Gaussian-prior MPPI, no wall](gifs/ackerman/no_wall/gaussian_prior_mppi/animation.gif) |
+| ![Ackermann standard MPPI, no wall](gifs/ackerman/no_wall/standard_mppi/animation.gif) | ![Ackermann Sensitivity-Projected-prior MPPI, no wall](gifs/ackerman/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
 
 #### Static blockage — two walls
 
-| Standard MPPI | Gaussian-prior MPPI |
+| Standard MPPI | Sensitivity-Projected-prior MPPI |
 |:---:|:---:|
-| ![Ackermann standard MPPI, static two-wall scenario](gifs/ackerman/static/standard_mppi/animation.gif) | ![Ackermann Gaussian-prior MPPI, static two-wall scenario](gifs/ackerman/static/gaussian_prior_mppi/animation.gif) |
+| ![Ackermann standard MPPI, static two-wall scenario](gifs/ackerman/static/standard_mppi/animation.gif) | ![Ackermann Sensitivity-Projected-prior MPPI, static two-wall scenario](gifs/ackerman/static/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
 
 #### Dynamic blockage — two walls
 
-| Standard MPPI | Gaussian-prior MPPI |
+| Standard MPPI | Sensitivity-Projected-prior MPPI |
 |:---:|:---:|
-| ![Ackermann standard MPPI, dynamic two-wall scenario](gifs/ackerman/dynamic/standard_mppi/animation.gif) | ![Ackermann Gaussian-prior MPPI, dynamic two-wall scenario](gifs/ackerman/dynamic/gaussian_prior_mppi/animation.gif) |
+| ![Ackermann standard MPPI, dynamic two-wall scenario](gifs/ackerman/dynamic/standard_mppi/animation.gif) | ![Ackermann Sensitivity-Projected-prior MPPI, dynamic two-wall scenario](gifs/ackerman/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
 
 All variants use the same task objective. The comparison therefore isolates the effect of proposal construction, covariance representation, rollout allocation, and explicit mode selection.
 
