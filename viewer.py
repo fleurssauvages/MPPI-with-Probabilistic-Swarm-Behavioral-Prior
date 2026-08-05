@@ -36,16 +36,18 @@ UNICYCLE_VARIANTS = [
     ("Control bank", "control_bank_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
     ("Gaussian prior", "gaussian_prior_mppi"),
+    ("SPG prior", "sensitivity_projected_gaussian_prior_mppi"),
     ("Mode-selecting Gaussian", "mode_selecting_gaussian_mppi"),
     ("Mode-selecting corridor", "mode_selecting_corridor_mppi"),
 ]
 
 ACKERMAN_VARIANTS = [
     ("Standard MPPI", "standard_mppi"),
-    ("Standard MPPI 256", "standard_mppi_256_rollouts"),
+    ("Standard MPPI 128", "standard_mppi_128_rollouts"),
     ("Control bank", "control_bank_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
     ("Gaussian prior", "gaussian_prior_mppi"),
+    ("SPG prior", "sensitivity_projected_gaussian_prior_mppi"),
 ]
 
 VARIANTS = list(ACKERMAN_VARIANTS)
@@ -160,6 +162,12 @@ def make_protocol_config(module: Any, num_rollouts: int) -> Any:
         "w_goal": 110.0,
         "w_control": 0.004,
         "lambda_temperature": 2.2,
+        "spg_lookahead_steps": 10,
+        "spg_fd_accel": 0.05,
+        "spg_fd_steering_rate": 0.05,
+        "spg_pseudoinverse_damping": 0.001,
+        "spg_covariance_jitter": 1e-8,
+        "spg_covariance_scale": 1.0,
     }
     if hasattr(cfg, "front_axle_distance"):
         settings.update({
@@ -1072,6 +1080,7 @@ class InteractiveMPPIViewer:
 
         gaussian_variants = {
             "gaussian_prior_mppi",
+            "sensitivity_projected_gaussian_prior_mppi",
             "mode_selecting_gaussian_mppi",
         }
         empirical_variants = {"control_bank_mppi"}
@@ -1197,7 +1206,7 @@ def main() -> None:
     args = parse_args()
     module_paths = {
         "unicycle": first_existing_path(args.unicycle_module, ["runs_unicycle.py"]),
-        "ackerman": first_existing_path(args.ackerman_module, ["runs_ackerman.py"]),
+        "ackerman": first_existing_path(args.ackerman_module, ["runs_ackermann.py"]),
     }
     root = tk.Tk()
     app = InteractiveMPPIViewer(root, module_paths=module_paths)

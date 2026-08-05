@@ -47,6 +47,9 @@ OUTPUT_PREFIX = "dynamic_block_soft"
 
 
 class ControllerVariant(str, Enum):
+    SENSITIVITY_PROJECTED_GAUSSIAN_MPPI = (
+        "sensitivity_projected_gaussian_prior_mppi"
+    )
     GAUSSIAN_PRIOR_MPPI = "gaussian_prior_mppi"
 
 
@@ -97,6 +100,14 @@ class MPPIConfig:
     temporal_noise_smoothing: float = 0.72
 
     gaussian_covariance_scale: float = 2.0
+
+    # Sensitivity-projected Gaussian (SPG) proposal.
+    spg_lookahead_steps: int = 10
+    spg_fd_accel: float = 0.05
+    spg_fd_steering_rate: float = 0.05
+    spg_pseudoinverse_damping: float = 0.001
+    spg_covariance_jitter: float = 1e-8
+    spg_covariance_scale: float = 1.0
 
     swarm_init_probability: float = 0.60
     max_empirical_nominals_per_mode: int = 16
@@ -190,6 +201,15 @@ class MPPIConfig:
         if self.vehicle_length <= 0.0 or self.vehicle_width <= 0.0:
             raise ValueError("vehicle footprint dimensions must be positive.")
         self.dynamics_substeps = max(1, int(self.dynamics_substeps))
+        self.spg_lookahead_steps = max(1, int(self.spg_lookahead_steps))
+        if self.spg_fd_accel <= 0.0 or self.spg_fd_steering_rate <= 0.0:
+            raise ValueError("SPG finite-difference steps must be positive.")
+        if self.spg_pseudoinverse_damping < 0.0:
+            raise ValueError("SPG pseudoinverse damping must be nonnegative.")
+        if self.spg_covariance_jitter < 0.0:
+            raise ValueError("SPG covariance jitter must be nonnegative.")
+        if self.spg_covariance_scale < 0.0:
+            raise ValueError("SPG covariance scale must be nonnegative.")
         if self.v_min > self.v_max:
             raise ValueError("v_min must not exceed v_max.")
         if self.accel_min > self.accel_max:
@@ -2118,6 +2138,154 @@ if njit is not None:
                     best = clearance
         return best
 
+    @njit(cache=True)
+    def sensitivity_projected_covariances_nb(
+        x0, nominal_controls, position_covariances,
+        lookahead_steps, fd_accel, fd_steering_rate,
+        pseudoinverse_damping, covariance_jitter, covariance_scale,
+        dt, front_axle_distance, rear_axle_distance,
+        mass, yaw_inertia, cornering_stiffness_front,
+        cornering_stiffness_rear, tire_friction_coefficient,
+        gravity, aerodynamic_drag_coefficient,
+        rolling_resistance_force, minimum_tire_speed,
+        dynamics_substeps, v_min, v_max,
+        lateral_velocity_limit, yaw_rate_limit,
+        accel_min, accel_max, steering_min, steering_max,
+        steering_rate_min, steering_rate_max,
+    ):
+        """Project position covariance into control space with Eq. (26)."""
+        horizon = nominal_controls.shape[0]
+        nominal_states = rollout_ackermann_single_nb(
+            x0, nominal_controls,
+            dt, front_axle_distance, rear_axle_distance,
+            mass, yaw_inertia, cornering_stiffness_front,
+            cornering_stiffness_rear, tire_friction_coefficient,
+            gravity, aerodynamic_drag_coefficient,
+            rolling_resistance_force, minimum_tire_speed,
+            dynamics_substeps, v_min, v_max,
+            lateral_velocity_limit, yaw_rate_limit,
+            accel_min, accel_max, steering_min, steering_max,
+            steering_rate_min, steering_rate_max,
+        )
+        projected = np.zeros((horizon, 2, 2), dtype=np.float64)
+        damping_sq = pseudoinverse_damping * pseudoinverse_damping
+
+        for t in range(horizon):
+            interval = min(max(1, int(lookahead_steps)), horizon - t)
+            jacobian = np.zeros((2, 2), dtype=np.float64)
+
+            for control_index in range(2):
+                delta = fd_accel if control_index == 0 else fd_steering_rate
+                lower = accel_min if control_index == 0 else steering_rate_min
+                upper = accel_max if control_index == 0 else steering_rate_max
+                center = nominal_controls[t, control_index]
+                plus_value = min(center + delta, upper)
+                minus_value = max(center - delta, lower)
+                denominator = plus_value - minus_value
+                if denominator <= 1e-12:
+                    continue
+
+                plus_state = nominal_states[t].copy()
+                minus_state = nominal_states[t].copy()
+                for k in range(interval):
+                    accel_plus = nominal_controls[t + k, 0]
+                    steer_plus = nominal_controls[t + k, 1]
+                    accel_minus = accel_plus
+                    steer_minus = steer_plus
+                    if k == 0:
+                        if control_index == 0:
+                            accel_plus = plus_value
+                            accel_minus = minus_value
+                        else:
+                            steer_plus = plus_value
+                            steer_minus = minus_value
+
+                    plus_values = _dynamic_ackermann_step_nb(
+                        plus_state, accel_plus, steer_plus,
+                        dt, front_axle_distance, rear_axle_distance,
+                        mass, yaw_inertia, cornering_stiffness_front,
+                        cornering_stiffness_rear, tire_friction_coefficient,
+                        gravity, aerodynamic_drag_coefficient,
+                        rolling_resistance_force, minimum_tire_speed,
+                        dynamics_substeps, v_min, v_max,
+                        lateral_velocity_limit, yaw_rate_limit,
+                        accel_min, accel_max, steering_min, steering_max,
+                        steering_rate_min, steering_rate_max,
+                    )
+                    minus_values = _dynamic_ackermann_step_nb(
+                        minus_state, accel_minus, steer_minus,
+                        dt, front_axle_distance, rear_axle_distance,
+                        mass, yaw_inertia, cornering_stiffness_front,
+                        cornering_stiffness_rear, tire_friction_coefficient,
+                        gravity, aerodynamic_drag_coefficient,
+                        rolling_resistance_force, minimum_tire_speed,
+                        dynamics_substeps, v_min, v_max,
+                        lateral_velocity_limit, yaw_rate_limit,
+                        accel_min, accel_max, steering_min, steering_max,
+                        steering_rate_min, steering_rate_max,
+                    )
+                    for state_index in range(7):
+                        plus_state[state_index] = plus_values[state_index]
+                        minus_state[state_index] = minus_values[state_index]
+
+                jacobian[0, control_index] = (
+                    plus_state[0] - minus_state[0]
+                ) / denominator
+                jacobian[1, control_index] = (
+                    plus_state[1] - minus_state[1]
+                ) / denominator
+
+            # Damped right pseudoinverse J^T (J J^T + d^2 I)^-1.
+            a00 = (
+                jacobian[0, 0] * jacobian[0, 0]
+                + jacobian[0, 1] * jacobian[0, 1]
+                + damping_sq
+            )
+            a01 = (
+                jacobian[0, 0] * jacobian[1, 0]
+                + jacobian[0, 1] * jacobian[1, 1]
+            )
+            a11 = (
+                jacobian[1, 0] * jacobian[1, 0]
+                + jacobian[1, 1] * jacobian[1, 1]
+                + damping_sq
+            )
+            determinant = a00 * a11 - a01 * a01
+            if determinant < 1e-18:
+                determinant = 1e-18
+            inv00 = a11 / determinant
+            inv01 = -a01 / determinant
+            inv11 = a00 / determinant
+
+            pinv00 = jacobian[0, 0] * inv00 + jacobian[1, 0] * inv01
+            pinv01 = jacobian[0, 0] * inv01 + jacobian[1, 0] * inv11
+            pinv10 = jacobian[0, 1] * inv00 + jacobian[1, 1] * inv01
+            pinv11 = jacobian[0, 1] * inv01 + jacobian[1, 1] * inv11
+
+            s00 = position_covariances[t, 0, 0]
+            s01 = 0.5 * (
+                position_covariances[t, 0, 1]
+                + position_covariances[t, 1, 0]
+            )
+            s11 = position_covariances[t, 1, 1]
+
+            q00 = pinv00 * s00 + pinv01 * s01
+            q01 = pinv00 * s01 + pinv01 * s11
+            q10 = pinv10 * s00 + pinv11 * s01
+            q11 = pinv10 * s01 + pinv11 * s11
+
+            c00 = q00 * pinv00 + q01 * pinv01
+            c01 = q00 * pinv10 + q01 * pinv11
+            c10 = q10 * pinv00 + q11 * pinv01
+            c11 = q10 * pinv10 + q11 * pinv11
+
+            projected[t, 0, 0] = covariance_scale * c00 + covariance_jitter
+            projected[t, 0, 1] = covariance_scale * 0.5 * (c01 + c10)
+            projected[t, 1, 0] = projected[t, 0, 1]
+            projected[t, 1, 1] = covariance_scale * c11 + covariance_jitter
+
+        return projected
+
 else:
     localize_prior_horizon_nb = None
     apply_gaussian_prior_noise_nb = None
@@ -2135,6 +2303,7 @@ else:
     rollout_collision_mask_nb = None
     apply_smooth_safe_control_nb = None
     min_clearance_nb = None
+    sensitivity_projected_covariances_nb = None
 
 
 def obstacle_circles_to_arrays(obstacle_circles: List[Tuple[Array, float]]) -> Tuple[Array, Array]:
@@ -2747,6 +2916,7 @@ def standard_mppi_costs_batch(
 REP_GAUSSIAN = 1
 REP_CORRIDOR = 2
 REP_CONTROL_BANK = 3
+REP_SENSITIVITY_PROJECTED_GAUSSIAN = 4
 
 
 def stable_representation_costs(
@@ -2940,6 +3110,130 @@ def sample_gaussian_controls(
     U[0] = nominal
     return enforce_ackermann_control_bounds(U, cfg)
 
+def sensitivity_projected_control_covariances(
+    x_current: Array,
+    nominal_controls: Array,
+    position_covariances: Array,
+    cfg: MPPIConfig,
+) -> Array:
+    """Compute Sigma_u,t = J_t^dagger Sigma_p,t J_t^dagger.T."""
+    x0 = np.asarray(x_current, dtype=np.float64)
+    nominal = np.asarray(nominal_controls, dtype=np.float64)
+    covariances = np.asarray(position_covariances, dtype=np.float64)
+    if sensitivity_projected_covariances_nb is not None:
+        return sensitivity_projected_covariances_nb(
+            x0,
+            nominal,
+            covariances,
+            int(cfg.spg_lookahead_steps),
+            float(cfg.spg_fd_accel),
+            float(cfg.spg_fd_steering_rate),
+            float(cfg.spg_pseudoinverse_damping),
+            float(cfg.spg_covariance_jitter),
+            float(cfg.spg_covariance_scale),
+            *_dynamic_model_arguments(cfg),
+        )
+
+    horizon = nominal.shape[0]
+    nominal_states = rollout_ackermann(x0, nominal, cfg)
+    projected = np.zeros((horizon, 2, 2), dtype=np.float64)
+    damping = float(cfg.spg_pseudoinverse_damping)
+
+    for t in range(horizon):
+        interval = min(max(1, int(cfg.spg_lookahead_steps)), horizon - t)
+        jacobian = np.zeros((2, 2), dtype=np.float64)
+        for control_index, delta in enumerate(
+            (float(cfg.spg_fd_accel), float(cfg.spg_fd_steering_rate))
+        ):
+            lower = cfg.accel_min if control_index == 0 else cfg.steering_rate_min
+            upper = cfg.accel_max if control_index == 0 else cfg.steering_rate_max
+            plus_value = float(np.clip(nominal[t, control_index] + delta, lower, upper))
+            minus_value = float(np.clip(nominal[t, control_index] - delta, lower, upper))
+            denominator = plus_value - minus_value
+            if denominator <= 1e-12:
+                continue
+
+            plus_controls = nominal[t:t + interval].copy()
+            minus_controls = plus_controls.copy()
+            plus_controls[0, control_index] = plus_value
+            minus_controls[0, control_index] = minus_value
+            plus_position = rollout_ackermann(
+                nominal_states[t], plus_controls, cfg
+            )[-1, :2]
+            minus_position = rollout_ackermann(
+                nominal_states[t], minus_controls, cfg
+            )[-1, :2]
+            jacobian[:, control_index] = (
+                plus_position - minus_position
+            ) / denominator
+
+        regularized = (
+            jacobian @ jacobian.T
+            + (damping * damping + 1e-18) * np.eye(2)
+        )
+        pseudoinverse = jacobian.T @ np.linalg.inv(regularized)
+        position_covariance = 0.5 * (
+            covariances[t] + covariances[t].T
+        )
+        control_covariance = (
+            pseudoinverse @ position_covariance @ pseudoinverse.T
+        )
+        projected[t] = (
+            float(cfg.spg_covariance_scale)
+            * 0.5 * (control_covariance + control_covariance.T)
+            + float(cfg.spg_covariance_jitter) * np.eye(2)
+        )
+    return projected
+
+
+def sample_sensitivity_projected_gaussian_controls(
+    x_current: Array,
+    local_mode: MPPIHomotopyMode,
+    n: int,
+    cfg: MPPIConfig,
+    rng: np.random.Generator,
+) -> Array:
+    """Sample the SPG proposal without using the fixed baseline covariance."""
+    horizon = int(cfg.horizon)
+    if n <= 0:
+        return np.zeros((0, horizon, 2), dtype=np.float64)
+
+    mean_path = np.asarray(local_mode.mean_path, dtype=np.float64)
+    nominal = nominal_controls_to_track_path(x_current, mean_path, cfg)
+    projected_covariances = sensitivity_projected_control_covariances(
+        x_current,
+        nominal,
+        np.asarray(local_mode.cov_blocks, dtype=np.float64),
+        cfg,
+    )
+
+    standard_noise = make_temporally_correlated_noise(
+        n,
+        horizon,
+        cfg,
+        rng,
+        noise_accel=1.0,
+        noise_steering_rate=1.0,
+    )
+    noise = np.zeros_like(standard_noise)
+    for t in range(horizon):
+        covariance = 0.5 * (
+            projected_covariances[t] + projected_covariances[t].T
+        )
+        if not np.all(np.isfinite(covariance)):
+            covariance = np.zeros((2, 2), dtype=np.float64)
+        eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+        eigenvalues = np.maximum(eigenvalues, 0.0)
+        covariance_sqrt = (
+            eigenvectors @ np.diag(np.sqrt(eigenvalues)) @ eigenvectors.T
+        )
+        noise[:, t, :] = standard_noise[:, t, :] @ covariance_sqrt.T
+
+    controls = nominal[None, :, :] + noise
+    controls[0] = nominal
+    return enforce_ackermann_control_bounds(controls, cfg)
+
+
 def nearby_mode_indices(
     global_modes: Sequence[MPPIHomotopyMode],
     x_current: Array,
@@ -3011,7 +3305,8 @@ def stable_swarm_mppi_step(
 
 
     if rep_type not in {
-        REP_GAUSSIAN, REP_CORRIDOR, REP_CONTROL_BANK
+        REP_GAUSSIAN, REP_CORRIDOR, REP_CONTROL_BANK,
+        REP_SENSITIVITY_PROJECTED_GAUSSIAN,
     }:
         raise ValueError(f"Unsupported pooled proposal representation: {rep_type}")
 
@@ -3080,6 +3375,10 @@ def stable_swarm_mppi_step(
 
         if rep_type == REP_GAUSSIAN:
             U = sample_gaussian_controls(x_current, local_mode, n, cfg, rng)
+        elif rep_type == REP_SENSITIVITY_PROJECTED_GAUSSIAN:
+            U = sample_sensitivity_projected_gaussian_controls(
+                x_current, local_mode, n, cfg, rng
+            )
         elif rep_type == REP_CONTROL_BANK:
             U = sample_exact_control_bank(
                 x_current, global_mode, nominal_bank[0], n, cfg, rng,
@@ -3448,7 +3747,19 @@ def run_controller_variant(
 
     for _ in range(max_steps):
         step_cfg = mppi_cfg
-        if variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
+        if variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
+            u, info, swarm_progress = stable_swarm_mppi_step(
+                x, modes, obstacles, goal, step_cfg, rng,
+                rep_type=REP_SENSITIVITY_PROJECTED_GAUSSIAN,
+                use_empirical_init=False,
+                use_mean_nominal=True,
+                use_mode_prior=False,
+                progress_by_mode=swarm_progress,
+                obstacle_circles=obstacle_circles,
+                record_optimal_traj=record_infos,
+            )
+
+        elif variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
                 x, modes, obstacles, goal, step_cfg, rng,
                 rep_type=REP_GAUSSIAN,
@@ -3890,7 +4201,19 @@ def run_dynamic_blockage_controller(
         if record_obstacle_history:
             obstacle_history.append(active_obstacles)
 
-        if variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
+        if variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
+            u, info, swarm_progress = stable_swarm_mppi_step(
+                x, modes, active_obstacles, goal, step_cfg, rng,
+                rep_type=REP_SENSITIVITY_PROJECTED_GAUSSIAN,
+                use_empirical_init=False,
+                use_mean_nominal=True,
+                use_mode_prior=False,
+                progress_by_mode=swarm_progress,
+                obstacle_circles=active_obstacle_circles,
+                record_optimal_traj=record_infos,
+            )
+
+        elif variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
             u, info, swarm_progress = stable_swarm_mppi_step(
                 x, modes, active_obstacles, goal, step_cfg, rng,
                 rep_type=REP_GAUSSIAN,
@@ -4686,6 +5009,7 @@ def main_dynamic_blockage():
     print(f"Block step: {block_step}")
 
     variants = [
+        ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
@@ -4826,6 +5150,7 @@ def main():
     )
 
     variants = [
+        ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
@@ -5087,6 +5412,7 @@ def main():
     activation_preview_clearance = None
 
     variants = [
+        ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
         ControllerVariant.GAUSSIAN_PRIOR_MPPI,
         ControllerVariant.CORRIDOR_PRIOR_MPPI,
         ControllerVariant.CONTROL_BANK_MPPI,
