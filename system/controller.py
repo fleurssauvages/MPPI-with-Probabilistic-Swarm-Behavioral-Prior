@@ -1568,6 +1568,17 @@ def run_controller(
                 cached_mode_clearances=mode_clearances,
                 record_optimal_traj=record,
             )
+        elif variant in (ControllerVariant.STANDARD_MPPI):
+            control, info = standard_mppi_step(
+                model,
+                state,
+                active_obstacles,
+                scene.goal,
+                cfg,
+                rng,
+                obstacle_circles=active_circles,
+                record_optimal_traj=record,
+            )
         else:
             raise ValueError(f"Unsupported variant: {variant}")
 
