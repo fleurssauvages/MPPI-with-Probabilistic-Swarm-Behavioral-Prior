@@ -1321,7 +1321,6 @@ SUPPORTED_VARIANTS = {
     ControllerVariant.CORRIDOR_PRIOR_MPPI,
     ControllerVariant.CONTROL_BANK_MPPI,
     ControllerVariant.STANDARD_MPPI,
-    ControllerVariant.STANDARD_MPPI_128,
 }
 
 build_default_scene = ctrl.build_default_scene
