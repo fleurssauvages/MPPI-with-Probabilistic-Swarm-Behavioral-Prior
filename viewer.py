@@ -18,7 +18,7 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.patches import Circle, Ellipse, Polygon
 UNICYCLE_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi'), ('Mode-selecting Gaussian', 'mode_selecting_gaussian_mppi'), ('Mode-selecting corridor', 'mode_selecting_corridor_mppi')]
-ACKERMAN_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Standard MPPI 128', 'standard_mppi_128_rollouts'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+ACKERMAN_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 VARIANTS = list(ACKERMAN_VARIANTS)
 CONDITIONS = [('No wall', 'no_wall'), ('Static wall', 'static_wall'), ('Dynamic wall', 'dynamic_wall')]
 SCENARIOS = [('Wall 0-1', 'wall_0_1'), ('Wall 1-2', 'wall_1_2'), ('Walls 0-1 and 1-2', 'walls_0_1__1_2')]
@@ -105,12 +105,12 @@ class InteractiveMPPIViewer:
         self.variant_var = tk.StringVar(value='SPG prior')
         self.condition_var = tk.StringVar(value='Dynamic wall')
         self.scenario_var = tk.StringVar(value='Walls 0-1 and 1-2')
-        self.seed_var = tk.StringVar(value='2')
+        self.seed_var = tk.StringVar(value='1')
         self.swarm_seed_var = tk.StringVar(value='5')
-        self.rollouts_var = tk.StringVar(value='64')
+        self.rollouts_var = tk.StringVar(value='512')
         self.speed_var = tk.StringVar(value='4.0')
         self.show_collision_var = tk.BooleanVar(value=True)
-        self.show_all_modes_var = tk.BooleanVar(value=True)
+        self.show_all_modes_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value='Ready')
         self.frame_label_var = tk.StringVar(value='Frame 0 / 0')
         row = 1
@@ -124,8 +124,6 @@ class InteractiveMPPIViewer:
         row = self._add_entry(controls, row, 'Rollouts per step', self.rollouts_var)
         row = self._add_combo(controls, row, 'Playback speed', self.speed_var, ['0.5', '1.0', '2.0', '4.0', '8.0'])
         ttk.Checkbutton(controls, text='Show collision representation', variable=self.show_collision_var, command=self._redraw_current).grid(row=row, column=0, sticky='w', pady=(8, 2))
-        row += 1
-        ttk.Checkbutton(controls, text='Show all mode means', variable=self.show_all_modes_var, command=self._redraw_current).grid(row=row, column=0, sticky='w', pady=2)
         row += 1
         buttons = ttk.Frame(controls)
         buttons.grid(row=row, column=0, sticky='ew', pady=(14, 6))
@@ -324,7 +322,7 @@ class InteractiveMPPIViewer:
         except ValueError as exc:
             raise ValueError(f'The selected module does not implement {variant_value!r}.') from exc
         self._warm_numba_for_case(module=module, variant=variant, variant_value=variant_value, modes=modes, base_obstacles=base_obstacles, runtime_blocker=runtime_blocker, scene=scene, trigger_progress=trigger_progress, blocker_from_start=blocker_from_start, cfg=cfg, seed=seed)
-        result = module.run_controller(variant, modes, base_obstacles, runtime_blocker, scene, seed=seed, trigger_progress=trigger_progress, blocker_active_from_start=blocker_from_start, max_steps=130, cfg=cfg, record=True)
+        result = module.run_controller(variant, modes, base_obstacles, runtime_blocker, scene, seed=seed, trigger_progress=trigger_progress, blocker_active_from_start=blocker_from_start, max_steps=250, cfg=cfg, record=True)
         return TrialBundle(module=module, condition=condition, scenario_id=scenario_id, variant_value=variant_value, cfg=cfg, result=result, modes=modes, start=scene.start.copy(), goal=scene.goal.copy(), bounds_xy=scene.bounds_xy, base_obstacles=list(base_obstacles), blocker=list(runtime_blocker), controller_seed=seed, swarm_seed=swarm_seed)
 
     def _poll_worker(self) -> None:
@@ -533,10 +531,7 @@ class InteractiveMPPIViewer:
         self._draw_obstacles(active_obstacles)
         if self.show_collision_var.get():
             self._draw_collision_representation(active_obstacles)
-        if self.show_all_modes_var.get() and (not bundle.variant_value.startswith('standard_mppi')):
-            for mean in self._mode_mean_cache:
-                self.ax.plot(mean[:, 0], mean[:, 1], color='0.65', linewidth=0.9, alpha=0.35, zorder=1)
-        selected_mode_index = self._selected_mode_index(frame, state)
+        selected_mode_index = self._selected_rollout_mode_index(frame)
         self._draw_prior(state, selected_mode_index)
         self.ax.plot(states[:frame + 1, 0], states[:frame + 1, 1], color='#1f77b4', linewidth=2.4, label='executed path', zorder=7)
         output = self._optimal_output(frame)
@@ -568,12 +563,15 @@ class InteractiveMPPIViewer:
                 extra.append(f"feasible rollouts={info['num_feasible_rollouts']}")
             if info.get('cost_min') is not None:
                 extra.append(f"min cost={float(info['cost_min']):.2f}")
+            if info.get('retained_mode_clearances') is not None:
+                values = [float(value) for value in info.get('retained_mode_clearances', [])]
+                extra.append('retained clearances=[' + ', '.join(f'{value:.3f}' for value in values) + ']')
         extra_text = ' | '.join(extra)
         title = f"{VARIANT_TO_DISPLAY.get(bundle.variant_value, bundle.variant_value)} | {bundle.condition.replace('_', ' ')} | step {frame}/{len(states) - 1}"
-        status = f'control: {control_text}\ndisplayed mode: {mode_text}\nwall: {wall_state}'
+        status = f'control: {control_text}\nselected rollout mode: {mode_text}\nwall: {wall_state}'
         if extra_text:
             status += '\n' + extra_text
-        legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='executed path'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='displayed prior')]
+        legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='executed path'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='selected rollout prior')]
         self.frame_label_var.set(f'Frame {frame} / {len(states) - 1}')
         self.canvas.draw_idle()
 
@@ -595,17 +593,22 @@ class InteractiveMPPIViewer:
         for center, radius in circles:
             self.ax.add_patch(Circle(np.asarray(center)[:2], float(radius) + float(self.bundle.cfg.robot_radius), fill=False, edgecolor='#e377c2', linewidth=0.75, linestyle=':', alpha=0.45, zorder=4))
 
-    def _selected_mode_index(self, frame: int, state: np.ndarray) -> Optional[int]:
+    def _selected_rollout_mode_index(self, frame: int) -> Optional[int]:
+        """Return the global mode that produced the displayed best rollout."""
         assert self.bundle is not None
         if self.bundle.variant_value.startswith('standard_mppi') or not self.bundle.modes:
             return None
         info = self._frame_info(frame)
-        if info and info.get('selected_mode_index') is not None:
-            index = int(info['selected_mode_index'])
-            if 0 <= index < len(self.bundle.modes):
-                return index
-        distances = [float(np.min(np.linalg.norm(np.asarray(mode.mean_path) - state[:2], axis=1))) for mode in self.bundle.modes]
-        return int(np.argmin(distances))
+        if not info:
+            return None
+        value = info.get('selected_rollout_mode_index')
+        if value is None:
+            # Compatibility with mode-selecting controller outputs.
+            value = info.get('selected_mode_index')
+        if value is None:
+            return None
+        index = int(value)
+        return index if 0 <= index < len(self.bundle.modes) else None
 
     def _frame_info(self, frame: int) -> Optional[dict[str, Any]]:
         assert self.bundle is not None
@@ -631,12 +634,14 @@ class InteractiveMPPIViewer:
         bundle = self.bundle
         variant = bundle.variant_value
         if variant.startswith('standard_mppi') or mode_index is None:
-            self.ax.text(0.99, 0.99, 'No trajectory prior', transform=self.ax.transAxes, ha='right', va='top', fontsize=8.5, color='#9467bd')
+            self.ax.text(0.99, 0.99, 'No selected rollout prior', transform=self.ax.transAxes, ha='right', va='top', fontsize=8.5, color='#9467bd')
+            return
+        if not (0 <= mode_index < len(bundle.modes)):
             return
         global_mode = bundle.modes[mode_index]
         local_mode = bundle.module.localize_mode_for_state(global_mode, state, bundle.cfg.horizon)
         mean = np.asarray(local_mode.mean_path, dtype=float)
-        self.ax.plot(mean[:, 0], mean[:, 1], color='#9467bd', linewidth=2.2, zorder=6)
+        self.ax.plot(mean[:, 0], mean[:, 1], color='#9467bd', linewidth=2.2, alpha=0.9, zorder=6)
         gaussian_variants = {'gaussian_prior_mppi', 'sensitivity_projected_gaussian_prior_mppi', 'mode_selecting_gaussian_mppi'}
         empirical_variants = {'control_bank_mppi'}
         corridor_variants = {'corridor_prior_mppi', 'mode_selecting_corridor_mppi'}
