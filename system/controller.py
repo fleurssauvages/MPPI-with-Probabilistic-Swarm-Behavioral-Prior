@@ -37,7 +37,6 @@ class ControllerConfig:
     lambda_temperature: float = 2.2
 
     temporal_noise_smoothing: float = 0.72
-    gaussian_covariance_scale: float = 2.0
     spg_lookahead_steps: int = 10
     spg_fd_accel: float = 0.05
     spg_fd_steering_rate: float = 0.05
@@ -161,10 +160,27 @@ REP_CORRIDOR = 2
 REP_CONTROL_BANK = 3
 REP_SENSITIVITY_PROJECTED_GAUSSIAN = 4
 
+# Spatial speed used to parameterize localized trajectory priors when the
+# model-specific configuration does not define ``prior_reference_speed``.
+DEFAULT_PRIOR_REFERENCE_SPEED = 2.0
+
+
+def prior_reference_step_distance(cfg: Any) -> float:
+    """Return the desired arc-length advance between localized reference points."""
+    reference_speed = float(getattr(cfg, "prior_reference_speed", DEFAULT_PRIOR_REFERENCE_SPEED))
+    dt = float(getattr(cfg, "dt", 0.12))
+    return max(1e-6, reference_speed * dt)
+
 
 if njit is not None:
     @njit(cache=True)
-    def _localize_prior_horizon_nb(mean_path, cov_blocks, arc_length, gaussian_variance, start_index, horizon):
+    def _localize_prior_horizon_nb(mean_path, cov_blocks, arc_length, gaussian_variance, start_index, horizon, step_distance):
+        """Localize a fixed-length receding spatial horizon along the prior.
+
+        Reference samples advance by ``step_distance`` in arc length. Once the
+        end of the prior is reached, the final mean/covariance sample is repeated
+        instead of compressing the remaining path over the full horizon.
+        """
         count = mean_path.shape[0]
         H = max(1, int(horizon))
         local_mean = np.empty((H, 2), dtype=np.float64)
@@ -173,16 +189,17 @@ if njit is not None:
         start = min(max(int(start_index), 0), max(0, count - 1))
         s0 = arc_length[start]
         s1 = arc_length[count - 1]
+        ds = max(float(step_distance), 1e-12)
         cursor = start
         for t in range(H):
-            fraction = 0.0 if H == 1 else t / (H - 1.0)
-            target = s0 + fraction * (s1 - s0)
+            target = min(s0 + t * ds, s1)
             while cursor + 1 < count and arc_length[cursor + 1] < target:
                 cursor += 1
             right = min(cursor + 1, count - 1)
             left = cursor
             denominator = arc_length[right] - arc_length[left]
             alpha = 0.0 if denominator <= 1e-12 else (target - arc_length[left]) / denominator
+            alpha = min(max(alpha, 0.0), 1.0)
             beta = 1.0 - alpha
             for row in range(2):
                 local_mean[t, row] = beta * mean_path[left, row] + alpha * mean_path[right, row]
@@ -447,6 +464,7 @@ def localize_mode_for_state_with_index(
     H: int,
     previous_idx: Optional[int] = None,
     max_advance: Optional[int] = None,
+    step_distance: Optional[float] = None,
 ) -> Tuple[MPPIHomotopyMode, int]:
     mode = _ensure_mode_prior_cache(mode)
     mean_path = np.asarray(mode.mean_path, dtype=np.float64)
@@ -459,6 +477,9 @@ def localize_mode_for_state_with_index(
             index = min(index, int(previous_idx) + int(max_advance))
         index = min(index, len(mean_path) - 2)
 
+    # Default matches the standard experiment configuration (2 m/s, dt=0.12 s).
+    ds = float(step_distance) if step_distance is not None else DEFAULT_PRIOR_REFERENCE_SPEED * 0.12
+    ds = max(ds, 1e-6)
     if _localize_prior_horizon_nb is not None:
         local_mean, local_cov, local_gaussian = _localize_prior_horizon_nb(
             np.asarray(mode.mean_path, dtype=np.float64),
@@ -467,9 +488,12 @@ def localize_mode_for_state_with_index(
             np.asarray(mode.gaussian_variance, dtype=np.float64),
             index,
             int(H),
+            ds,
         )
     else:
-        source_s = np.linspace(float(mode.arc_length[index]), float(mode.arc_length[-1]), int(H))
+        s0 = float(mode.arc_length[index])
+        s1 = float(mode.arc_length[-1])
+        source_s = np.minimum(s0 + np.arange(int(H), dtype=np.float64) * ds, s1)
         local_mean = np.column_stack(
             (
                 np.interp(source_s, mode.arc_length, mode.mean_path[:, 0]),
@@ -498,8 +522,14 @@ def localize_mode_for_state_with_index(
     )
 
 
-def localize_mode_for_state(mode: MPPIHomotopyMode, x_current: Array, H: int) -> MPPIHomotopyMode:
-    return localize_mode_for_state_with_index(mode, x_current, H)[0]
+
+def localize_mode_for_state(
+    mode: MPPIHomotopyMode,
+    x_current: Array,
+    H: int,
+    step_distance: Optional[float] = None,
+) -> MPPIHomotopyMode:
+    return localize_mode_for_state_with_index(mode, x_current, H, step_distance=step_distance)[0]
 
 
 def localize_path_for_state_with_index(
@@ -508,6 +538,7 @@ def localize_path_for_state_with_index(
     H: int,
     previous_idx: Optional[int] = None,
     max_advance: Optional[int] = None,
+    step_distance: Optional[float] = None,
 ) -> Tuple[Array, int]:
     p = np.asarray(path, dtype=np.float64)
     nearest_idx = int(np.argmin(np.linalg.norm(p - np.asarray(x_current[:2]), axis=1)))
@@ -518,12 +549,28 @@ def localize_path_for_state_with_index(
         if max_advance is not None:
             index = min(index, int(previous_idx) + int(max_advance))
         index = min(index, len(p) - 2)
+
+    ds = float(step_distance) if step_distance is not None else DEFAULT_PRIOR_REFERENCE_SPEED * 0.12
+    ds = max(ds, 1e-6)
     tail = p[index:] if index < len(p) - 1 else p[-2:]
-    return resample_path(tail, H), index
+    arc = np.zeros(len(tail), dtype=np.float64)
+    if len(tail) > 1:
+        arc[1:] = np.cumsum(np.linalg.norm(np.diff(tail, axis=0), axis=1))
+    if arc[-1] <= 1e-12:
+        return np.repeat(tail[:1], int(H), axis=0), index
+    source_s = np.minimum(np.arange(int(H), dtype=np.float64) * ds, arc[-1])
+    local = np.column_stack((np.interp(source_s, arc, tail[:, 0]), np.interp(source_s, arc, tail[:, 1])))
+    return local, index
 
 
-def localize_path_for_state(path: Array, x_current: Array, H: int) -> Array:
-    return localize_path_for_state_with_index(path, x_current, H)[0]
+
+def localize_path_for_state(
+    path: Array,
+    x_current: Array,
+    H: int,
+    step_distance: Optional[float] = None,
+) -> Array:
+    return localize_path_for_state_with_index(path, x_current, H, step_distance=step_distance)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -778,6 +825,7 @@ def build_empirical_nominal_bank(
             cfg.horizon,
             previous_idx=previous_idx if cfg.use_monotonic_reference_progress else None,
             max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+            step_distance=prior_reference_step_distance(cfg),
         )
         bank.append(model.nominal_controls_to_track_path(x_current, local_path, cfg))
     return bank
@@ -796,14 +844,16 @@ def build_nominal_bank_for_mode(
     use_mean_nominal: bool,
     previous_idx: Optional[int] = None,
 ) -> List[Array]:
-    goal_nominal = model.nominal_controls_to_goal(x_current, goal, cfg)
-    mean_nominal = (
-        model.nominal_controls_to_track_path(x_current, local_mode.mean_path, cfg)
-        if use_mean_nominal
-        else goal_nominal
-    )
-    bank = (
-        build_empirical_nominal_bank(
+    """Build prior-conditioned nominal controls without a direct-goal proposal.
+
+    ``goal`` and ``use_mean_nominal`` are retained in the signature for API
+    compatibility.  The mean-path conversion is always the fallback center;
+    empirical control-bank variants add localized sample-path conversions.
+    """
+    _ = (goal, use_mean_nominal)
+    mean_nominal = model.nominal_controls_to_track_path(x_current, local_mode.mean_path, cfg)
+    if use_empirical_init:
+        return build_empirical_nominal_bank(
             model,
             x_current,
             global_mode,
@@ -812,12 +862,7 @@ def build_nominal_bank_for_mode(
             rng,
             previous_idx=previous_idx,
         )
-        if use_empirical_init
-        else [mean_nominal]
-    )
-    if not any(np.allclose(candidate, goal_nominal) for candidate in bank):
-        bank.append(goal_nominal)
-    return bank
+    return [mean_nominal]
 
 
 def sample_controls_from_nominal_bank(
@@ -877,6 +922,7 @@ def sample_exact_control_bank(
                 cfg.horizon,
                 previous_idx=previous_idx if cfg.use_monotonic_reference_progress else None,
                 max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+                step_distance=prior_reference_step_distance(cfg),
             )
             candidates.append(model.nominal_controls_to_track_path(x_current, local_path, cfg))
     if not candidates:
@@ -902,7 +948,7 @@ def sample_gaussian_controls(
     noise = make_temporally_correlated_noise(model, n, H, cfg, rng)
     variance = np.asarray(local_mode.gaussian_variance, dtype=np.float64)
     floor_variance = float(cfg.sigma_floor) ** 2
-    scale = float(cfg.gaussian_covariance_scale) * np.sqrt(np.maximum(variance, floor_variance)) / max(
+    scale = np.sqrt(np.maximum(variance, floor_variance)) / max(
         float(cfg.sigma_floor), 1e-9
     )
     noise *= scale[None, :, None]
@@ -952,13 +998,6 @@ def sample_sensitivity_projected_gaussian_controls(
     controls[0] = nominal
     return model.clip_control_batch(controls, cfg)
 
-
-def ensure_direct_goal_prior(model: Any, controls: Array, x_current: Array, goal: Array, cfg: Any) -> Array:
-    proposals = np.asarray(controls, dtype=np.float64).copy()
-    if proposals.ndim != 3 or proposals.shape[0] == 0:
-        return proposals
-    proposals[-1] = model.nominal_controls_to_goal(x_current, goal, cfg)
-    return model.clip_control_batch(proposals, cfg)
 
 
 # ---------------------------------------------------------------------------
@@ -1179,6 +1218,7 @@ def stable_swarm_mppi_step(
             cfg.horizon,
             previous_idx=previous if cfg.use_monotonic_reference_progress else None,
             max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+            step_distance=prior_reference_step_distance(cfg),
         )
         local_modes.append(local_mode)
         new_progress[key] = index
@@ -1243,8 +1283,6 @@ def stable_swarm_mppi_step(
                 rng,
                 prefer_empirical=False,
             )
-        if rep_type != REP_CONTROL_BANK:
-            controls = ensure_direct_goal_prior(model, controls, x_current, goal, cfg)
         states = model.rollout_batch(x_current, controls, cfg)
         costs = model.trajectory_costs(states, controls, obstacle_circles, goal, cfg)
         costs = reject_colliding_rollouts(model, costs, states, obstacle_circles, goal, cfg)
@@ -1342,6 +1380,7 @@ def mode_selecting_stable_mppi_step(
             cfg.horizon,
             previous_idx=previous if cfg.use_monotonic_reference_progress else None,
             max_advance=cfg.max_reference_index_advance if cfg.use_monotonic_reference_progress else None,
+            step_distance=prior_reference_step_distance(cfg),
         )
         new_progress[key] = index
         records.append(
@@ -1614,24 +1653,3 @@ def run_controller(
         obstacle_history=obstacle_history,
         reached_goal=bool(reached_goal),
     )
-
-
-__all__ = [
-    "ControllerConfig",
-    "ControllerVariant",
-    "DynamicWallScenario",
-    "GaussianTrajectoryMode",
-    "MPPIHomotopyMode",
-    "Scene",
-    "SimulationResult",
-    "TopologicalTrajectoryMixture",
-    "build_default_scene",
-    "build_homotopy_modes",
-    "default_dynamic_wall_scenarios",
-    "localize_mode_for_state",
-    "localize_path_for_state",
-    "make_wall_blockers_between_centers",
-    "obstacle_bounding_circles",
-    "obstacle_center",
-    "run_controller",
-]

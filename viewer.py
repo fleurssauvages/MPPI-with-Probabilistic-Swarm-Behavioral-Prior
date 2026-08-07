@@ -4,7 +4,7 @@ import math
 import queue
 import threading
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Optional
 import numpy as np
 from system import ackermann, unicycle
@@ -16,6 +16,7 @@ except ImportError as exc:
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
+from matplotlib.path import Path as MplPath
 from matplotlib.patches import Circle, Ellipse, Polygon
 UNICYCLE_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi'), ('Mode-selecting Gaussian', 'mode_selecting_gaussian_mppi'), ('Mode-selecting corridor', 'mode_selecting_corridor_mppi')]
 ACKERMAN_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
@@ -61,13 +62,32 @@ def normalized_bounds(bounds_xy: Any) -> tuple[float, float, float, float]:
 def make_protocol_config(module: Any, num_rollouts: int) -> Any:
     return module.MPPIConfig(num_rollouts=int(num_rollouts))
 
+def obstacle_from_vertices(template: Any, vertices: np.ndarray) -> Any:
+    """Rebuild an obstacle of the same type with edited polygon vertices."""
+    edited = np.asarray(vertices, dtype=np.float64).copy()
+    try:
+        return type(template)(edited)
+    except Exception:
+        candidate = copy.deepcopy(template)
+        if hasattr(candidate, 'vertices'):
+            try:
+                candidate.vertices = edited
+                return candidate
+            except Exception:
+                pass
+    raise TypeError(f'Cannot rebuild obstacle type {type(template).__name__} from polygon vertices.')
+
+def obstacle_layout_key(vertices_list: list[np.ndarray]) -> tuple[tuple[float, ...], ...]:
+    """Stable cache key for an interactively edited obstacle layout."""
+    return tuple(tuple(np.round(np.asarray(vertices, dtype=float).ravel(), 6)) for vertices in vertices_list)
+
 class InteractiveMPPIViewer:
 
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.root.title('Interactive MPPI viewer - Ackermann')
-        self.root.geometry('1450x900')
         self.root.minsize(1080, 700)
+        self._maximize_window()
         self.modules = {'ackerman': ackermann, 'unicycle': unicycle}
         self.model_key = 'ackerman'
         self.module = self.modules[self.model_key]
@@ -87,14 +107,39 @@ class InteractiveMPPIViewer:
         self._obstacle_cache: dict[int, list[Any]] = {}
         self._circle_cache: dict[tuple[int, ...], list[tuple[np.ndarray, float]]] = {}
         self._mode_mean_cache: list[np.ndarray] = []
+        self._edit_scene: Any = None
+        self._editable_obstacle_vertices: list[np.ndarray] = []
+        self._drag_obstacle_index: Optional[int] = None
+        self._drag_anchor: Optional[np.ndarray] = None
+        self._drag_original_vertices: Optional[np.ndarray] = None
+        self._reset_editable_obstacles(redraw=False)
         self._build_ui()
         self.poll_after_id = self.root.after(100, self._poll_worker)
 
+    def _maximize_window(self) -> None:
+        """Start maximized while retaining normal window decorations."""
+        try:
+            self.root.state('zoomed')
+            return
+        except tk.TclError:
+            pass
+        try:
+            self.root.attributes('-zoomed', True)
+            return
+        except tk.TclError:
+            pass
+        # Portable fallback for window managers without a zoomed state.
+        width = max(1080, int(self.root.winfo_screenwidth()))
+        height = max(700, int(self.root.winfo_screenheight()))
+        self.root.geometry(f'{width}x{height}+0+0')
+
     def _build_ui(self) -> None:
+        self.root.columnconfigure(0, weight=0, minsize=330)
         self.root.columnconfigure(1, weight=1)
         self.root.rowconfigure(0, weight=1)
-        controls = ttk.Frame(self.root, padding=12)
-        controls.grid(row=0, column=0, sticky='nsw')
+        controls = ttk.Frame(self.root, padding=12, width=330)
+        controls.grid(row=0, column=0, sticky='ns')
+        controls.grid_propagate(False)
         controls.columnconfigure(0, weight=1)
         plot_frame = ttk.Frame(self.root, padding=(0, 8, 8, 8))
         plot_frame.grid(row=0, column=1, sticky='nsew')
@@ -134,6 +179,10 @@ class InteractiveMPPIViewer:
         self.play_button.grid(row=1, column=0, sticky='ew', padx=(0, 3))
         self.restart_button = ttk.Button(buttons, text='Restart', command=self.restart_animation, state='disabled')
         self.restart_button.grid(row=1, column=1, sticky='ew', padx=(3, 0))
+        self.edit_obstacles_button = ttk.Button(buttons, text='Edit obstacles', command=self.edit_obstacles)
+        self.edit_obstacles_button.grid(row=2, column=0, sticky='ew', padx=(0, 3), pady=(6, 0))
+        self.reset_obstacles_button = ttk.Button(buttons, text='Reset obstacles', command=self.reset_obstacles)
+        self.reset_obstacles_button.grid(row=2, column=1, sticky='ew', padx=(3, 0), pady=(6, 0))
         row += 1
         ttk.Separator(controls).grid(row=row, column=0, sticky='ew', pady=10)
         row += 1
@@ -148,7 +197,14 @@ class InteractiveMPPIViewer:
         row += 1
         ttk.Label(controls, text='Status', font=('TkDefaultFont', 11, 'bold')).grid(row=row, column=0, sticky='w')
         row += 1
-        ttk.Label(controls, textvariable=self.status_var, wraplength=280, justify='left').grid(row=row, column=0, sticky='nw', pady=(4, 0))
+        self.status_label = ttk.Label(
+            controls,
+            textvariable=self.status_var,
+            wraplength=292,
+            justify='left',
+            anchor='nw',
+        )
+        self.status_label.grid(row=row, column=0, sticky='nsew', pady=(4, 0))
         controls.rowconfigure(row, weight=1)
         self.condition_var.trace_add('write', lambda *_: self._update_condition_controls())
         self._update_condition_controls()
@@ -157,6 +213,9 @@ class InteractiveMPPIViewer:
         self.figure.subplots_adjust(left=0.07, right=0.98, bottom=0.07, top=0.93)
         self.canvas = FigureCanvasTkAgg(self.figure, master=plot_frame)
         self.canvas.get_tk_widget().grid(row=0, column=0, sticky='nsew')
+        self.canvas.mpl_connect('button_press_event', self._on_plot_press)
+        self.canvas.mpl_connect('motion_notify_event', self._on_plot_motion)
+        self.canvas.mpl_connect('button_release_event', self._on_plot_release)
         toolbar = NavigationToolbar2Tk(self.canvas, plot_frame, pack_toolbar=False)
         toolbar.update()
         toolbar.grid(row=1, column=0, sticky='ew')
@@ -188,6 +247,7 @@ class InteractiveMPPIViewer:
         self._stop_animation()
         self.model_key = requested
         self.module = self.modules[requested]
+        self._reset_editable_obstacles(redraw=False)
         self.bundle = None
         self.frame_index = 0
         self.mode_cache.clear()
@@ -222,14 +282,107 @@ class InteractiveMPPIViewer:
 
     def _draw_empty(self) -> None:
         self.ax.clear()
-        self.ax.set_xlim(0, 10)
-        self.ax.set_ylim(0, 10)
+        if self._edit_scene is None:
+            self.ax.set_xlim(0, 10)
+            self.ax.set_ylim(0, 10)
+            self.ax.set_title('Select a controller and run a case')
+        else:
+            xmin, xmax, ymin, ymax = normalized_bounds(self._edit_scene.bounds_xy)
+            self.ax.set_xlim(xmin, xmax)
+            self.ax.set_ylim(ymin, ymax)
+            self._draw_obstacles(self._editable_obstacle_vertices)
+            start = np.asarray(self._edit_scene.start, dtype=float)
+            goal = np.asarray(self._edit_scene.goal, dtype=float)
+            self.ax.scatter([start[0]], [start[1]], s=65, marker='o', color='#2ca02c', zorder=9)
+            self.ax.scatter([goal[0]], [goal[1]], s=140, marker='*', color='#d62728', zorder=9)
+            self.ax.set_title('Drag obstacles to reposition them, then run the selected case')
         self.ax.set_aspect('equal', adjustable='box')
         self.ax.grid(True, alpha=0.2)
-        self.ax.set_title('Select a controller and run a case')
         self.ax.set_xlabel('x')
         self.ax.set_ylabel('y')
         self.canvas.draw_idle()
+
+    def _reset_editable_obstacles(self, *, redraw: bool=True) -> None:
+        self._edit_scene = self.module.build_default_scene()
+        self._editable_obstacle_vertices = [polygon_vertices(obstacle).copy() for obstacle in self._edit_scene.obstacles]
+        self._drag_obstacle_index = None
+        self._drag_anchor = None
+        self._drag_original_vertices = None
+        self.mode_cache.clear()
+        if redraw and hasattr(self, 'ax'):
+            self._draw_empty()
+
+    def edit_obstacles(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo('Simulation running', 'Wait for the current simulation before editing obstacles.')
+            return
+        self._stop_animation()
+        self.bundle = None
+        self.frame_index = 0
+        self._states = np.empty((0, 0), dtype=float)
+        self._controls = np.empty((0, 0), dtype=float)
+        self._obstacle_cache.clear()
+        self._circle_cache.clear()
+        self._mode_mean_cache.clear()
+        self.play_button.configure(state='disabled', text='Play')
+        self.restart_button.configure(state='disabled')
+        self.frame_scale.configure(from_=0, to=0, state='disabled')
+        self.frame_label_var.set('Frame 0 / 0')
+        self.status_var.set('Obstacle editing enabled. Drag a polygon and press Run selected case.')
+        self._draw_empty()
+
+    def reset_obstacles(self) -> None:
+        if self.worker is not None and self.worker.is_alive():
+            messagebox.showinfo('Simulation running', 'Wait for the current simulation before resetting obstacles.')
+            return
+        self.edit_obstacles()
+        self._reset_editable_obstacles(redraw=True)
+        self.status_var.set('Obstacle layout reset. Drag a polygon or run the selected case.')
+
+    def _obstacle_editing_enabled(self) -> bool:
+        return self.bundle is None and not (self.worker is not None and self.worker.is_alive())
+
+    def _on_plot_press(self, event: Any) -> None:
+        if not self._obstacle_editing_enabled() or event.inaxes is not self.ax or event.button != 1:
+            return
+        if event.xdata is None or event.ydata is None:
+            return
+        point = (float(event.xdata), float(event.ydata))
+        for index in range(len(self._editable_obstacle_vertices) - 1, -1, -1):
+            vertices = self._editable_obstacle_vertices[index]
+            if MplPath(vertices, closed=True).contains_point(point, radius=0.03):
+                self._drag_obstacle_index = index
+                self._drag_anchor = np.asarray(point, dtype=float)
+                self._drag_original_vertices = vertices.copy()
+                self.status_var.set(f'Dragging obstacle {index}. Release to place it.')
+                return
+
+    def _on_plot_motion(self, event: Any) -> None:
+        if self._drag_obstacle_index is None or self._drag_anchor is None or self._drag_original_vertices is None:
+            return
+        if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
+            return
+        delta = np.asarray([float(event.xdata), float(event.ydata)], dtype=float) - self._drag_anchor
+        original = self._drag_original_vertices
+        if self._edit_scene is not None:
+            xmin, xmax, ymin, ymax = normalized_bounds(self._edit_scene.bounds_xy)
+            delta[0] = float(np.clip(delta[0], xmin - np.min(original[:, 0]), xmax - np.max(original[:, 0])))
+            delta[1] = float(np.clip(delta[1], ymin - np.min(original[:, 1]), ymax - np.max(original[:, 1])))
+        self._editable_obstacle_vertices[self._drag_obstacle_index] = original + delta
+        self._draw_empty()
+
+    def _on_plot_release(self, event: Any) -> None:
+        if self._drag_obstacle_index is None:
+            return
+        index = self._drag_obstacle_index
+        self._drag_obstacle_index = None
+        self._drag_anchor = None
+        self._drag_original_vertices = None
+        self.mode_cache.clear()
+        self._obstacle_cache.clear()
+        self._circle_cache.clear()
+        self.status_var.set(f'Obstacle {index} moved. Press Run selected case to recompute the prior and controller trajectory.')
+        self._draw_empty()
 
     def _get_module(self) -> Any:
         module = self.module
@@ -275,9 +428,11 @@ class InteractiveMPPIViewer:
         self.run_button.configure(state='disabled')
         self.play_button.configure(state='disabled')
         self.restart_button.configure(state='disabled')
+        self.edit_obstacles_button.configure(state='disabled')
+        self.reset_obstacles_button.configure(state='disabled')
         self.frame_scale.configure(state='disabled')
         self.status_var.set('Loading controller and generating the trajectory prior. The first construction can take several minutes due to the Numba routines.')
-        settings = {'condition': condition, 'scenario_id': scenario_id, 'variant_value': variant_value, 'seed': seed, 'swarm_seed': swarm_seed, 'rollouts': rollouts}
+        settings = {'condition': condition, 'scenario_id': scenario_id, 'variant_value': variant_value, 'seed': seed, 'swarm_seed': swarm_seed, 'rollouts': rollouts, 'obstacle_vertices': [vertices.copy() for vertices in self._editable_obstacle_vertices]}
         self.worker = threading.Thread(target=self._simulation_worker, args=(settings,), daemon=True)
         self.worker.start()
 
@@ -288,11 +443,16 @@ class InteractiveMPPIViewer:
         except Exception:
             self.worker_queue.put(('error', traceback.format_exc()))
 
-    def _prepare_and_run_trial(self, *, condition: str, scenario_id: str, variant_value: str, seed: int, swarm_seed: int, rollouts: int) -> TrialBundle:
+    def _prepare_and_run_trial(self, *, condition: str, scenario_id: str, variant_value: str, seed: int, swarm_seed: int, rollouts: int, obstacle_vertices: list[np.ndarray]) -> TrialBundle:
         module = self._get_module()
         cfg = make_protocol_config(module, rollouts)
         scene = module.build_default_scene()
-        default_obstacles = list(scene.obstacles)
+        templates = list(scene.obstacles)
+        if len(obstacle_vertices) != len(templates):
+            raise ValueError('Edited obstacle layout does not match the current scene.')
+        default_obstacles = [obstacle_from_vertices(template, vertices) for template, vertices in zip(templates, obstacle_vertices)]
+        scene = replace(scene, obstacles=tuple(default_obstacles))
+        layout_key = obstacle_layout_key(obstacle_vertices)
         scenarios = {scenario.scenario_id: scenario for scenario in module.default_dynamic_wall_scenarios()}
         if scenario_id not in scenarios:
             available = ', '.join(sorted(scenarios))
@@ -306,14 +466,14 @@ class InteractiveMPPIViewer:
             runtime_blocker: list[Any] = []
             blocker_from_start = True
             trigger_progress = None
-            prior_key = ('static', scenario_id, swarm_seed)
+            prior_key = ('static', scenario_id, swarm_seed, layout_key)
         else:
             prior_obstacles = default_obstacles
             base_obstacles = default_obstacles
             runtime_blocker = [] if condition == 'no_wall' else blocker
             blocker_from_start = False
             trigger_progress = None if condition == 'no_wall' else scenario.trigger_progress
-            prior_key = ('base', swarm_seed)
+            prior_key = ('base', swarm_seed, layout_key)
         if prior_key not in self.mode_cache:
             self.mode_cache[prior_key] = module.build_homotopy_modes(scene, prior_obstacles, swarm_seed)
         modes = self.mode_cache[prior_key]
@@ -359,6 +519,8 @@ class InteractiveMPPIViewer:
         self.run_button.configure(state='normal')
         self.play_button.configure(state='normal')
         self.restart_button.configure(state='normal')
+        self.edit_obstacles_button.configure(state='normal')
+        self.reset_obstacles_button.configure(state='normal')
         summary = self._trial_summary(bundle)
         self.status_var.set(summary)
         self._draw_frame(0)
@@ -370,6 +532,8 @@ class InteractiveMPPIViewer:
         if self.closing:
             return
         self.run_button.configure(state='normal')
+        self.edit_obstacles_button.configure(state='normal')
+        self.reset_obstacles_button.configure(state='normal')
         self.status_var.set('Simulation failed. See the error dialog.')
         messagebox.showerror('Simulation failed', details + '\n\nRun the viewer from the project root and verify that both controller module and save/best_policy.pkl are available.')
 

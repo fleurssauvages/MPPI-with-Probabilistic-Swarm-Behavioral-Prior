@@ -12,13 +12,10 @@ try:
 except ImportError:
     import controller as ctrl
 
-try:
-    from numba import njit, prange
-except Exception:
-    njit = None
+from numba import njit
 
 Array = np.ndarray
-NUMBA_AVAILABLE = njit is not None
+NUMBA_AVAILABLE = True
 MODEL_NAME = "unicycle"
 
 ControllerVariant = ctrl.ControllerVariant
@@ -30,13 +27,23 @@ MPPIHomotopyMode = ctrl.MPPIHomotopyMode
 
 @dataclass
 class MPPIConfig(ctrl.ControllerConfig):
-    gaussian_covariance_scale: float = 4.0
     v_min: float = -1.0
     v_max: float = 2.8
     omega_min: float = -4.5
     omega_max: float = 4.5
     noise_v: float = 0.5
     noise_omega: float = 0.9
+
+    # Geometric-prior to unicycle-control conversion.
+    prior_reference_speed: float = 2.0
+    prior_tracking_heading_gain: float = 2.5
+    prior_tracking_lateral_gain: float = 1.0
+    prior_tracking_terminal_distance_gain: float = 1.8
+    # Intercept the geometric prior before switching to local Frenet tracking.
+    prior_intercept_lateral_threshold: float = 0.60
+    prior_intercept_heading_threshold: float = 0.65
+    prior_intercept_lookahead: float = 0.90
+    prior_intercept_heading_gain: float = 2.8
 
     max_delta_v: float = 0.7
     max_delta_omega: float = 1.4
@@ -56,361 +63,476 @@ class MPPIConfig(ctrl.ControllerConfig):
             raise ValueError("Invalid unicycle control bounds.")
 
 
-if njit is not None:
-    @njit(cache=True)
-    def _wrap_angle_nb(a):
-            return (a + np.pi) % (2.0 * np.pi) - np.pi
+@njit(cache=True)
+def _wrap_angle_nb(a):
+        return (a + np.pi) % (2.0 * np.pi) - np.pi
 
-    @njit(cache=True)
-    def _softplus_scalar_nb(z):
-            if z > 40.0:
-                return z
-            if z < -40.0:
-                return math.exp(z)
-            return math.log1p(math.exp(z))
+@njit(cache=True)
+def _softplus_scalar_nb(z):
+        if z > 40.0:
+            return z
+        if z < -40.0:
+            return math.exp(z)
+        return math.log1p(math.exp(z))
 
-    @njit(cache=True, parallel=True)
-    def rollout_unicycle_batch_nb(x0, U, dt):
-            N = U.shape[0]
-            H = U.shape[1]
-            X = np.zeros((N, H + 1, 3), dtype=np.float64)
-            for n in prange(N):
-                X[n, 0, 0] = x0[0]
-                X[n, 0, 1] = x0[1]
-                X[n, 0, 2] = x0[2]
-            for n in prange(N):
-                for t in range(H):
-                    th = X[n, t, 2]
-                    v = U[n, t, 0]
-                    om = U[n, t, 1]
-                    X[n, t + 1, 0] = X[n, t, 0] + v * math.cos(th) * dt
-                    X[n, t + 1, 1] = X[n, t, 1] + v * math.sin(th) * dt
-                    X[n, t + 1, 2] = _wrap_angle_nb(X[n, t, 2] + om * dt)
-            return X
+@njit(cache=True)
+def unicycle_step_nb(x, u, dt):
+    out = np.empty(3, dtype=np.float64)
+    theta = x[2]
+    out[0] = x[0] + u[0] * math.cos(theta) * dt
+    out[1] = x[1] + u[0] * math.sin(theta) * dt
+    out[2] = _wrap_angle_nb(theta + u[1] * dt)
+    return out
 
-    @njit(cache=True)
-    def rollout_unicycle_single_nb(x0, U, dt):
-            H = U.shape[0]
-            X = np.zeros((H + 1, 3), dtype=np.float64)
-            X[0, 0] = x0[0]
-            X[0, 1] = x0[1]
-            X[0, 2] = x0[2]
-            for t in range(H):
-                th = X[t, 2]
-                v = U[t, 0]
-                om = U[t, 1]
-                X[t + 1, 0] = X[t, 0] + v * math.cos(th) * dt
-                X[t + 1, 1] = X[t, 1] + v * math.sin(th) * dt
-                X[t + 1, 2] = _wrap_angle_nb(X[t, 2] + om * dt)
-            return X
 
-    @njit(cache=True)
-    def nominal_controls_to_track_path_nb(x0, ref, horizon, dt, v_min, v_max, omega_min, omega_max):
-            U = np.zeros((horizon, 2), dtype=np.float64)
-            px = x0[0]
-            py = x0[1]
-            theta = x0[2]
-            ref_len = ref.shape[0]
-            for t in range(horizon):
-                target_idx = t + 3
-                if target_idx >= ref_len:
-                    target_idx = ref_len - 1
-                dx = ref[target_idx, 0] - px
-                dy = ref[target_idx, 1] - py
-                dist = math.sqrt(dx * dx + dy * dy)
-                desired_heading = math.atan2(dy, dx)
-                err = _wrap_angle_nb(desired_heading - theta)
-                forward = math.cos(err)
-                if forward < 0.0:
-                    forward = 0.0
-                heading_scale = forward * forward
-                v = 0.2 + 2.4 * dist * heading_scale
-                if v < v_min:
-                    v = v_min
-                elif v > v_max:
-                    v = v_max
-                omega = 3.2 * err
-                if omega < omega_min:
-                    omega = omega_min
-                elif omega > omega_max:
-                    omega = omega_max
-                U[t, 0] = v
-                U[t, 1] = omega
-                px += v * math.cos(theta) * dt
-                py += v * math.sin(theta) * dt
-                theta = _wrap_angle_nb(theta + omega * dt)
-            return U
+@njit(cache=True)
+def rollout_unicycle_batch_nb(x0, U, dt):
+    N = U.shape[0]
+    H = U.shape[1]
+    X = np.zeros((N, H + 1, 3), dtype=np.float64)
+    for n in range(N):
+        X[n, 0, 0] = x0[0]
+        X[n, 0, 1] = x0[1]
+        X[n, 0, 2] = x0[2]
+        for t in range(H):
+            X[n, t + 1] = unicycle_step_nb(X[n, t], U[n, t], dt)
+    return X
 
-    @njit(cache=True)
-    def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, omega_max):
-            U = np.zeros((horizon, 2), dtype=np.float64)
-            px = x0[0]
-            py = x0[1]
-            theta = x0[2]
-            for t in range(horizon):
-                dx = goal[0] - px
-                dy = goal[1] - py
-                dist = math.sqrt(dx * dx + dy * dy)
-                desired_heading = math.atan2(dy, dx)
-                err = _wrap_angle_nb(desired_heading - theta)
-                forward = math.cos(err)
-                if forward < 0.0:
-                    forward = 0.0
-                heading_scale = forward * forward
-                v = 0.2 + 2.2 * dist * heading_scale
-                if v < v_min:
-                    v = v_min
-                elif v > v_max:
-                    v = v_max
-                omega = 3.0 * err
-                if omega < omega_min:
-                    omega = omega_min
-                elif omega > omega_max:
-                    omega = omega_max
-                U[t, 0] = v
-                U[t, 1] = omega
-                px += v * math.cos(theta) * dt
-                py += v * math.sin(theta) * dt
-                theta = _wrap_angle_nb(theta + omega * dt)
-            return U
+@njit(cache=True)
+def rollout_unicycle_single_nb(x0, U, dt):
+    H = U.shape[0]
+    X = np.zeros((H + 1, 3), dtype=np.float64)
+    X[0] = x0
+    for t in range(H):
+        X[t + 1] = unicycle_step_nb(X[t], U[t], dt)
+    return X
 
-    @njit(cache=True, parallel=True)
-    def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_control, w_control_smooth):
-            N = U.shape[0]
-            H = horizon
-            M = circle_radii.shape[0]
-            costs = np.zeros(N, dtype=np.float64)
-            for n in prange(N):
-                cost = 0.0
-                for t in range(H):
-                    px = X[n, t + 1, 0]
-                    py = X[n, t + 1, 1]
-                    gx = px - goal[0]
-                    gy = py - goal[1]
-                    cost += w_goal / H * (gx * gx + gy * gy)
-                    for j in range(M):
-                        dx = px - circle_centers[j, 0]
-                        dy = py - circle_centers[j, 1]
-                        d = math.sqrt(dx * dx + dy * dy) - circle_radii[j]
-                        margin = robot_radius
-                        sp = _softplus_scalar_nb(8.0 * (margin - d))
-                        cost += w_obstacle * sp * sp
-                ctrl_cost = 0.0
-                for t in range(H):
-                    v = U[n, t, 0]
-                    om = U[n, t, 1]
-                    ctrl_cost += v * v + 0.15 * om * om
-                cost += w_control * ctrl_cost
-                smooth_cost = 0.0
-                for t in range(H - 1):
-                    dv = U[n, t + 1, 0] - U[n, t, 0]
-                    dom = U[n, t + 1, 1] - U[n, t, 1]
-                    smooth_cost += dv * dv + 0.2 * dom * dom
-                cost += w_control_smooth * smooth_cost
-                costs[n] = cost
-            return costs
+@njit(cache=True)
+def _path_intercept_point_nb(ref, best_seg, best_qx, best_qy, lookahead_distance):
+    """Return a point ``lookahead_distance`` forward from the path projection."""
+    ref_len = ref.shape[0]
+    tx = best_qx
+    ty = best_qy
+    remaining = max(0.0, lookahead_distance)
+    if ref_len < 2 or best_seg >= ref_len - 1:
+        return tx, ty
 
-    @njit(cache=True)
-    def point_in_poly_nb(px, py, poly):
-            inside = False
-            n = poly.shape[0]
-            for i in range(n):
-                xi = poly[i, 0]
-                yi = poly[i, 1]
-                j = i + 1
-                if j == n:
-                    j = 0
-                xj = poly[j, 0]
-                yj = poly[j, 1]
-                if (yi > py) != (yj > py):
-                    x_cross = xi + (py - yi) * (xj - xi) / (yj - yi + 1e-18)
-                    if px < x_cross:
-                        inside = not inside
-            return inside
+    dx = ref[best_seg + 1, 0] - best_qx
+    dy = ref[best_seg + 1, 1] - best_qy
+    seg_len = math.sqrt(dx * dx + dy * dy)
+    if seg_len > 1e-12:
+        if remaining <= seg_len:
+            alpha = remaining / seg_len
+            return best_qx + alpha * dx, best_qy + alpha * dy
+        remaining -= seg_len
+        tx = ref[best_seg + 1, 0]
+        ty = ref[best_seg + 1, 1]
 
-    @njit(cache=True)
-    def point_segment_dist_nb(px, py, ax, ay, bx, by):
-            abx = bx - ax
-            aby = by - ay
-            denom = abx * abx + aby * aby
-            if denom <= 1e-12:
-                cx = ax
-                cy = ay
+    for i in range(best_seg + 1, ref_len - 1):
+        dx = ref[i + 1, 0] - ref[i, 0]
+        dy = ref[i + 1, 1] - ref[i, 1]
+        seg_len = math.sqrt(dx * dx + dy * dy)
+        if seg_len <= 1e-12:
+            continue
+        if remaining <= seg_len:
+            alpha = remaining / seg_len
+            return ref[i, 0] + alpha * dx, ref[i, 1] + alpha * dy
+        remaining -= seg_len
+        tx = ref[i + 1, 0]
+        ty = ref[i + 1, 1]
+    return tx, ty
+
+
+@njit(cache=True)
+def nominal_controls_to_track_path_nb(
+    x0, ref, horizon, reference_speed, heading_gain, lateral_gain,
+    terminal_distance_gain, intercept_lateral_threshold,
+    intercept_heading_threshold, intercept_lookahead, intercept_heading_gain,
+    dt, v_min, v_max, omega_min, omega_max
+):
+    U = np.zeros((horizon, 2), dtype=np.float64)
+    px = x0[0]
+    py = x0[1]
+    theta = x0[2]
+    ref_len = ref.shape[0]
+    progress_idx = 0
+
+    terminal_endpoint = False
+    if ref_len >= 2:
+        ex = ref[ref_len - 1, 0] - ref[ref_len - 2, 0]
+        ey = ref[ref_len - 1, 1] - ref[ref_len - 2, 1]
+        terminal_endpoint = ex * ex + ey * ey <= 1e-12
+
+    for t in range(horizon):
+        if ref_len < 2:
+            U[t, 0] = 0.0
+            U[t, 1] = 0.0
+            continue
+
+        first_seg = min(progress_idx, ref_len - 2)
+        best_seg = first_seg
+        best_d2 = 1e300
+        best_qx = ref[first_seg, 0]
+        best_qy = ref[first_seg, 1]
+        for i in range(first_seg, ref_len - 1):
+            sx = ref[i + 1, 0] - ref[i, 0]
+            sy = ref[i + 1, 1] - ref[i, 1]
+            seg2 = sx * sx + sy * sy
+            if seg2 <= 1e-14:
+                qx = ref[i, 0]
+                qy = ref[i, 1]
             else:
-                u = ((px - ax) * abx + (py - ay) * aby) / denom
-                if u < 0.0:
-                    u = 0.0
-                elif u > 1.0:
-                    u = 1.0
-                cx = ax + u * abx
-                cy = ay + u * aby
-            dx = px - cx
-            dy = py - cy
-            return math.sqrt(dx * dx + dy * dy)
+                tau = ((px - ref[i, 0]) * sx + (py - ref[i, 1]) * sy) / seg2
+                tau = min(max(tau, 0.0), 1.0)
+                qx = ref[i, 0] + tau * sx
+                qy = ref[i, 1] + tau * sy
+            dxq = px - qx
+            dyq = py - qy
+            d2 = dxq * dxq + dyq * dyq
+            if d2 < best_d2:
+                best_d2 = d2
+                best_seg = i
+                best_qx = qx
+                best_qy = qy
+        progress_idx = best_seg
 
-    @njit(cache=True)
-    def min_clearance_nb(states, polys_padded, poly_lengths, robot_radius):
-            best = 1e+18
-            S = states.shape[0]
-            M = poly_lengths.shape[0]
-            for s in range(S):
-                px = states[s, 0]
-                py = states[s, 1]
-                for m in range(M):
-                    n = poly_lengths[m]
-                    poly = polys_padded[m]
-                    min_d = 1e+18
-                    for i in range(n):
-                        j = i + 1
-                        if j == n:
-                            j = 0
-                        d = point_segment_dist_nb(px, py, poly[i, 0], poly[i, 1], poly[j, 0], poly[j, 1])
-                        if d < min_d:
-                            min_d = d
-                    if point_in_poly_nb(px, py, poly[:n]):
-                        signed = -min_d
-                    else:
-                        signed = min_d
-                    clearance = signed - robot_radius
-                    if clearance < best:
-                        best = clearance
-            return best
-
-    @njit(cache=True, parallel=True)
-    def rollout_collision_mask_nb(X, circle_centers, circle_radii, robot_radius, hard_collision_clearance):
-        mask = np.zeros(X.shape[0], dtype=np.bool_)
-        for n in prange(X.shape[0]):
-            collided = False
-            for t in range(1, X.shape[1]):
-                px = X[n, t, 0]
-                py = X[n, t, 1]
-                for obstacle in range(circle_radii.shape[0]):
-                    dx = px - circle_centers[obstacle, 0]
-                    dy = py - circle_centers[obstacle, 1]
-                    clearance = math.sqrt(dx * dx + dy * dy) - circle_radii[obstacle] - robot_radius
-                    if clearance < hard_collision_clearance:
-                        collided = True
-                        break
-                if collided:
+        tangent_seg = best_seg
+        sx = ref[tangent_seg + 1, 0] - ref[tangent_seg, 0]
+        sy = ref[tangent_seg + 1, 1] - ref[tangent_seg, 1]
+        seg_len = math.sqrt(sx * sx + sy * sy)
+        if seg_len <= 1e-12:
+            found = False
+            for i in range(best_seg + 1, ref_len - 1):
+                tx0 = ref[i + 1, 0] - ref[i, 0]
+                ty0 = ref[i + 1, 1] - ref[i, 1]
+                ll = math.sqrt(tx0 * tx0 + ty0 * ty0)
+                if ll > 1e-12:
+                    tangent_seg = i
+                    sx = tx0
+                    sy = ty0
+                    seg_len = ll
+                    found = True
                     break
-            mask[n] = collided
-        return mask
+            if not found:
+                for i in range(best_seg - 1, -1, -1):
+                    tx0 = ref[i + 1, 0] - ref[i, 0]
+                    ty0 = ref[i + 1, 1] - ref[i, 1]
+                    ll = math.sqrt(tx0 * tx0 + ty0 * ty0)
+                    if ll > 1e-12:
+                        tangent_seg = i
+                        sx = tx0
+                        sy = ty0
+                        seg_len = ll
+                        break
 
-    @njit(cache=True)
-    def sensitivity_projected_covariances_nb(x0, nominal_controls, position_covariances, lookahead_steps, fd_v, fd_omega, pseudoinverse_damping, covariance_jitter, dt, v_min, v_max, omega_min, omega_max):
-            """Project planar trajectory covariance into unicycle control space."""
-            horizon = nominal_controls.shape[0]
-            nominal_states = rollout_unicycle_single_nb(x0, nominal_controls, dt)
-            projected = np.zeros((horizon, 2, 2), dtype=np.float64)
-            damping_sq = pseudoinverse_damping * pseudoinverse_damping
-            for t in range(horizon):
-                interval = min(max(1, int(lookahead_steps)), horizon - t)
-                jacobian = np.zeros((2, 2), dtype=np.float64)
-                for control_index in range(2):
-                    delta = fd_v if control_index == 0 else fd_omega
-                    lower = v_min if control_index == 0 else omega_min
-                    upper = v_max if control_index == 0 else omega_max
-                    center = nominal_controls[t, control_index]
-                    plus_value = min(center + delta, upper)
-                    minus_value = max(center - delta, lower)
-                    denominator = plus_value - minus_value
-                    if denominator <= 1e-12:
-                        continue
-                    plus_state = nominal_states[t].copy()
-                    minus_state = nominal_states[t].copy()
-                    for k in range(interval):
-                        v_plus = nominal_controls[t + k, 0]
-                        omega_plus = nominal_controls[t + k, 1]
-                        v_minus = v_plus
-                        omega_minus = omega_plus
-                        if k == 0:
-                            if control_index == 0:
-                                v_plus = plus_value
-                                v_minus = minus_value
-                            else:
-                                omega_plus = plus_value
-                                omega_minus = minus_value
-                        plus_theta = plus_state[2]
-                        plus_state[0] += v_plus * math.cos(plus_theta) * dt
-                        plus_state[1] += v_plus * math.sin(plus_theta) * dt
-                        plus_state[2] = _wrap_angle_nb(plus_theta + omega_plus * dt)
-                        minus_theta = minus_state[2]
-                        minus_state[0] += v_minus * math.cos(minus_theta) * dt
-                        minus_state[1] += v_minus * math.sin(minus_theta) * dt
-                        minus_state[2] = _wrap_angle_nb(minus_theta + omega_minus * dt)
-                    jacobian[0, control_index] = (plus_state[0] - minus_state[0]) / denominator
-                    jacobian[1, control_index] = (plus_state[1] - minus_state[1]) / denominator
-                a00 = jacobian[0, 0] * jacobian[0, 0] + jacobian[0, 1] * jacobian[0, 1] + damping_sq
-                a01 = jacobian[0, 0] * jacobian[1, 0] + jacobian[0, 1] * jacobian[1, 1]
-                a11 = jacobian[1, 0] * jacobian[1, 0] + jacobian[1, 1] * jacobian[1, 1] + damping_sq
-                determinant = a00 * a11 - a01 * a01
-                if determinant < 1e-18:
-                    determinant = 1e-18
-                inv00 = a11 / determinant
-                inv01 = -a01 / determinant
-                inv11 = a00 / determinant
-                pinv00 = jacobian[0, 0] * inv00 + jacobian[1, 0] * inv01
-                pinv01 = jacobian[0, 0] * inv01 + jacobian[1, 0] * inv11
-                pinv10 = jacobian[0, 1] * inv00 + jacobian[1, 1] * inv01
-                pinv11 = jacobian[0, 1] * inv01 + jacobian[1, 1] * inv11
-                s00 = position_covariances[t, 0, 0]
-                s01 = 0.5 * (position_covariances[t, 0, 1] + position_covariances[t, 1, 0])
-                s11 = position_covariances[t, 1, 1]
-                q00 = pinv00 * s00 + pinv01 * s01
-                q01 = pinv00 * s01 + pinv01 * s11
-                q10 = pinv10 * s00 + pinv11 * s01
-                q11 = pinv10 * s01 + pinv11 * s11
-                c00 = q00 * pinv00 + q01 * pinv01
-                c01 = q00 * pinv10 + q01 * pinv11
-                c10 = q10 * pinv00 + q11 * pinv01
-                c11 = q10 * pinv10 + q11 * pinv11
-                projected[t, 0, 0] = c00 + covariance_jitter
-                projected[t, 0, 1] = 0.5 * (c01 + c10)
-                projected[t, 1, 0] = projected[t, 0, 1]
-                projected[t, 1, 1] = c11 + covariance_jitter
-            return projected
+        tx = sx / max(seg_len, 1e-12)
+        ty = sy / max(seg_len, 1e-12)
+        path_heading = math.atan2(ty, tx)
+        lateral_error = -ty * (px - best_qx) + tx * (py - best_qy)
+        heading_error = _wrap_angle_nb(theta - path_heading)
+        cross_track_distance = math.sqrt(max(best_d2, 0.0))
 
-    @njit(cache=True)
-    def centerline_connection_clearance_nb(start_point, end_point, circle_centers, circle_radii, robot_radius):
-        if circle_radii.shape[0] == 0:
-            return 1e18
-        ax = start_point[0]
-        ay = start_point[1]
-        bx = end_point[0]
-        by = end_point[1]
+        intercept_mode = (
+            cross_track_distance > intercept_lateral_threshold
+            or abs(heading_error) > intercept_heading_threshold
+        )
+
+        if intercept_mode:
+            target_x, target_y = _path_intercept_point_nb(
+                ref, best_seg, best_qx, best_qy, intercept_lookahead
+            )
+            dx = target_x - px
+            dy = target_y - py
+            capture_heading = math.atan2(dy, dx)
+            capture_error = _wrap_angle_nb(capture_heading - theta)
+            forward = max(0.0, math.cos(capture_error))
+            desired_speed = min(max(reference_speed * forward * forward, 0.0), v_max)
+            omega = intercept_heading_gain * capture_error
+        else:
+            curvature = 0.0
+            if ref_len >= 3:
+                center = min(max(tangent_seg, 1), ref_len - 2)
+                x0p = ref[center - 1, 0]
+                y0p = ref[center - 1, 1]
+                x1p = ref[center, 0]
+                y1p = ref[center, 1]
+                x2p = ref[center + 1, 0]
+                y2p = ref[center + 1, 1]
+                a0x = x1p - x0p
+                a0y = y1p - y0p
+                b0x = x2p - x0p
+                b0y = y2p - y0p
+                l01 = math.sqrt(a0x * a0x + a0y * a0y)
+                d12x = x2p - x1p
+                d12y = y2p - y1p
+                l12 = math.sqrt(d12x * d12x + d12y * d12y)
+                l02 = math.sqrt(b0x * b0x + b0y * b0y)
+                denom = l01 * l12 * l02
+                if denom > 1e-12:
+                    cross = a0x * b0y - a0y * b0x
+                    curvature = 2.0 * cross / denom
+                if abs(curvature) < 1e-4:
+                    curvature = 0.0
+
+            forward = max(0.0, math.cos(heading_error))
+            desired_speed = min(max(reference_speed * forward * forward, 0.0), v_max)
+            omega = desired_speed * curvature - heading_gain * heading_error - lateral_gain * lateral_error
+
+        if terminal_endpoint:
+            remaining = math.sqrt(
+                (ref[best_seg + 1, 0] - best_qx) ** 2
+                + (ref[best_seg + 1, 1] - best_qy) ** 2
+            )
+            for i in range(best_seg + 1, ref_len - 1):
+                rx = ref[i + 1, 0] - ref[i, 0]
+                ry = ref[i + 1, 1] - ref[i, 1]
+                remaining += math.sqrt(rx * rx + ry * ry)
+            desired_speed = min(desired_speed, max(0.0, terminal_distance_gain * remaining))
+
+        if omega < omega_min:
+            omega = omega_min
+        elif omega > omega_max:
+            omega = omega_max
+        if desired_speed < v_min:
+            desired_speed = v_min
+
+        U[t, 0] = desired_speed
+        U[t, 1] = omega
+        px += desired_speed * math.cos(theta) * dt
+        py += desired_speed * math.sin(theta) * dt
+        theta = _wrap_angle_nb(theta + omega * dt)
+    return U
+
+
+@njit(cache=True)
+def nominal_controls_to_track_paths_batch_nb(
+    x0, refs, horizon, reference_speed, heading_gain, lateral_gain,
+    terminal_distance_gain, intercept_lateral_threshold,
+    intercept_heading_threshold, intercept_lookahead, intercept_heading_gain,
+    dt, v_min, v_max, omega_min, omega_max
+):
+    count = refs.shape[0]
+    output = np.empty((count, horizon, 2), dtype=np.float64)
+    for n in range(count):
+        controls = nominal_controls_to_track_path_nb(
+            x0, refs[n], horizon, reference_speed, heading_gain, lateral_gain,
+            terminal_distance_gain, intercept_lateral_threshold,
+            intercept_heading_threshold, intercept_lookahead, intercept_heading_gain,
+            dt, v_min, v_max, omega_min, omega_max,
+        )
+        for t in range(horizon):
+            output[n, t, 0] = controls[t, 0]
+            output[n, t, 1] = controls[t, 1]
+    return output
+
+@njit(cache=True)
+def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, omega_max):
+        U = np.zeros((horizon, 2), dtype=np.float64)
+        px = x0[0]
+        py = x0[1]
+        theta = x0[2]
+        for t in range(horizon):
+            dx = goal[0] - px
+            dy = goal[1] - py
+            dist = math.sqrt(dx * dx + dy * dy)
+            desired_heading = math.atan2(dy, dx)
+            err = _wrap_angle_nb(desired_heading - theta)
+            forward = math.cos(err)
+            if forward < 0.0:
+                forward = 0.0
+            heading_scale = forward * forward
+            v = 0.2 + 2.2 * dist * heading_scale
+            if v < v_min:
+                v = v_min
+            elif v > v_max:
+                v = v_max
+            omega = 3.0 * err
+            if omega < omega_min:
+                omega = omega_min
+            elif omega > omega_max:
+                omega = omega_max
+            U[t, 0] = v
+            U[t, 1] = omega
+            px += v * math.cos(theta) * dt
+            py += v * math.sin(theta) * dt
+            theta = _wrap_angle_nb(theta + omega * dt)
+        return U
+
+@njit(cache=True)
+def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_control, w_control_smooth):
+        N = U.shape[0]
+        H = horizon
+        M = circle_radii.shape[0]
+        costs = np.zeros(N, dtype=np.float64)
+        for n in range(N):
+            cost = 0.0
+            for t in range(H):
+                px = X[n, t + 1, 0]
+                py = X[n, t + 1, 1]
+                gx = px - goal[0]
+                gy = py - goal[1]
+                cost += w_goal / H * (gx * gx + gy * gy)
+                for j in range(M):
+                    dx = px - circle_centers[j, 0]
+                    dy = py - circle_centers[j, 1]
+                    d = math.sqrt(dx * dx + dy * dy) - circle_radii[j]
+                    margin = robot_radius
+                    sp = _softplus_scalar_nb(8.0 * (margin - d))
+                    cost += w_obstacle * sp * sp
+            ctrl_cost = 0.0
+            for t in range(H):
+                v = U[n, t, 0]
+                om = U[n, t, 1]
+                ctrl_cost += v * v + 0.15 * om * om
+            cost += w_control * ctrl_cost
+            smooth_cost = 0.0
+            for t in range(H - 1):
+                dv = U[n, t + 1, 0] - U[n, t, 0]
+                dom = U[n, t + 1, 1] - U[n, t, 1]
+                smooth_cost += dv * dv + 0.2 * dom * dom
+            cost += w_control_smooth * smooth_cost
+            costs[n] = cost
+        return costs
+
+@njit(cache=True)
+def point_in_poly_nb(px, py, poly):
+        inside = False
+        n = poly.shape[0]
+        for i in range(n):
+            xi = poly[i, 0]
+            yi = poly[i, 1]
+            j = i + 1
+            if j == n:
+                j = 0
+            xj = poly[j, 0]
+            yj = poly[j, 1]
+            if (yi > py) != (yj > py):
+                x_cross = xi + (py - yi) * (xj - xi) / (yj - yi + 1e-18)
+                if px < x_cross:
+                    inside = not inside
+        return inside
+
+@njit(cache=True)
+def point_segment_dist_nb(px, py, ax, ay, bx, by):
         abx = bx - ax
         aby = by - ay
-        denominator = abx * abx + aby * aby
-        best = 1e18
-        for index in range(circle_radii.shape[0]):
-            if denominator <= 1e-16:
-                alpha = 0.0
-            else:
-                alpha = ((circle_centers[index, 0] - ax) * abx + (circle_centers[index, 1] - ay) * aby) / denominator
-                alpha = min(1.0, max(0.0, alpha))
-            qx = ax + alpha * abx
-            qy = ay + alpha * aby
-            dx = circle_centers[index, 0] - qx
-            dy = circle_centers[index, 1] - qy
-            clearance = math.sqrt(dx * dx + dy * dy) - circle_radii[index] - robot_radius
-            if clearance < best:
-                best = clearance
-        return best
-else:
-    _wrap_angle_nb = None
-    _softplus_scalar_nb = None
-    rollout_unicycle_batch_nb = None
-    rollout_unicycle_single_nb = None
-    nominal_controls_to_track_path_nb = None
-    nominal_controls_to_goal_nb = None
-    standard_mppi_costs_batch_nb = None
-    point_in_poly_nb = None
-    point_segment_dist_nb = None
-    min_clearance_nb = None
-    rollout_collision_mask_nb = None
-    sensitivity_projected_covariances_nb = None
-    centerline_connection_clearance_nb = None
+        denom = abx * abx + aby * aby
+        if denom <= 1e-12:
+            cx = ax
+            cy = ay
+        else:
+            u = ((px - ax) * abx + (py - ay) * aby) / denom
+            if u < 0.0:
+                u = 0.0
+            elif u > 1.0:
+                u = 1.0
+            cx = ax + u * abx
+            cy = ay + u * aby
+        dx = px - cx
+        dy = py - cy
+        return math.sqrt(dx * dx + dy * dy)
 
+@njit(cache=True)
+def min_clearance_nb(states, polys_padded, poly_lengths, robot_radius):
+        best = 1e+18
+        S = states.shape[0]
+        M = poly_lengths.shape[0]
+        for s in range(S):
+            px = states[s, 0]
+            py = states[s, 1]
+            for m in range(M):
+                n = poly_lengths[m]
+                poly = polys_padded[m]
+                min_d = 1e+18
+                for i in range(n):
+                    j = i + 1
+                    if j == n:
+                        j = 0
+                    d = point_segment_dist_nb(px, py, poly[i, 0], poly[i, 1], poly[j, 0], poly[j, 1])
+                    if d < min_d:
+                        min_d = d
+                if point_in_poly_nb(px, py, poly[:n]):
+                    signed = -min_d
+                else:
+                    signed = min_d
+                clearance = signed - robot_radius
+                if clearance < best:
+                    best = clearance
+        return best
+
+@njit(cache=True)
+def sensitivity_projected_covariances_nb(x0, nominal_controls, position_covariances, lookahead_steps, fd_v, fd_omega, pseudoinverse_damping, covariance_jitter, dt, v_min, v_max, omega_min, omega_max):
+        """Project planar trajectory covariance into unicycle control space."""
+        horizon = nominal_controls.shape[0]
+        nominal_states = rollout_unicycle_single_nb(x0, nominal_controls, dt)
+        projected = np.zeros((horizon, 2, 2), dtype=np.float64)
+        damping_sq = pseudoinverse_damping * pseudoinverse_damping
+        for t in range(horizon):
+            interval = min(max(1, int(lookahead_steps)), horizon - t)
+            jacobian = np.zeros((2, 2), dtype=np.float64)
+            for control_index in range(2):
+                delta = fd_v if control_index == 0 else fd_omega
+                lower = v_min if control_index == 0 else omega_min
+                upper = v_max if control_index == 0 else omega_max
+                center = nominal_controls[t, control_index]
+                plus_value = min(center + delta, upper)
+                minus_value = max(center - delta, lower)
+                denominator = plus_value - minus_value
+                if denominator <= 1e-12:
+                    continue
+                plus_state = nominal_states[t].copy()
+                minus_state = nominal_states[t].copy()
+                for k in range(interval):
+                    v_plus = nominal_controls[t + k, 0]
+                    omega_plus = nominal_controls[t + k, 1]
+                    v_minus = v_plus
+                    omega_minus = omega_plus
+                    if k == 0:
+                        if control_index == 0:
+                            v_plus = plus_value
+                            v_minus = minus_value
+                        else:
+                            omega_plus = plus_value
+                            omega_minus = minus_value
+                    plus_theta = plus_state[2]
+                    plus_state[0] += v_plus * math.cos(plus_theta) * dt
+                    plus_state[1] += v_plus * math.sin(plus_theta) * dt
+                    plus_state[2] = _wrap_angle_nb(plus_theta + omega_plus * dt)
+                    minus_theta = minus_state[2]
+                    minus_state[0] += v_minus * math.cos(minus_theta) * dt
+                    minus_state[1] += v_minus * math.sin(minus_theta) * dt
+                    minus_state[2] = _wrap_angle_nb(minus_theta + omega_minus * dt)
+                jacobian[0, control_index] = (plus_state[0] - minus_state[0]) / denominator
+                jacobian[1, control_index] = (plus_state[1] - minus_state[1]) / denominator
+            a00 = jacobian[0, 0] * jacobian[0, 0] + jacobian[0, 1] * jacobian[0, 1] + damping_sq
+            a01 = jacobian[0, 0] * jacobian[1, 0] + jacobian[0, 1] * jacobian[1, 1]
+            a11 = jacobian[1, 0] * jacobian[1, 0] + jacobian[1, 1] * jacobian[1, 1] + damping_sq
+            determinant = a00 * a11 - a01 * a01
+            if determinant < 1e-18:
+                determinant = 1e-18
+            inv00 = a11 / determinant
+            inv01 = -a01 / determinant
+            inv11 = a00 / determinant
+            pinv00 = jacobian[0, 0] * inv00 + jacobian[1, 0] * inv01
+            pinv01 = jacobian[0, 0] * inv01 + jacobian[1, 0] * inv11
+            pinv10 = jacobian[0, 1] * inv00 + jacobian[1, 1] * inv01
+            pinv11 = jacobian[0, 1] * inv01 + jacobian[1, 1] * inv11
+            s00 = position_covariances[t, 0, 0]
+            s01 = 0.5 * (position_covariances[t, 0, 1] + position_covariances[t, 1, 0])
+            s11 = position_covariances[t, 1, 1]
+            q00 = pinv00 * s00 + pinv01 * s01
+            q01 = pinv00 * s01 + pinv01 * s11
+            q10 = pinv10 * s00 + pinv11 * s01
+            q11 = pinv10 * s01 + pinv11 * s11
+            c00 = q00 * pinv00 + q01 * pinv01
+            c01 = q00 * pinv10 + q01 * pinv11
+            c10 = q10 * pinv00 + q11 * pinv01
+            c11 = q10 * pinv10 + q11 * pinv11
+            projected[t, 0, 0] = c00 + covariance_jitter
+            projected[t, 0, 1] = 0.5 * (c01 + c10)
+            projected[t, 1, 0] = projected[t, 0, 1]
+            projected[t, 1, 1] = c11 + covariance_jitter
+        return projected
 
 def _poly_vertices(obs) -> Array:
     if hasattr(obs, 'vertices'):
@@ -457,24 +579,17 @@ def polygon_signed_distance_and_normal(p: Array, obs) -> Tuple[float, Array]:
     return (best_dist, best_normal)
 
 def min_clearance(states: Array, obstacles: Sequence, robot_radius: float) -> float:
-    if min_clearance_nb is not None:
-        padded, lengths = obstacles_to_padded_arrays(obstacles)
-        return float(min_clearance_nb(np.asarray(states, dtype=np.float64), padded, lengths, float(robot_radius)))
-    vals = []
-    for x in states:
-        p = x[:2]
-        for obs in obstacles:
-            d, _ = polygon_signed_distance_and_normal(p, obs)
-            vals.append(d - robot_radius)
-    return float(np.min(vals)) if vals else 1e309
+    state_array = np.asarray(states, dtype=np.float64)
+    if state_array.size == 0 or not obstacles:
+        return 1e309
+    padded, lengths = obstacles_to_padded_arrays(obstacles)
+    return float(min_clearance_nb(state_array, padded, lengths, float(robot_radius)))
 
 def wrap_angle(a):
     return (a + np.pi) % (2.0 * np.pi) - np.pi
 
 def unicycle_step(x: Array, u: Array, dt: float) -> Array:
-    px, py, th = x
-    v, om = u
-    return np.array([px + v * math.cos(th) * dt, py + v * math.sin(th) * dt, wrap_angle(th + om * dt)], dtype=np.float64)
+    return unicycle_step_nb(np.asarray(x, dtype=np.float64), np.asarray(u, dtype=np.float64), float(dt))
 
 def segment_goal_entry_state(x0: Array, x1: Array, goal: Array, goal_tolerance: float) -> Tuple[bool, Array]:
     p0 = np.asarray(x0[:2], dtype=np.float64)
@@ -506,28 +621,10 @@ def segment_goal_entry_state(x0: Array, x1: Array, goal: Array, goal_tolerance: 
     return (True, hit)
 
 def rollout_unicycle(x0: Array, U: Array, dt: float) -> Array:
-    if rollout_unicycle_single_nb is not None:
-        return rollout_unicycle_single_nb(np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), float(dt))
-    X = np.zeros((len(U) + 1, 3), dtype=np.float64)
-    X[0] = x0
-    for t, u in enumerate(U):
-        X[t + 1] = unicycle_step(X[t], u, dt)
-    return X
+    return rollout_unicycle_single_nb(np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), float(dt))
 
 def rollout_unicycle_batch(x0: Array, U: Array, dt: float) -> Array:
-    if rollout_unicycle_batch_nb is not None:
-        return rollout_unicycle_batch_nb(np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), float(dt))
-    N, H, _ = U.shape
-    X = np.zeros((N, H + 1, 3), dtype=np.float64)
-    X[:, 0, :] = x0[None, :]
-    for t in range(H):
-        th = X[:, t, 2]
-        v = U[:, t, 0]
-        om = U[:, t, 1]
-        X[:, t + 1, 0] = X[:, t, 0] + v * np.cos(th) * dt
-        X[:, t + 1, 1] = X[:, t, 1] + v * np.sin(th) * dt
-        X[:, t + 1, 2] = wrap_angle(X[:, t, 2] + om * dt)
-    return X
+    return rollout_unicycle_batch_nb(np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), float(dt))
 
 def softplus(z):
     return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
@@ -608,62 +705,45 @@ def obstacles_to_padded_arrays(obstacles: Sequence) -> Tuple[Array, Array]:
     return (padded, lengths)
 
 def nominal_controls_to_track_path(x0: Array, ref: Array, cfg) -> Array:
-    if nominal_controls_to_track_path_nb is not None:
-        return nominal_controls_to_track_path_nb(np.asarray(x0, dtype=np.float64), np.asarray(ref, dtype=np.float64), int(cfg.horizon), float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max))
-    H = cfg.horizon
-    U = np.zeros((H, 2), dtype=np.float64)
-    x = x0.copy()
-    for t in range(H):
-        target = ref[min(t + 3, len(ref) - 1)]
-        delta = target - x[:2]
-        dist = float(np.linalg.norm(delta))
-        desired_heading = math.atan2(delta[1], delta[0])
-        err = wrap_angle(desired_heading - x[2])
-        heading_scale = max(0.0, math.cos(err)) ** 2
-        v = np.clip(0.2 + 2.4 * dist * heading_scale, 0.0, cfg.v_max)
-        omega = np.clip(3.2 * err, cfg.omega_min, cfg.omega_max)
-        U[t] = [v, omega]
-        x = unicycle_step(x, U[t], cfg.dt)
-    return U
+    return nominal_controls_to_track_path_nb(
+        np.asarray(x0, dtype=np.float64), np.asarray(ref, dtype=np.float64), int(cfg.horizon),
+        float(cfg.prior_reference_speed), float(cfg.prior_tracking_heading_gain),
+        float(cfg.prior_tracking_lateral_gain), float(cfg.prior_tracking_terminal_distance_gain),
+        float(cfg.prior_intercept_lateral_threshold),
+        float(cfg.prior_intercept_heading_threshold),
+        float(cfg.prior_intercept_lookahead),
+        float(cfg.prior_intercept_heading_gain),
+        float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
+    )
+
+def nominal_controls_to_track_paths(x0: Array, refs: Array, cfg) -> Array:
+    reference_batch = np.asarray(refs, dtype=np.float64)
+    if reference_batch.ndim != 3 or reference_batch.shape[1:] != (int(cfg.horizon), 2):
+        raise ValueError(f"refs must have shape (N,{int(cfg.horizon)},2), got {reference_batch.shape}")
+    return nominal_controls_to_track_paths_batch_nb(
+        np.asarray(x0, dtype=np.float64), reference_batch, int(cfg.horizon),
+        float(cfg.prior_reference_speed), float(cfg.prior_tracking_heading_gain),
+        float(cfg.prior_tracking_lateral_gain), float(cfg.prior_tracking_terminal_distance_gain),
+        float(cfg.prior_intercept_lateral_threshold),
+        float(cfg.prior_intercept_heading_threshold),
+        float(cfg.prior_intercept_lookahead),
+        float(cfg.prior_intercept_heading_gain),
+        float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
+    )
 
 def nominal_controls_to_goal(x0: Array, goal: Array, cfg) -> Array:
-    if nominal_controls_to_goal_nb is not None:
-        return nominal_controls_to_goal_nb(np.asarray(x0, dtype=np.float64), np.asarray(goal, dtype=np.float64), int(cfg.horizon), float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max))
-    H = cfg.horizon
-    U = np.zeros((H, 2), dtype=np.float64)
-    x = x0.copy()
-    for t in range(H):
-        delta = goal - x[:2]
-        dist = float(np.linalg.norm(delta))
-        desired_heading = math.atan2(delta[1], delta[0])
-        err = wrap_angle(desired_heading - x[2])
-        heading_scale = max(0.0, math.cos(err)) ** 2
-        v = np.clip(0.2 + 2.2 * dist * heading_scale, 0.0, cfg.v_max)
-        omega = np.clip(3.0 * err, cfg.omega_min, cfg.omega_max)
-        U[t] = [v, omega]
-        x = unicycle_step(x, U[t], cfg.dt)
-    return U
+    return nominal_controls_to_goal_nb(
+        np.asarray(x0, dtype=np.float64), np.asarray(goal, dtype=np.float64), int(cfg.horizon),
+        float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
+    )
 
 def standard_mppi_costs_batch(X: Array, U: Array, obstacle_circles: List[Tuple[Array, float]], goal: Array, cfg: MPPIConfig) -> Array:
-    if standard_mppi_costs_batch_nb is not None:
-        centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        costs = standard_mppi_costs_batch_nb(np.asarray(X, dtype=np.float64), np.asarray(U, dtype=np.float64), centers, radii, np.asarray(goal, dtype=np.float64), int(cfg.horizon), float(cfg.robot_radius), float(cfg.w_goal), float(cfg.w_obstacle), float(cfg.w_control), float(cfg.w_control_smooth))
-        return costs
-    N, H, _ = U.shape
-    costs = np.zeros(N, dtype=np.float64)
-    P = X[:, 1:H + 1, :2]
-    for t in range(H):
-        p = P[:, t, :]
-        goal_error = p - goal[None, :]
-        costs += cfg.w_goal / H * np.sum(goal_error ** 2, axis=1)
-        for center, radius in obstacle_circles:
-            d = np.linalg.norm(p - center[None, :], axis=1) - radius
-            margin = cfg.robot_radius
-            costs += cfg.w_obstacle * softplus(8.0 * (margin - d)) ** 2
-    costs += cfg.w_control * np.sum(U[:, :, 0] ** 2 + 0.15 * U[:, :, 1] ** 2, axis=1)
-    dU = np.diff(U, axis=1)
-    costs += cfg.w_control_smooth * np.sum(dU[:, :, 0] ** 2 + 0.2 * dU[:, :, 1] ** 2, axis=1)
-    return costs
+    centers, radii = obstacle_circles_to_arrays(obstacle_circles)
+    return standard_mppi_costs_batch_nb(
+        np.asarray(X, dtype=np.float64), np.asarray(U, dtype=np.float64), centers, radii,
+        np.asarray(goal, dtype=np.float64), int(cfg.horizon), float(cfg.robot_radius),
+        float(cfg.w_goal), float(cfg.w_obstacle), float(cfg.w_control), float(cfg.w_control_smooth),
+    )
 
 def stable_representation_costs(X: Array, U: Array, obstacle_circles: List[Tuple[Array, float]], goal: Array, cfg: MPPIConfig) -> Array:
     return standard_mppi_costs_batch(X, U, obstacle_circles, goal, cfg)
@@ -677,7 +757,7 @@ def enforce_forward_curve_proposals(U: Array, cfg: MPPIConfig) -> Array:
     return U
 
 def sensitivity_projected_control_covariances(x0: Array, nominal_controls: Array, position_covariances: Array, cfg: MPPIConfig) -> Array:
-    """Compute Eq. (26) for the unicycle controls (v, omega)."""
+    """Compute Eq. (26) using the Numba sensitivity-projection kernel."""
     nominal = np.asarray(nominal_controls, dtype=np.float64)
     covariances = np.asarray(position_covariances, dtype=np.float64)
     horizon = int(nominal.shape[0])
@@ -685,51 +765,18 @@ def sensitivity_projected_control_covariances(x0: Array, nominal_controls: Array
         raise ValueError(f'nominal_controls must have shape (H,2), got {nominal.shape}')
     if covariances.shape != (horizon, 2, 2):
         raise ValueError(f'position_covariances must have shape (H,2,2), got {covariances.shape}')
-    if sensitivity_projected_covariances_nb is not None:
-        return sensitivity_projected_covariances_nb(np.asarray(x0, dtype=np.float64), nominal, covariances, int(cfg.spg_lookahead_steps), float(cfg.spg_fd_accel), float(cfg.spg_fd_steering_rate), float(cfg.spg_pseudoinverse_damping), float(cfg.spg_covariance_jitter), float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max))
-    nominal_states = rollout_unicycle(x0, nominal, cfg.dt)
-    projected = np.zeros((horizon, 2, 2), dtype=np.float64)
-    damping = float(cfg.spg_pseudoinverse_damping)
-    covariance_scale = 1.0
-    eye2 = np.eye(2, dtype=np.float64)
-    for t in range(horizon):
-        interval = min(max(1, int(cfg.spg_lookahead_steps)), horizon - t)
-        jacobian = np.zeros((2, 2), dtype=np.float64)
-        for control_index, delta in enumerate((float(cfg.spg_fd_accel), float(cfg.spg_fd_steering_rate))):
-            lower = cfg.v_min if control_index == 0 else cfg.omega_min
-            upper = cfg.v_max if control_index == 0 else cfg.omega_max
-            plus_value = float(np.clip(nominal[t, control_index] + delta, lower, upper))
-            minus_value = float(np.clip(nominal[t, control_index] - delta, lower, upper))
-            denominator = plus_value - minus_value
-            if denominator <= 1e-12:
-                continue
-            plus_controls = nominal[t:t + interval].copy()
-            minus_controls = plus_controls.copy()
-            plus_controls[0, control_index] = plus_value
-            minus_controls[0, control_index] = minus_value
-            plus_position = rollout_unicycle(nominal_states[t], plus_controls, cfg.dt)[-1, :2]
-            minus_position = rollout_unicycle(nominal_states[t], minus_controls, cfg.dt)[-1, :2]
-            jacobian[:, control_index] = (plus_position - minus_position) / denominator
-        regularized = jacobian @ jacobian.T + (damping * damping + 1e-18) * eye2
-        pseudoinverse = np.linalg.solve(regularized, jacobian).T
-        position_covariance = 0.5 * (covariances[t] + covariances[t].T)
-        control_covariance = pseudoinverse @ position_covariance @ pseudoinverse.T
-        projected[t] = covariance_scale * 0.5 * (control_covariance + control_covariance.T) + float(cfg.spg_covariance_jitter) * eye2
-    return projected
+    return sensitivity_projected_covariances_nb(
+        np.asarray(x0, dtype=np.float64), nominal, covariances,
+        int(cfg.spg_lookahead_steps), float(cfg.spg_fd_accel), float(cfg.spg_fd_steering_rate),
+        float(cfg.spg_pseudoinverse_damping), float(cfg.spg_covariance_jitter),
+        float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
+    )
 
 def rollout_collision_mask(X: Array, obstacle_circles: Sequence[Tuple[Array, float]], cfg: MPPIConfig) -> Array:
     if not obstacle_circles or X.shape[0] == 0:
         return np.zeros(X.shape[0], dtype=bool)
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
     radii = np.asarray([r for _, r in obstacle_circles], dtype=np.float64)
-    if rollout_collision_mask_nb is not None:
-        return rollout_collision_mask_nb(
-            np.asarray(X, dtype=np.float64),
-            centers,
-            radii,
-            float(cfg.robot_radius),
-            float(cfg.hard_collision_clearance),
-        )
     points = np.asarray(X[:, 1:, :2], dtype=np.float64)
     delta = points[:, :, None, :] - centers[None, None, :, :]
     clearance = np.linalg.norm(delta, axis=-1) - radii[None, None, :] - float(cfg.robot_radius)
@@ -790,38 +837,6 @@ def mean_path_clearance(path: Array, obstacle_circles, cfg: MPPIConfig) -> float
     )
 
 
-def centerline_connection_clearance(
-    x_current: Array,
-    closest_point: Array,
-    obstacle_circles,
-    cfg: MPPIConfig,
-) -> float:
-    """Exact swept-disc clearance from the robot position to the centerline."""
-    if not obstacle_circles:
-        return 1e309
-    centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-    start = np.asarray(x_current[:2], dtype=np.float64)
-    point = np.asarray(closest_point, dtype=np.float64).reshape(2)
-    if centerline_connection_clearance_nb is not None:
-        return float(
-            centerline_connection_clearance_nb(
-                start,
-                point,
-                centers,
-                radii,
-                float(cfg.robot_radius),
-            )
-        )
-    segment = point - start
-    denominator = float(segment @ segment)
-    if denominator <= 1e-16:
-        closest = np.repeat(start[None, :], len(centers), axis=0)
-    else:
-        alpha = np.clip(((centers - start[None, :]) @ segment) / denominator, 0.0, 1.0)
-        closest = start[None, :] + alpha[:, None] * segment[None, :]
-    return float(np.min(np.linalg.norm(centers - closest, axis=1) - radii - float(cfg.robot_radius)))
-
-
 def apply_final_output(
     x_current: Array,
     control: Array,
@@ -870,12 +885,3 @@ def build_homotopy_modes(scene: Scene, obstacles: Sequence, seed: int):
 
 def run_controller(variant, modes, base_obstacles, blockers, scene, **kwargs):
     return ctrl.run_controller(sys.modules[__name__], variant, modes, base_obstacles, blockers, scene, **kwargs)
-
-
-__all__ = [
-    "ControllerVariant", "MPPIConfig", "Scene", "SimulationResult", "DynamicWallScenario",
-    "build_default_scene", "default_dynamic_wall_scenarios", "obstacle_center",
-    "make_wall_blockers_between_centers", "build_homotopy_modes", "run_controller",
-    "min_clearance", "minimum_clearance", "obstacle_bounding_circles",
-    "localize_mode_for_state", "localize_path_for_state", "NUMBA_AVAILABLE",
-]
