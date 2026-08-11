@@ -12,7 +12,7 @@ try:
 except ImportError:
     import controller as ctrl
 
-from numba import njit
+from numba import njit, prange
 
 Array = np.ndarray
 NUMBA_AVAILABLE = True
@@ -50,23 +50,19 @@ class MPPIConfig(ctrl.ControllerConfig):
     steering_max: float = 1.2
     steering_rate_min: float = -50.0
     steering_rate_max: float = 50.0
-    noise_accel: float = 0.8
+    noise_accel: float = 0.5
     noise_steering_rate: float = 1.0
 
-    # Geometric-prior to Ackermann-control conversion.
-    prior_reference_speed: float = 2.0
-    prior_tracking_heading_gain: float = 2.5
-    prior_tracking_lateral_gain: float = 1.0
-    prior_tracking_softening_speed: float = 0.8
-    prior_tracking_steering_gain: float = 3.5
-    prior_tracking_yaw_rate_gain: float = 0.4
-    prior_tracking_terminal_distance_gain: float = 1.8
-    # Intercept the geometric prior before switching to local Frenet tracking.
-    prior_intercept_lateral_threshold: float = 0.60
-    prior_intercept_heading_threshold: float = 0.65
-    prior_intercept_lookahead: float = 0.90
-    prior_intercept_min_speed: float = 0.40
-    prior_intercept_heading_gain: float = 0.35
+    prior_ilqr_iterations: int = 2
+    prior_ilqr_line_search_steps: int = 2
+    prior_ilqr_mahalanobis_weight: float = 2.5
+    prior_ilqr_covariance_floor: float = 0.12
+    prior_ilqr_covariance_fallback_std: float = 0.25
+    prior_ilqr_heading_weight: float = 2.5
+    prior_ilqr_progress_weight: float = 2.0
+    prior_ilqr_control_accel_weight: float = 0.01
+    prior_ilqr_control_steering_rate_weight: float = 0.01
+    prior_ilqr_regularization: float = 0.05
 
     vehicle_length: float = 0.81
     vehicle_width: float = 0.36
@@ -102,10 +98,20 @@ class MPPIConfig(ctrl.ControllerConfig):
             "minimum_tire_speed": self.minimum_tire_speed,
             "vehicle_length": self.vehicle_length,
             "vehicle_width": self.vehicle_width,
+            "prior_ilqr_mahalanobis_weight": self.prior_ilqr_mahalanobis_weight,
+            "prior_ilqr_covariance_floor": self.prior_ilqr_covariance_floor,
+            "prior_ilqr_covariance_fallback_std": self.prior_ilqr_covariance_fallback_std,
+            "prior_ilqr_heading_weight": self.prior_ilqr_heading_weight,
+            "prior_ilqr_progress_weight": self.prior_ilqr_progress_weight,
+            "prior_ilqr_control_accel_weight": self.prior_ilqr_control_accel_weight,
+            "prior_ilqr_control_steering_rate_weight": self.prior_ilqr_control_steering_rate_weight,
+            "prior_ilqr_regularization": self.prior_ilqr_regularization,
         }
         invalid = [name for name, value in positive.items() if value <= 0.0]
         if invalid:
             raise ValueError("These values must be positive: " + ", ".join(invalid))
+        self.prior_ilqr_iterations = max(1, int(self.prior_ilqr_iterations))
+        self.prior_ilqr_line_search_steps = max(1, int(self.prior_ilqr_line_search_steps))
         self.dynamics_substeps = max(1, int(self.dynamics_substeps))
         for lower, upper, name in (
             (self.v_min, self.v_max, "velocity"),
@@ -128,6 +134,7 @@ def _softplus_scalar_nb(z):
         if z < -40.0:
             return math.exp(z)
         return math.log1p(math.exp(z))
+
 
 @njit(cache=True)
 def _dynamic_ackermann_step_nb(state, accel_cmd, steering_rate_cmd, dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient, gravity, aerodynamic_drag_coefficient, rolling_resistance_force, minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min, accel_max, steering_min, steering_max, steering_rate_min, steering_rate_max):
@@ -178,12 +185,12 @@ def _dynamic_ackermann_step_nb(state, accel_cmd, steering_rate_cmd, dt, front_ax
             steering = min(max(steering + h * steering_rate, steering_min), steering_max)
         return (px, py, psi, vx, vy, yaw_rate, steering)
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def rollout_ackermann_batch_nb(x0, U, dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient, gravity, aerodynamic_drag_coefficient, rolling_resistance_force, minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min, accel_max, steering_min, steering_max, steering_rate_min, steering_rate_max):
         N = U.shape[0]
         H = U.shape[1]
         X = np.zeros((N, H + 1, 7), dtype=np.float64)
-        for n in range(N):
+        for n in prange(N):
             for j in range(7):
                 X[n, 0, j] = x0[j]
             for t in range(H):
@@ -239,228 +246,397 @@ def _path_intercept_point_nb(ref, best_seg, best_qx, best_qy, lookahead_distance
         ty = ref[i + 1, 1]
     return tx, ty
 
+@njit(cache=True)
+def _path_arc_lengths_ilqr_nb(ref):
+    n = ref.shape[0]
+    arc = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        dx = ref[i, 0] - ref[i - 1, 0]
+        dy = ref[i, 1] - ref[i - 1, 1]
+        arc[i] = arc[i - 1] + math.sqrt(dx * dx + dy * dy)
+    return arc
+
 
 @njit(cache=True)
-def nominal_controls_to_track_path_nb(
-    x0, ref, horizon, reference_speed, heading_gain, lateral_gain, softening_speed,
-    steering_gain, yaw_rate_gain, terminal_distance_gain,
-    intercept_lateral_threshold, intercept_heading_threshold, intercept_lookahead,
-    intercept_min_speed, intercept_heading_gain,
+def _project_path_forward_ilqr_nb(ref, arc, px, py, start_seg):
+    n = ref.shape[0]
+    if n < 2:
+        return 0.0, ref[0, 0], ref[0, 1], 1.0, 0.0, 0.0, 0
+    first = min(max(int(start_seg), 0), n - 2)
+    best_d2 = 1e300
+    best_seg = first
+    best_alpha = 0.0
+    best_qx = ref[first, 0]
+    best_qy = ref[first, 1]
+    best_tx = 1.0
+    best_ty = 0.0
+    found = False
+    for i in range(first, n - 1):
+        ax = ref[i, 0]
+        ay = ref[i, 1]
+        dx = ref[i + 1, 0] - ax
+        dy = ref[i + 1, 1] - ay
+        l2 = dx * dx + dy * dy
+        if l2 <= 1e-16:
+            continue
+        alpha = ((px - ax) * dx + (py - ay) * dy) / l2
+        if alpha < 0.0:
+            alpha = 0.0
+        elif alpha > 1.0:
+            alpha = 1.0
+        qx = ax + alpha * dx
+        qy = ay + alpha * dy
+        ex = px - qx
+        ey = py - qy
+        d2 = ex * ex + ey * ey
+        if d2 < best_d2:
+            inv_l = 1.0 / math.sqrt(l2)
+            best_d2 = d2
+            best_seg = i
+            best_alpha = alpha
+            best_qx = qx
+            best_qy = qy
+            best_tx = dx * inv_l
+            best_ty = dy * inv_l
+            found = True
+    if not found:
+        for i in range(first - 1, -1, -1):
+            dx = ref[i + 1, 0] - ref[i, 0]
+            dy = ref[i + 1, 1] - ref[i, 1]
+            l2 = dx * dx + dy * dy
+            if l2 > 1e-16:
+                inv_l = 1.0 / math.sqrt(l2)
+                best_seg = i
+                best_alpha = 1.0
+                best_qx = ref[i + 1, 0]
+                best_qy = ref[i + 1, 1]
+                best_tx = dx * inv_l
+                best_ty = dy * inv_l
+                break
+    seg_len = arc[best_seg + 1] - arc[best_seg]
+    progress = arc[best_seg] + best_alpha * max(seg_len, 0.0)
+    heading = math.atan2(best_ty, best_tx)
+    return progress, best_qx, best_qy, best_tx, best_ty, heading, best_seg
+
+
+@njit(cache=True)
+def _spatial_precision_ilqr_nb(cov_blocks, arc, seg, progress, covariance_floor):
+    """Inverse of Sigma(s)+sigma_floor^2 I at geometric projected progress."""
+    n = cov_blocks.shape[0]
+    if n == 0:
+        floor_var = max(covariance_floor * covariance_floor, 1e-8)
+        inv = 1.0 / floor_var
+        return inv, 0.0, inv
+    i = min(max(int(seg), 0), max(0, n - 2))
+    j = min(i + 1, n - 1)
+    ds = arc[min(i + 1, arc.shape[0] - 1)] - arc[min(i, arc.shape[0] - 1)]
+    alpha = 0.0 if ds <= 1e-12 else (progress - arc[i]) / ds
+    alpha = min(max(alpha, 0.0), 1.0)
+    beta = 1.0 - alpha
+    c00 = beta * cov_blocks[i, 0, 0] + alpha * cov_blocks[j, 0, 0]
+    c01a = beta * cov_blocks[i, 0, 1] + alpha * cov_blocks[j, 0, 1]
+    c01b = beta * cov_blocks[i, 1, 0] + alpha * cov_blocks[j, 1, 0]
+    c11 = beta * cov_blocks[i, 1, 1] + alpha * cov_blocks[j, 1, 1]
+    floor_var = max(covariance_floor * covariance_floor, 1e-8)
+    a = max(c00 + floor_var, floor_var)
+    d = max(c11 + floor_var, floor_var)
+    b = 0.5 * (c01a + c01b)
+    max_b = 0.999999 * math.sqrt(max(a * d, 0.0))
+    b = min(max(b, -max_b), max_b)
+    det = max(a * d - b * b, 1e-14)
+    return d / det, -b / det, a / det
+
+
+@njit(cache=True)
+def _project_ackermann_rollout_ilqr_nb(X, ref, arc, cov_blocks, covariance_floor):
+    count = X.shape[0]
+    progress = np.zeros(count, dtype=np.float64)
+    qx = np.zeros(count, dtype=np.float64)
+    qy = np.zeros(count, dtype=np.float64)
+    tx = np.zeros(count, dtype=np.float64)
+    ty = np.zeros(count, dtype=np.float64)
+    heading = np.zeros(count, dtype=np.float64)
+    p00 = np.zeros(count, dtype=np.float64)
+    p01 = np.zeros(count, dtype=np.float64)
+    p11 = np.zeros(count, dtype=np.float64)
+    cursor = 0
+    for t in range(count):
+        values = _project_path_forward_ilqr_nb(ref, arc, X[t, 0], X[t, 1], cursor)
+        progress[t] = values[0]
+        qx[t] = values[1]
+        qy[t] = values[2]
+        tx[t] = values[3]
+        ty[t] = values[4]
+        heading[t] = values[5]
+        cursor = values[6]
+        a, b, d = _spatial_precision_ilqr_nb(cov_blocks, arc, cursor, progress[t], covariance_floor)
+        p00[t] = a
+        p01[t] = b
+        p11[t] = d
+    return progress, qx, qy, tx, ty, heading, p00, p01, p11
+
+@njit(cache=True)
+def _ackermann_forward_only_step_ilqr_nb(
+    x, accel, steering_rate,
     dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
     cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
     gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
     minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
     yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
-    steering_rate_min, steering_rate_max
+    steering_rate_min, steering_rate_max,
+):
+    values = _dynamic_ackermann_step_nb(
+        x, accel, steering_rate, dt, front_axle_distance, rear_axle_distance,
+        mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
+        tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
+        rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
+        v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+        accel_min, accel_max, steering_min, steering_max,
+        steering_rate_min, steering_rate_max,
+    )
+    if values[3] >= -1e-8:
+        return accel, values
+
+    high = accel_max
+    high_values = _dynamic_ackermann_step_nb(
+        x, high, steering_rate, dt, front_axle_distance, rear_axle_distance,
+        mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
+        tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
+        rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
+        v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+        accel_min, accel_max, steering_min, steering_max,
+        steering_rate_min, steering_rate_max,
+    )
+    if high_values[3] < 0.0:
+        return high, high_values
+    low = accel
+    best_accel = high
+    best_values = high_values
+    for _ in range(4):
+        mid = 0.5 * (low + high)
+        mid_values = _dynamic_ackermann_step_nb(
+            x, mid, steering_rate, dt, front_axle_distance, rear_axle_distance,
+            mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
+            tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
+            rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
+            v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+            accel_min, accel_max, steering_min, steering_max,
+            steering_rate_min, steering_rate_max,
+        )
+        if mid_values[3] >= 0.0:
+            high = mid
+            best_accel = mid
+            best_values = mid_values
+        else:
+            low = mid
+    return best_accel, best_values
+
+
+@njit(cache=True)
+def _ackermann_ilqr_initial_controls_nb(
+    x0, ref, arc, horizon,
+    dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+    cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+    gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+    minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+    yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+    steering_rate_min, steering_rate_max,
 ):
     U = np.zeros((horizon, 2), dtype=np.float64)
-    x = np.zeros(7, dtype=np.float64)
+    x = np.empty(7, dtype=np.float64)
     for j in range(7):
         x[j] = x0[j]
-    ref_len = ref.shape[0]
-    wheelbase = front_axle_distance + rear_axle_distance
-    progress_idx = 0
-
-    terminal_endpoint = False
-    if ref_len >= 2:
-        ex = ref[ref_len - 1, 0] - ref[ref_len - 2, 0]
-        ey = ref[ref_len - 1, 1] - ref[ref_len - 2, 1]
-        terminal_endpoint = ex * ex + ey * ey <= 1e-12
-
+    cursor = 0
+    wheelbase = max(front_axle_distance + rear_axle_distance, 1e-9)
     for t in range(horizon):
-        if ref_len < 2:
-            accel = min(max(-3.0 * x[3], accel_min), accel_max)
-            steering_rate = min(max(-steering_gain * x[6] - yaw_rate_gain * x[5], steering_rate_min), steering_rate_max)
-            U[t, 0] = accel
-            U[t, 1] = steering_rate
-            values = _dynamic_ackermann_step_nb(
-                x, accel, steering_rate, dt, front_axle_distance, rear_axle_distance,
-                mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
-                tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
-                rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
-                v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min,
-                accel_max, steering_min, steering_max, steering_rate_min,
-                steering_rate_max,
-            )
-            for j in range(7):
-                x[j] = values[j]
-            continue
-
-        # Closest forward projection on the prior.
-        first_seg = min(progress_idx, ref_len - 2)
-        best_seg = first_seg
-        best_d2 = 1e300
-        best_qx = ref[first_seg, 0]
-        best_qy = ref[first_seg, 1]
-        for i in range(first_seg, ref_len - 1):
-            sx = ref[i + 1, 0] - ref[i, 0]
-            sy = ref[i + 1, 1] - ref[i, 1]
-            seg2 = sx * sx + sy * sy
-            if seg2 <= 1e-14:
-                qx = ref[i, 0]
-                qy = ref[i, 1]
-            else:
-                tau = ((x[0] - ref[i, 0]) * sx + (x[1] - ref[i, 1]) * sy) / seg2
-                tau = min(max(tau, 0.0), 1.0)
-                qx = ref[i, 0] + tau * sx
-                qy = ref[i, 1] + tau * sy
-            dxq = x[0] - qx
-            dyq = x[1] - qy
-            d2 = dxq * dxq + dyq * dyq
-            if d2 < best_d2:
-                best_d2 = d2
-                best_seg = i
-                best_qx = qx
-                best_qy = qy
-        progress_idx = best_seg
-
-        # Non-degenerate local tangent.
-        tangent_seg = best_seg
-        sx = ref[tangent_seg + 1, 0] - ref[tangent_seg, 0]
-        sy = ref[tangent_seg + 1, 1] - ref[tangent_seg, 1]
-        seg_len = math.sqrt(sx * sx + sy * sy)
-        if seg_len <= 1e-12:
-            found = False
-            for i in range(best_seg + 1, ref_len - 1):
-                tx0 = ref[i + 1, 0] - ref[i, 0]
-                ty0 = ref[i + 1, 1] - ref[i, 1]
-                ll = math.sqrt(tx0 * tx0 + ty0 * ty0)
-                if ll > 1e-12:
-                    tangent_seg = i
-                    sx = tx0
-                    sy = ty0
-                    seg_len = ll
-                    found = True
-                    break
-            if not found:
-                for i in range(best_seg - 1, -1, -1):
-                    tx0 = ref[i + 1, 0] - ref[i, 0]
-                    ty0 = ref[i + 1, 1] - ref[i, 1]
-                    ll = math.sqrt(tx0 * tx0 + ty0 * ty0)
-                    if ll > 1e-12:
-                        tangent_seg = i
-                        sx = tx0
-                        sy = ty0
-                        seg_len = ll
-                        break
-
-        tx = sx / max(seg_len, 1e-12)
-        ty = sy / max(seg_len, 1e-12)
-        path_heading = math.atan2(ty, tx)
-        lateral_error = -ty * (x[0] - best_qx) + tx * (x[1] - best_qy)
-        heading_error = _wrap_angle_nb(x[2] - path_heading)
-        cross_track_distance = math.sqrt(max(best_d2, 0.0))
-
-        # Interception is used whenever either position or orientation is too far
-        # from the local Frenet tube. Once both errors are small, switch to Frenet.
-        intercept_mode = (
-            cross_track_distance > intercept_lateral_threshold
-            or abs(heading_error) > intercept_heading_threshold
+        s, qx, qy, tx, ty, heading, cursor = _project_path_forward_ilqr_nb(
+            ref, arc, x[0], x[1], cursor
         )
-
-        desired_speed = min(max(reference_speed, 0.0), v_max)
-        if intercept_mode:
-            target_x, target_y = _path_intercept_point_nb(
-                ref, best_seg, best_qx, best_qy, intercept_lookahead
-            )
-            dx = target_x - x[0]
-            dy = target_y - x[1]
-            target_distance = math.sqrt(dx * dx + dy * dy)
-            capture_heading = math.atan2(dy, dx)
-            capture_error = _wrap_angle_nb(capture_heading - x[2])
-            capture_curvature = 2.0 * math.sin(capture_error) / max(target_distance, 0.35)
-            desired_steering = math.atan(wheelbase * capture_curvature) + intercept_heading_gain * capture_error
-            desired_steering = min(max(desired_steering, steering_min), steering_max)
-
-            forward = max(0.0, math.cos(capture_error))
-            desired_speed = reference_speed * forward * forward
-            desired_speed = max(intercept_min_speed, desired_speed)
-            desired_speed = min(max(desired_speed, 0.0), v_max)
-        else:
-            # Frenet feed-forward curvature from three nearby path samples.
-            curvature = 0.0
-            if ref_len >= 3:
-                center = min(max(tangent_seg, 1), ref_len - 2)
-                x0p = ref[center - 1, 0]
-                y0p = ref[center - 1, 1]
-                x1p = ref[center, 0]
-                y1p = ref[center, 1]
-                x2p = ref[center + 1, 0]
-                y2p = ref[center + 1, 1]
-                a0x = x1p - x0p
-                a0y = y1p - y0p
-                b0x = x2p - x0p
-                b0y = y2p - y0p
-                l01 = math.sqrt(a0x * a0x + a0y * a0y)
-                d12x = x2p - x1p
-                d12y = y2p - y1p
-                l12 = math.sqrt(d12x * d12x + d12y * d12y)
-                l02 = math.sqrt(b0x * b0x + b0y * b0y)
-                denom = l01 * l12 * l02
-                if denom > 1e-12:
-                    cross = a0x * b0y - a0y * b0x
-                    curvature = 2.0 * cross / denom
-                if abs(curvature) < 1e-4:
-                    curvature = 0.0
-
-            feedforward = math.atan(wheelbase * curvature)
-            feedback = -heading_gain * heading_error - math.atan2(
-                lateral_gain * lateral_error, abs(x[3]) + softening_speed
-            )
-            desired_steering = min(max(feedforward + feedback, steering_min), steering_max)
-
-        steering_rate = steering_gain * (desired_steering - x[6]) - yaw_rate_gain * x[5]
+        _ = (s, tx, ty, heading)
+        lookahead = min(1.2, max(0.55, 0.55 + 0.22 * max(x[3], 0.0)))
+        gx, gy = _path_intercept_point_nb(ref, cursor, qx, qy, lookahead)
+        desired_heading = math.atan2(gy - x[1], gx - x[0])
+        heading_error = _wrap_angle_nb(desired_heading - x[2])
+        alignment = max(0.0, math.cos(heading_error))
+        desired_speed = v_max * (0.30 + 0.70 * alignment * alignment)
+        accel = 3.0 * (desired_speed - x[3])
+        accel = min(max(accel, accel_min), accel_max)
+        curvature = 2.0 * math.sin(heading_error) / max(lookahead, 1e-6)
+        desired_steering = math.atan(wheelbase * curvature)
+        desired_steering = min(max(desired_steering, steering_min), steering_max)
+        steering_rate = 5.0 * (desired_steering - x[6]) - 0.20 * x[5]
         steering_rate = min(max(steering_rate, steering_rate_min), steering_rate_max)
-
-        if terminal_endpoint:
-            remaining = math.sqrt(
-                (ref[best_seg + 1, 0] - best_qx) ** 2
-                + (ref[best_seg + 1, 1] - best_qy) ** 2
-            )
-            for i in range(best_seg + 1, ref_len - 1):
-                rx = ref[i + 1, 0] - ref[i, 0]
-                ry = ref[i + 1, 1] - ref[i, 1]
-                remaining += math.sqrt(rx * rx + ry * ry)
-            desired_speed = min(desired_speed, max(0.0, terminal_distance_gain * remaining))
-
-        accel = min(max(3.0 * (desired_speed - x[3]), accel_min), accel_max)
-        U[t, 0] = accel
-        U[t, 1] = steering_rate
-        values = _dynamic_ackermann_step_nb(
+        accel, values = _ackermann_forward_only_step_ilqr_nb(
             x, accel, steering_rate, dt, front_axle_distance, rear_axle_distance,
             mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
             tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
             rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
-            v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min,
-            accel_max, steering_min, steering_max, steering_rate_min,
-            steering_rate_max,
+            v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+            accel_min, accel_max, steering_min, steering_max,
+            steering_rate_min, steering_rate_max,
         )
+        U[t, 0] = accel
+        U[t, 1] = steering_rate
         for j in range(7):
             x[j] = values[j]
     return U
 
 
 @njit(cache=True)
-def nominal_controls_to_track_paths_batch_nb(
-    x0, refs, horizon, reference_speed, heading_gain, lateral_gain, softening_speed,
-    steering_gain, yaw_rate_gain, terminal_distance_gain,
-    intercept_lateral_threshold, intercept_heading_threshold, intercept_lookahead,
-    intercept_min_speed, intercept_heading_gain,
+def _ackermann_ilqr_total_cost_nb(
+    X, U, ref, arc, cov_blocks, covariance_floor,
+    mahalanobis_weight, heading_weight, progress_weight,
+    control_accel_weight, control_steering_rate_weight,
+):
+    progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_ackermann_rollout_ilqr_nb(
+        X, ref, arc, cov_blocks, covariance_floor
+    )
+    H = U.shape[0]
+    cost = 0.0
+    for t in range(H):
+        dx = X[t, 0] - qx[t]
+        dy = X[t, 1] - qy[t]
+        mx = p00[t] * dx + p01[t] * dy
+        my = p01[t] * dx + p11[t] * dy
+        mahal = dx * mx + dy * my
+        eh = _wrap_angle_nb(X[t, 2] - heading[t])
+        cost += mahalanobis_weight * mahal + heading_weight * eh * eh - progress_weight * progress[t]
+        cost += control_accel_weight * U[t, 0] * U[t, 0] + control_steering_rate_weight * U[t, 1] * U[t, 1]
+    return cost
+
+@njit(cache=True)
+def _invert_regularized_2x2_ilqr_nb(a00, a01, a11, regularization):
+    r = max(regularization, 1e-9)
+    a00 += r
+    a11 += r
+    det = a00 * a11 - a01 * a01
+    if det <= 1e-12:
+        a00 += 10.0 * r + 1e-6
+        a11 += 10.0 * r + 1e-6
+        det = max(a00 * a11 - a01 * a01, 1e-12)
+    return a11 / det, -a01 / det, a00 / det
+
+
+@njit(cache=True)
+def _ackermann_ilqr_linearize_nb(
+    x, u, xnext,
     dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
     cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
     gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
     minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
     yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
-    steering_rate_min, steering_rate_max
+    steering_rate_min, steering_rate_max,
 ):
-    count = refs.shape[0]
-    output = np.empty((count, horizon, 2), dtype=np.float64)
-    for n in range(count):
-        controls = nominal_controls_to_track_path_nb(
-            x0, refs[n], horizon, reference_speed, heading_gain, lateral_gain, softening_speed,
-            steering_gain, yaw_rate_gain, terminal_distance_gain,
-            intercept_lateral_threshold, intercept_heading_threshold, intercept_lookahead,
-            intercept_min_speed, intercept_heading_gain,
+    A = np.zeros((7, 7), dtype=np.float64)
+    B = np.zeros((7, 2), dtype=np.float64)
+    A[0, 0] = 1.0
+    A[1, 1] = 1.0
+
+    for j in range(2, 7):
+        eps = 1e-4 if j == 2 or j == 6 else 1e-3
+        step = eps
+        if j == 3:
+            if x[j] + eps > v_max:
+                step = -eps
+            elif x[j] - eps < v_min:
+                step = eps
+        elif j == 4:
+            if x[j] + eps > lateral_velocity_limit:
+                step = -eps
+            elif x[j] - eps < -lateral_velocity_limit:
+                step = eps
+        elif j == 5:
+            if x[j] + eps > yaw_rate_limit:
+                step = -eps
+            elif x[j] - eps < -yaw_rate_limit:
+                step = eps
+        elif j == 6:
+            if x[j] + eps > steering_max:
+                step = -eps
+            elif x[j] - eps < steering_min:
+                step = eps
+        xp = np.empty(7, dtype=np.float64)
+        for k in range(7):
+            xp[k] = x[k]
+        xp[j] += step
+        if j == 2:
+            xp[j] = _wrap_angle_nb(xp[j])
+        values = _dynamic_ackermann_step_nb(
+            xp, u[0], u[1], dt, front_axle_distance, rear_axle_distance,
+            mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
+            tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
+            rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
+            v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+            accel_min, accel_max, steering_min, steering_max,
+            steering_rate_min, steering_rate_max,
+        )
+        for i in range(7):
+            diff = values[i] - xnext[i]
+            if i == 2:
+                diff = _wrap_angle_nb(diff)
+            A[i, j] = diff / step
+
+    for j in range(2):
+        eps = 1e-3
+        step = eps
+        if j == 0:
+            if u[j] + eps > accel_max:
+                step = -eps
+            elif u[j] - eps < accel_min:
+                step = eps
+        else:
+            if u[j] + eps > steering_rate_max:
+                step = -eps
+            elif u[j] - eps < steering_rate_min:
+                step = eps
+        up0 = u[0]
+        up1 = u[1]
+        if j == 0:
+            up0 += step
+        else:
+            up1 += step
+        values = _dynamic_ackermann_step_nb(
+            x, up0, up1, dt, front_axle_distance, rear_axle_distance,
+            mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
+            tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
+            rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
+            v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+            accel_min, accel_max, steering_min, steering_max,
+            steering_rate_min, steering_rate_max,
+        )
+        for i in range(7):
+            diff = values[i] - xnext[i]
+            if i == 2:
+                diff = _wrap_angle_nb(diff)
+            B[i, j] = diff / step
+    return A, B
+
+
+@njit(cache=True)
+def _ackermann_ilqr_backward_nb(
+    X, U, ref, arc, cov_blocks, covariance_floor,
+    mahalanobis_weight, heading_weight, progress_weight,
+    control_accel_weight, control_steering_rate_weight, regularization,
+    dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+    cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+    gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+    minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+    yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+    steering_rate_min, steering_rate_max,
+):
+    H = U.shape[0]
+    progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_ackermann_rollout_ilqr_nb(
+        X, ref, arc, cov_blocks, covariance_floor
+    )
+    kff = np.zeros((H, 2), dtype=np.float64)
+    Kfb = np.zeros((H, 2, 7), dtype=np.float64)
+
+    Vx = np.zeros(7, dtype=np.float64)
+    Vxx = np.zeros((7, 7), dtype=np.float64)
+
+    for t in range(H - 1, -1, -1):
+        A, B = _ackermann_ilqr_linearize_nb(
+            X[t], U[t], X[t + 1],
             dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
             cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
             gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
@@ -468,10 +644,185 @@ def nominal_controls_to_track_paths_batch_nb(
             yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
             steering_rate_min, steering_rate_max,
         )
-        for t in range(horizon):
-            output[n, t, 0] = controls[t, 0]
-            output[n, t, 1] = controls[t, 1]
-    return output
+        dx = X[t, 0] - qx[t]
+        dy = X[t, 1] - qy[t]
+        mx = p00[t] * dx + p01[t] * dy
+        my = p01[t] * dx + p11[t] * dy
+        eh = _wrap_angle_nb(X[t, 2] - heading[t])
+        lx = np.zeros(7, dtype=np.float64)
+        lx[0] = 2.0 * mahalanobis_weight * mx - progress_weight * tx[t]
+        lx[1] = 2.0 * mahalanobis_weight * my - progress_weight * ty[t]
+        lx[2] = 2.0 * heading_weight * eh
+        lxx = np.zeros((7, 7), dtype=np.float64)
+        lxx[0, 0] = 2.0 * mahalanobis_weight * p00[t]
+        lxx[0, 1] = 2.0 * mahalanobis_weight * p01[t]
+        lxx[1, 0] = lxx[0, 1]
+        lxx[1, 1] = 2.0 * mahalanobis_weight * p11[t]
+        lxx[2, 2] = 2.0 * heading_weight
+        lu = np.array((2.0 * control_accel_weight * U[t, 0], 2.0 * control_steering_rate_weight * U[t, 1]), dtype=np.float64)
+        luu = np.zeros((2, 2), dtype=np.float64)
+        luu[0, 0] = 2.0 * control_accel_weight
+        luu[1, 1] = 2.0 * control_steering_rate_weight
+
+        Qx = lx + A.T @ Vx
+        Qu = lu + B.T @ Vx
+        Qxx = lxx + A.T @ Vxx @ A
+        Quu = luu + B.T @ Vxx @ B
+        Qux = B.T @ Vxx @ A
+
+        inv00, inv01, inv11 = _invert_regularized_2x2_ilqr_nb(
+            Quu[0, 0], 0.5 * (Quu[0, 1] + Quu[1, 0]), Quu[1, 1], regularization
+        )
+        k0 = -(inv00 * Qu[0] + inv01 * Qu[1])
+        k1 = -(inv01 * Qu[0] + inv11 * Qu[1])
+        kff[t, 0] = k0
+        kff[t, 1] = k1
+        for j in range(7):
+            Kfb[t, 0, j] = -(inv00 * Qux[0, j] + inv01 * Qux[1, j])
+            Kfb[t, 1, j] = -(inv01 * Qux[0, j] + inv11 * Qux[1, j])
+
+        K = Kfb[t]
+        kval = kff[t]
+        Vx = Qx + K.T @ Quu @ kval + K.T @ Qu + Qux.T @ kval
+        Vxx = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
+        Vxx = 0.5 * (Vxx + Vxx.T)
+    return kff, Kfb
+
+@njit(cache=True)
+def _ackermann_ilqr_forward_update_nb(
+    x0, U, X, kff, Kfb, alpha,
+    dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+    cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+    gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+    minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+    yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+    steering_rate_min, steering_rate_max,
+):
+    H = U.shape[0]
+    Unew = np.zeros_like(U)
+    Xnew = np.zeros_like(X)
+    for j in range(7):
+        Xnew[0, j] = x0[j]
+    for t in range(H):
+        du0 = alpha * kff[t, 0]
+        du1 = alpha * kff[t, 1]
+        for j in range(7):
+            dx = Xnew[t, j] - X[t, j]
+            if j == 2:
+                dx = _wrap_angle_nb(dx)
+            du0 += Kfb[t, 0, j] * dx
+            du1 += Kfb[t, 1, j] * dx
+        u0 = min(max(U[t, 0] + du0, accel_min), accel_max)
+        u1 = min(max(U[t, 1] + du1, steering_rate_min), steering_rate_max)
+        u0, values = _ackermann_forward_only_step_ilqr_nb(
+            Xnew[t], u0, u1, dt, front_axle_distance, rear_axle_distance,
+            mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear,
+            tire_friction_coefficient, gravity, aerodynamic_drag_coefficient,
+            rolling_resistance_force, minimum_tire_speed, dynamics_substeps,
+            v_min, v_max, lateral_velocity_limit, yaw_rate_limit,
+            accel_min, accel_max, steering_min, steering_max,
+            steering_rate_min, steering_rate_max,
+        )
+        Unew[t, 0] = u0
+        Unew[t, 1] = u1
+        for j in range(7):
+            Xnew[t + 1, j] = values[j]
+    return Unew, Xnew
+
+
+@njit(cache=True)
+def _ackermann_ilqr_nominal_and_positions_nb(
+    x0, ref, cov_blocks, horizon,
+    iterations, line_search_steps,
+    mahalanobis_weight, covariance_floor, heading_weight, progress_weight,
+    control_accel_weight, control_steering_rate_weight, regularization,
+    dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+    cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+    gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+    minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+    yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+    steering_rate_min, steering_rate_max,
+):
+    Uzero = np.zeros((horizon, 2), dtype=np.float64)
+    positions = np.zeros(horizon, dtype=np.float64)
+    if ref.shape[0] < 2:
+        return Uzero, positions
+    arc = _path_arc_lengths_ilqr_nb(ref)
+    if arc[arc.shape[0] - 1] <= 1e-10:
+        return Uzero, positions
+
+    ilqr_steering_rate_min = max(steering_rate_min, -8.0)
+    ilqr_steering_rate_max = min(steering_rate_max, 8.0)
+
+    U = _ackermann_ilqr_initial_controls_nb(
+        x0, ref, arc, horizon,
+        dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+        cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+        gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+        minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+        yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+        ilqr_steering_rate_min, ilqr_steering_rate_max,
+    )
+    X = rollout_ackermann_single_nb(
+        x0, U, dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+        cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+        gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+        minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+        yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+        ilqr_steering_rate_min, ilqr_steering_rate_max,
+    )
+    best_cost = _ackermann_ilqr_total_cost_nb(
+        X, U, ref, arc, cov_blocks, covariance_floor,
+        mahalanobis_weight, heading_weight, progress_weight,
+        control_accel_weight, control_steering_rate_weight,
+    )
+
+    for _ in range(max(1, int(iterations))):
+        kff, Kfb = _ackermann_ilqr_backward_nb(
+            X, U, ref, arc, cov_blocks, covariance_floor,
+            mahalanobis_weight, heading_weight, progress_weight,
+            control_accel_weight, control_steering_rate_weight, regularization,
+            dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+            cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+            gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+            minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+            yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+            ilqr_steering_rate_min, ilqr_steering_rate_max,
+        )
+        improved = False
+        alpha = 1.0
+        for _ls in range(max(1, int(line_search_steps))):
+            Utrial, Xtrial = _ackermann_ilqr_forward_update_nb(
+                x0, U, X, kff, Kfb, alpha,
+                dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
+                cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
+                gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
+                minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit,
+                yaw_rate_limit, accel_min, accel_max, steering_min, steering_max,
+                ilqr_steering_rate_min, ilqr_steering_rate_max,
+            )
+            trial_cost = _ackermann_ilqr_total_cost_nb(
+                Xtrial, Utrial, ref, arc, cov_blocks, covariance_floor,
+                mahalanobis_weight, heading_weight, progress_weight,
+                control_accel_weight, control_steering_rate_weight,
+            )
+            if math.isfinite(trial_cost) and trial_cost < best_cost - 1e-9:
+                U = Utrial
+                X = Xtrial
+                best_cost = trial_cost
+                improved = True
+                break
+            alpha *= 0.5
+        if not improved:
+            break
+
+    final_progress, _, _, _, _, _, _, _, _ = _project_ackermann_rollout_ilqr_nb(
+        X, ref, arc, cov_blocks, covariance_floor
+    )
+    for t in range(horizon):
+        positions[t] = final_progress[t]
+    return U, positions
+
 
 @njit(cache=True)
 def nominal_controls_to_goal_nb(x0, goal, horizon, dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient, gravity, aerodynamic_drag_coefficient, rolling_resistance_force, minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min, accel_max, steering_min, steering_max, steering_rate_min, steering_rate_max):
@@ -487,7 +838,7 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, front_axle_distance, rear
             desired_heading = math.atan2(dy, dx)
             heading_error = _wrap_angle_nb(desired_heading - x[2])
             heading_scale = max(0.0, math.cos(heading_error)) ** 2
-            desired_speed = min(max(0.2 + 2.2 * dist * heading_scale, 0.0), v_max)
+            desired_speed = v_max * heading_scale
             accel = min(max(3.0 * (desired_speed - x[3]), accel_min), accel_max)
             lookahead = max(dist, 0.35)
             curvature = 2.0 * math.sin(heading_error) / lookahead
@@ -577,22 +928,17 @@ def path_min_clearance_to_circles_nb(path, circle_centers, circle_radii, vehicle
                         best = clearance
         return best
 
-@njit(cache=True)
-def rollout_collision_mask_nb(X, circle_centers, circle_radii, goal, vehicle_length, vehicle_width, hard_collision_clearance, rollout_goal_tolerance):
+@njit(cache=True, parallel=True)
+def rollout_collision_mask_nb(X, circle_centers, circle_radii, vehicle_length, vehicle_width, hard_collision_clearance):
         N = X.shape[0]
         H = X.shape[1] - 1
         mask = np.zeros(N, dtype=np.bool_)
-        goal_radius_sq = rollout_goal_tolerance * rollout_goal_tolerance
-        for n in range(N):
+        for n in prange(N):
             for t in range(H):
                 state = X[n, t + 1]
                 clearance = minimum_rectangle_circle_clearance_nb(state, circle_centers, circle_radii, vehicle_length, vehicle_width)
                 if clearance < hard_collision_clearance:
                     mask[n] = True
-                    break
-                gx = state[0] - goal[0]
-                gy = state[1] - goal[1]
-                if gx * gx + gy * gy <= goal_radius_sq:
                     break
         return mask
 
@@ -626,49 +972,41 @@ def apply_smooth_safe_control_nb(x_current, u, previous_control, has_previous_co
                     cmd[0] = min(0.0, cmd[0])
         return cmd
 
-@njit(cache=True)
-def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, vehicle_length, vehicle_width, w_goal, rollout_goal_tolerance, w_obstacle, w_control, w_control_smooth):
+@njit(cache=True, parallel=True)
+def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, vehicle_length, vehicle_width, w_goal, w_obstacle, w_control, w_control_smooth):
         N = U.shape[0]
         H = horizon
         M = circle_radii.shape[0]
         costs = np.zeros(N, dtype=np.float64)
-        goal_radius_sq = rollout_goal_tolerance * rollout_goal_tolerance
-        for n in range(N):
+        for n in prange(N):
             cost = 0.0
-            arrival_index = H
             for t in range(H):
                 px = X[n, t + 1, 0]
                 py = X[n, t + 1, 1]
                 gx = px - goal[0]
                 gy = py - goal[1]
-                goal_distance_sq = gx * gx + gy * gy
-                cost += w_goal / H * goal_distance_sq
-                yaw_rate = X[n, t + 1, 5]
-                steering_angle = X[n, t + 1, 6]
+                cost += w_goal / H * (gx * gx + gy * gy)
                 heading = X[n, t + 1, 2]
                 for j in range(M):
                     clearance = rectangle_circle_clearance_nb(px, py, heading, circle_centers[j, 0], circle_centers[j, 1], circle_radii[j], vehicle_length, vehicle_width)
                     sp = _softplus_scalar_nb(8.0 * (0.0 - clearance))
                     cost += w_obstacle * sp * sp
-                if goal_distance_sq <= goal_radius_sq:
-                    arrival_index = t + 1
-                    break
             ctrl_cost = 0.0
-            for t in range(arrival_index):
-                v = U[n, t, 0]
-                om = U[n, t, 1]
-                ctrl_cost += v * v + 0.15 * om * om
+            for t in range(H):
+                u0 = U[n, t, 0]
+                u1 = U[n, t, 1]
+                ctrl_cost += u0 * u0 + 0.15 * u1 * u1
             cost += w_control * ctrl_cost
             smooth_cost = 0.0
-            for t in range(max(0, arrival_index - 1)):
-                dv = U[n, t + 1, 0] - U[n, t, 0]
-                dom = U[n, t + 1, 1] - U[n, t, 1]
-                smooth_cost += dv * dv + 0.2 * dom * dom
+            for t in range(H - 1):
+                du0 = U[n, t + 1, 0] - U[n, t, 0]
+                du1 = U[n, t + 1, 1] - U[n, t, 1]
+                smooth_cost += du0 * du0 + 0.2 * du1 * du1
             cost += w_control_smooth * smooth_cost
             costs[n] = cost
         return costs
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def boundary_penalty_nb(X, xmin, xmax, ymin, ymax, vehicle_length, vehicle_width, w_boundary, collision_substeps, hard_collision_clearance, hard_collision_penalty):
         N = X.shape[0]
         H = X.shape[1] - 1
@@ -677,7 +1015,7 @@ def boundary_penalty_nb(X, xmin, xmax, ymin, ymax, vehicle_length, vehicle_width
         denominator = float(substeps + 1)
         half_length = 0.5 * vehicle_length
         half_width = 0.5 * vehicle_width
-        for n in range(N):
+        for n in prange(N):
             cost = 0.0
             for t in range(H):
                 x0 = X[n, t, 0]
@@ -830,14 +1168,14 @@ def min_clearance_nb(states, polys_padded, poly_lengths, vehicle_length, vehicle
                     best = clearance
         return best
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def sensitivity_projected_covariances_nb(x0, nominal_controls, position_covariances, lookahead_steps, fd_accel, fd_steering_rate, pseudoinverse_damping, covariance_jitter, dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient, gravity, aerodynamic_drag_coefficient, rolling_resistance_force, minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min, accel_max, steering_min, steering_max, steering_rate_min, steering_rate_max):
         """Project position covariance into control space with Eq. (26)."""
         horizon = nominal_controls.shape[0]
         nominal_states = rollout_ackermann_single_nb(x0, nominal_controls, dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia, cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient, gravity, aerodynamic_drag_coefficient, rolling_resistance_force, minimum_tire_speed, dynamics_substeps, v_min, v_max, lateral_velocity_limit, yaw_rate_limit, accel_min, accel_max, steering_min, steering_max, steering_rate_min, steering_rate_max)
         projected = np.zeros((horizon, 2, 2), dtype=np.float64)
         damping_sq = pseudoinverse_damping * pseudoinverse_damping
-        for t in range(horizon):
+        for t in prange(horizon):
             interval = min(max(1, int(lookahead_steps)), horizon - t)
             jacobian = np.zeros((2, 2), dtype=np.float64)
             for control_index in range(2):
@@ -1054,9 +1392,6 @@ def rollout_ackermann_batch(x0: Array, U: Array, cfg: MPPIConfig) -> Array:
         np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), *_dynamic_model_arguments(cfg)
     )
 
-def softplus(z):
-    return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
-
 def obstacle_circles_to_arrays(obstacle_circles: List[Tuple[Array, float]]) -> Tuple[Array, Array]:
     if not obstacle_circles:
         return (np.zeros((0, 2), dtype=np.float64), np.zeros(0, dtype=np.float64))
@@ -1076,20 +1411,6 @@ def apply_smooth_safe_control(x_current: Array, u: Array, previous_control: Opti
         bool(cfg.enforce_one_step_safety), float(cfg.one_step_safety_clearance),
         float(cfg.vehicle_length), float(cfg.vehicle_width), *_dynamic_model_arguments(cfg)
     )
-
-def _path_tangent_headings(path: Array) -> Array:
-    p = np.asarray(path, dtype=np.float64)
-    if len(p) <= 1:
-        return np.zeros(len(p), dtype=np.float64)
-    tangent = np.empty_like(p)
-    tangent[0] = p[1] - p[0]
-    tangent[-1] = p[-1] - p[-2]
-    if len(p) > 2:
-        tangent[1:-1] = p[2:] - p[:-2]
-    headings = np.arctan2(tangent[:, 1], tangent[:, 0])
-    for i in range(1, len(headings)):
-        headings[i] = headings[i - 1] + wrap_angle(headings[i] - headings[i - 1])
-    return headings
 
 def path_min_clearance_to_circles(path: Array, obstacle_circles: List[Tuple[Array, float]], vehicle_length: float, vehicle_width: float, substeps: int=2) -> float:
     p = np.asarray(path, dtype=np.float64)
@@ -1112,48 +1433,50 @@ def obstacles_to_padded_arrays(obstacles: Sequence) -> Tuple[Array, Array]:
         lengths[i] = p.shape[0]
     return (padded, lengths)
 
-def nominal_controls_to_track_path(x0: Array, ref: Array, cfg: MPPIConfig) -> Array:
-    return nominal_controls_to_track_path_nb(
-        np.asarray(x0, dtype=np.float64),
-        np.asarray(ref, dtype=np.float64),
-        int(cfg.horizon),
-        float(cfg.prior_reference_speed),
-        float(cfg.prior_tracking_heading_gain),
-        float(cfg.prior_tracking_lateral_gain),
-        float(cfg.prior_tracking_softening_speed),
-        float(cfg.prior_tracking_steering_gain),
-        float(cfg.prior_tracking_yaw_rate_gain),
-        float(cfg.prior_tracking_terminal_distance_gain),
-        float(cfg.prior_intercept_lateral_threshold),
-        float(cfg.prior_intercept_heading_threshold),
-        float(cfg.prior_intercept_lookahead),
-        float(cfg.prior_intercept_min_speed),
-        float(cfg.prior_intercept_heading_gain),
-        *_dynamic_model_arguments(cfg),
+def _prepare_ilqr_covariance(ref: Array, cov_blocks: Optional[Array], cfg: MPPIConfig) -> Array:
+    path = np.asarray(ref, dtype=np.float64)
+    n = len(path)
+    if cov_blocks is None:
+        var = float(cfg.prior_ilqr_covariance_fallback_std) ** 2
+        cov = np.zeros((n, 2, 2), dtype=np.float64)
+        cov[:, 0, 0] = var
+        cov[:, 1, 1] = var
+        return np.ascontiguousarray(cov)
+    cov = np.asarray(cov_blocks, dtype=np.float64)
+    if cov.shape != (n, 2, 2):
+        raise ValueError(f"cov_blocks must have shape ({n},2,2), got {cov.shape}")
+    cov = 0.5 * (cov + np.swapaxes(cov, 1, 2))
+    return np.ascontiguousarray(cov)
+
+
+def nominal_controls_and_arc_positions(
+    x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None
+) -> Tuple[Array, Array]:
+    path = np.asarray(ref, dtype=np.float64)
+    cov = _prepare_ilqr_covariance(path, cov_blocks, cfg)
+    return _ackermann_ilqr_nominal_and_positions_nb(
+        np.asarray(x0, dtype=np.float64), path, cov, int(cfg.horizon),
+        int(cfg.prior_ilqr_iterations), int(cfg.prior_ilqr_line_search_steps),
+        float(cfg.prior_ilqr_mahalanobis_weight), float(cfg.prior_ilqr_covariance_floor),
+        float(cfg.prior_ilqr_heading_weight), float(cfg.prior_ilqr_progress_weight),
+        float(cfg.prior_ilqr_control_accel_weight), float(cfg.prior_ilqr_control_steering_rate_weight),
+        float(cfg.prior_ilqr_regularization), *_dynamic_model_arguments(cfg),
     )
 
-def nominal_controls_to_track_paths(x0: Array, refs: Array, cfg: MPPIConfig) -> Array:
-    reference_batch = np.asarray(refs, dtype=np.float64)
-    if reference_batch.ndim != 3 or reference_batch.shape[1:] != (int(cfg.horizon), 2):
-        raise ValueError(f"refs must have shape (N,{int(cfg.horizon)},2), got {reference_batch.shape}")
-    return nominal_controls_to_track_paths_batch_nb(
-        np.asarray(x0, dtype=np.float64),
-        reference_batch,
-        int(cfg.horizon),
-        float(cfg.prior_reference_speed),
-        float(cfg.prior_tracking_heading_gain),
-        float(cfg.prior_tracking_lateral_gain),
-        float(cfg.prior_tracking_softening_speed),
-        float(cfg.prior_tracking_steering_gain),
-        float(cfg.prior_tracking_yaw_rate_gain),
-        float(cfg.prior_tracking_terminal_distance_gain),
-        float(cfg.prior_intercept_lateral_threshold),
-        float(cfg.prior_intercept_heading_threshold),
-        float(cfg.prior_intercept_lookahead),
-        float(cfg.prior_intercept_min_speed),
-        float(cfg.prior_intercept_heading_gain),
-        *_dynamic_model_arguments(cfg),
-    )
+
+def prior_control_arc_positions(
+    x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None
+) -> Array:
+    _, positions = nominal_controls_and_arc_positions(x0, ref, cfg, cov_blocks)
+    return positions
+
+
+def nominal_controls_to_track_path(
+    x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None
+) -> Array:
+    controls, _ = nominal_controls_and_arc_positions(x0, ref, cfg, cov_blocks)
+    return controls
+
 
 def nominal_controls_to_goal(x0: Array, goal: Array, cfg: MPPIConfig) -> Array:
     return nominal_controls_to_goal_nb(
@@ -1180,8 +1503,7 @@ def standard_mppi_costs_batch(X: Array, U: Array, obstacle_circles: List[Tuple[A
         np.asarray(X, dtype=np.float64), np.asarray(U, dtype=np.float64), centers, radii,
         np.asarray(goal, dtype=np.float64), int(cfg.horizon),
         float(cfg.vehicle_length), float(cfg.vehicle_width), float(cfg.w_goal),
-        float(cfg.rollout_goal_tolerance), float(cfg.w_obstacle), float(cfg.w_control),
-        float(cfg.w_control_smooth),
+        float(cfg.w_obstacle), float(cfg.w_control), float(cfg.w_control_smooth),
     )
     return costs + boundary_penalty(X, cfg)
 
@@ -1214,10 +1536,11 @@ def rollout_collision_mask(X: Array, obstacle_circles: Sequence[Tuple[Array, flo
         return np.zeros(state_batch.shape[0], dtype=bool)
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
     radii = np.asarray([r for _, r in obstacle_circles], dtype=np.float64)
+    del goal
     return rollout_collision_mask_nb(
-        state_batch, centers, radii, np.asarray(goal, dtype=np.float64),
+        state_batch, centers, radii,
         float(cfg.vehicle_length), float(cfg.vehicle_width),
-        float(cfg.hard_collision_clearance), float(cfg.rollout_goal_tolerance),
+        float(cfg.hard_collision_clearance),
     )
 
 def update_display_trajectory(info: Dict[str, object], x_current: Array, executed_u: Array, goal: Array, cfg: MPPIConfig) -> None:
@@ -1228,19 +1551,13 @@ def update_display_trajectory(info: Dict[str, object], x_current: Array, execute
     if display_u.ndim != 2 or display_u.shape[1] != 2 or len(display_u) == 0:
         return
     display_u[0] = np.asarray(executed_u, dtype=np.float64)
-    trajectory = rollout_ackermann(x_current, display_u, cfg)
-    distances = np.linalg.norm(trajectory[:, :2] - np.asarray(goal, dtype=np.float64)[None, :], axis=1)
-    reached = np.flatnonzero(distances <= float(cfg.rollout_goal_tolerance))
-    if len(reached):
-        trajectory = trajectory[:int(reached[0]) + 1]
-    info['optimal_traj'] = trajectory
+    del goal
+    info['optimal_traj'] = rollout_ackermann(x_current, display_u, cfg)
 
 def initial_pose(start: Array, goal: Array) -> Array:
     direction = goal - start
     heading = math.atan2(direction[1], direction[0])
     return np.array([start[0], start[1], heading, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
-
-# Generic controller adapter -------------------------------------------------
 
 def control_noise_scale(cfg: MPPIConfig) -> Array:
     return np.asarray([cfg.noise_accel, cfg.noise_steering_rate], dtype=np.float64)

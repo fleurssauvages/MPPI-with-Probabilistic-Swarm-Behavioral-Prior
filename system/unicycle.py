@@ -12,7 +12,7 @@ try:
 except ImportError:
     import controller as ctrl
 
-from numba import njit
+from numba import njit, prange
 
 Array = np.ndarray
 NUMBA_AVAILABLE = True
@@ -27,40 +27,49 @@ MPPIHomotopyMode = ctrl.MPPIHomotopyMode
 
 @dataclass
 class MPPIConfig(ctrl.ControllerConfig):
+    goal_tolerance: float = 0.05
     v_min: float = -1.0
     v_max: float = 2.8
     omega_min: float = -4.5
     omega_max: float = 4.5
     noise_v: float = 0.5
-    noise_omega: float = 0.9
+    noise_omega: float = 1.0
 
-    # Geometric-prior to unicycle-control conversion.
-    prior_reference_speed: float = 2.0
-    prior_tracking_heading_gain: float = 2.5
-    prior_tracking_lateral_gain: float = 1.0
-    prior_tracking_terminal_distance_gain: float = 1.8
-    # Intercept the geometric prior before switching to local Frenet tracking.
-    prior_intercept_lateral_threshold: float = 0.60
-    prior_intercept_heading_threshold: float = 0.65
-    prior_intercept_lookahead: float = 0.90
-    prior_intercept_heading_gain: float = 2.8
+    prior_ilqr_iterations: int = 2
+    prior_ilqr_line_search_steps: int = 2
+    prior_ilqr_mahalanobis_weight: float = 2.5
+    prior_ilqr_covariance_floor: float = 0.12
+    prior_ilqr_covariance_fallback_std: float = 0.25
+    prior_ilqr_heading_weight: float = 2.5
+    prior_ilqr_progress_weight: float = 1.5
+    prior_ilqr_control_v_weight: float = 0.015
+    prior_ilqr_control_omega_weight: float = 0.03
+    prior_ilqr_regularization: float = 0.02
 
     max_delta_v: float = 0.7
     max_delta_omega: float = 1.4
     enforce_one_step_safety: bool = True
     one_step_safety_clearance: float = 0.0
 
-    terminal_slowdown_radius: float = 0.75
-    terminal_max_speed: float = 0.55
-    terminal_distance_gain: float = 1.8
-    terminal_heading_gain: float = 1.2
-    terminal_heading_deadzone: float = 0.45
-    terminal_blend_power: float = 1.5
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.v_min > self.v_max or self.omega_min > self.omega_max:
             raise ValueError("Invalid unicycle control bounds.")
+        for name, value in (
+            ("prior_ilqr_mahalanobis_weight", self.prior_ilqr_mahalanobis_weight),
+            ("prior_ilqr_covariance_floor", self.prior_ilqr_covariance_floor),
+            ("prior_ilqr_covariance_fallback_std", self.prior_ilqr_covariance_fallback_std),
+            ("prior_ilqr_heading_weight", self.prior_ilqr_heading_weight),
+            ("prior_ilqr_progress_weight", self.prior_ilqr_progress_weight),
+            ("prior_ilqr_control_v_weight", self.prior_ilqr_control_v_weight),
+            ("prior_ilqr_control_omega_weight", self.prior_ilqr_control_omega_weight),
+            ("prior_ilqr_regularization", self.prior_ilqr_regularization),
+        ):
+            if value <= 0.0:
+                raise ValueError(f"{name} must be positive.")
+        self.prior_ilqr_iterations = max(1, int(self.prior_ilqr_iterations))
+        self.prior_ilqr_line_search_steps = max(1, int(self.prior_ilqr_line_search_steps))
 
 
 @njit(cache=True)
@@ -75,6 +84,7 @@ def _softplus_scalar_nb(z):
             return math.exp(z)
         return math.log1p(math.exp(z))
 
+
 @njit(cache=True)
 def unicycle_step_nb(x, u, dt):
     out = np.empty(3, dtype=np.float64)
@@ -85,12 +95,12 @@ def unicycle_step_nb(x, u, dt):
     return out
 
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def rollout_unicycle_batch_nb(x0, U, dt):
     N = U.shape[0]
     H = U.shape[1]
     X = np.zeros((N, H + 1, 3), dtype=np.float64)
-    for n in range(N):
+    for n in prange(N):
         X[n, 0, 0] = x0[0]
         X[n, 0, 1] = x0[1]
         X[n, 0, 2] = x0[2]
@@ -142,188 +152,352 @@ def _path_intercept_point_nb(ref, best_seg, best_qx, best_qy, lookahead_distance
         ty = ref[i + 1, 1]
     return tx, ty
 
+@njit(cache=True)
+def _path_arc_lengths_ilqr_nb(ref):
+    n = ref.shape[0]
+    arc = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        dx = ref[i, 0] - ref[i - 1, 0]
+        dy = ref[i, 1] - ref[i - 1, 1]
+        arc[i] = arc[i - 1] + math.sqrt(dx * dx + dy * dy)
+    return arc
+
 
 @njit(cache=True)
-def nominal_controls_to_track_path_nb(
-    x0, ref, horizon, reference_speed, heading_gain, lateral_gain,
-    terminal_distance_gain, intercept_lateral_threshold,
-    intercept_heading_threshold, intercept_lookahead, intercept_heading_gain,
-    dt, v_min, v_max, omega_min, omega_max
-):
-    U = np.zeros((horizon, 2), dtype=np.float64)
-    px = x0[0]
-    py = x0[1]
-    theta = x0[2]
-    ref_len = ref.shape[0]
-    progress_idx = 0
-
-    terminal_endpoint = False
-    if ref_len >= 2:
-        ex = ref[ref_len - 1, 0] - ref[ref_len - 2, 0]
-        ey = ref[ref_len - 1, 1] - ref[ref_len - 2, 1]
-        terminal_endpoint = ex * ex + ey * ey <= 1e-12
-
-    for t in range(horizon):
-        if ref_len < 2:
-            U[t, 0] = 0.0
-            U[t, 1] = 0.0
+def _project_path_forward_ilqr_nb(ref, arc, px, py, start_seg):
+    n = ref.shape[0]
+    if n < 2:
+        return 0.0, ref[0, 0], ref[0, 1], 1.0, 0.0, 0.0, 0
+    first = min(max(int(start_seg), 0), n - 2)
+    best_d2 = 1e300
+    best_seg = first
+    best_alpha = 0.0
+    best_qx = ref[first, 0]
+    best_qy = ref[first, 1]
+    best_tx = 1.0
+    best_ty = 0.0
+    found = False
+    for i in range(first, n - 1):
+        ax = ref[i, 0]
+        ay = ref[i, 1]
+        dx = ref[i + 1, 0] - ax
+        dy = ref[i + 1, 1] - ay
+        l2 = dx * dx + dy * dy
+        if l2 <= 1e-16:
             continue
-
-        first_seg = min(progress_idx, ref_len - 2)
-        best_seg = first_seg
-        best_d2 = 1e300
-        best_qx = ref[first_seg, 0]
-        best_qy = ref[first_seg, 1]
-        for i in range(first_seg, ref_len - 1):
-            sx = ref[i + 1, 0] - ref[i, 0]
-            sy = ref[i + 1, 1] - ref[i, 1]
-            seg2 = sx * sx + sy * sy
-            if seg2 <= 1e-14:
-                qx = ref[i, 0]
-                qy = ref[i, 1]
-            else:
-                tau = ((px - ref[i, 0]) * sx + (py - ref[i, 1]) * sy) / seg2
-                tau = min(max(tau, 0.0), 1.0)
-                qx = ref[i, 0] + tau * sx
-                qy = ref[i, 1] + tau * sy
-            dxq = px - qx
-            dyq = py - qy
-            d2 = dxq * dxq + dyq * dyq
-            if d2 < best_d2:
-                best_d2 = d2
+        alpha = ((px - ax) * dx + (py - ay) * dy) / l2
+        if alpha < 0.0:
+            alpha = 0.0
+        elif alpha > 1.0:
+            alpha = 1.0
+        qx = ax + alpha * dx
+        qy = ay + alpha * dy
+        ex = px - qx
+        ey = py - qy
+        d2 = ex * ex + ey * ey
+        if d2 < best_d2:
+            inv_l = 1.0 / math.sqrt(l2)
+            best_d2 = d2
+            best_seg = i
+            best_alpha = alpha
+            best_qx = qx
+            best_qy = qy
+            best_tx = dx * inv_l
+            best_ty = dy * inv_l
+            found = True
+    if not found:
+        for i in range(first - 1, -1, -1):
+            dx = ref[i + 1, 0] - ref[i, 0]
+            dy = ref[i + 1, 1] - ref[i, 1]
+            l2 = dx * dx + dy * dy
+            if l2 > 1e-16:
+                inv_l = 1.0 / math.sqrt(l2)
                 best_seg = i
-                best_qx = qx
-                best_qy = qy
-        progress_idx = best_seg
+                best_alpha = 1.0
+                best_qx = ref[i + 1, 0]
+                best_qy = ref[i + 1, 1]
+                best_tx = dx * inv_l
+                best_ty = dy * inv_l
+                break
+    seg_len = arc[best_seg + 1] - arc[best_seg]
+    progress = arc[best_seg] + best_alpha * max(seg_len, 0.0)
+    heading = math.atan2(best_ty, best_tx)
+    return progress, best_qx, best_qy, best_tx, best_ty, heading, best_seg
 
-        tangent_seg = best_seg
-        sx = ref[tangent_seg + 1, 0] - ref[tangent_seg, 0]
-        sy = ref[tangent_seg + 1, 1] - ref[tangent_seg, 1]
-        seg_len = math.sqrt(sx * sx + sy * sy)
-        if seg_len <= 1e-12:
-            found = False
-            for i in range(best_seg + 1, ref_len - 1):
-                tx0 = ref[i + 1, 0] - ref[i, 0]
-                ty0 = ref[i + 1, 1] - ref[i, 1]
-                ll = math.sqrt(tx0 * tx0 + ty0 * ty0)
-                if ll > 1e-12:
-                    tangent_seg = i
-                    sx = tx0
-                    sy = ty0
-                    seg_len = ll
-                    found = True
-                    break
-            if not found:
-                for i in range(best_seg - 1, -1, -1):
-                    tx0 = ref[i + 1, 0] - ref[i, 0]
-                    ty0 = ref[i + 1, 1] - ref[i, 1]
-                    ll = math.sqrt(tx0 * tx0 + ty0 * ty0)
-                    if ll > 1e-12:
-                        tangent_seg = i
-                        sx = tx0
-                        sy = ty0
-                        seg_len = ll
-                        break
 
-        tx = sx / max(seg_len, 1e-12)
-        ty = sy / max(seg_len, 1e-12)
-        path_heading = math.atan2(ty, tx)
-        lateral_error = -ty * (px - best_qx) + tx * (py - best_qy)
-        heading_error = _wrap_angle_nb(theta - path_heading)
-        cross_track_distance = math.sqrt(max(best_d2, 0.0))
+@njit(cache=True)
+def _spatial_precision_ilqr_nb(cov_blocks, arc, seg, progress, covariance_floor):
+    """Inverse of Sigma(s)+sigma_floor^2 I at geometric projected progress."""
+    n = cov_blocks.shape[0]
+    if n == 0:
+        floor_var = max(covariance_floor * covariance_floor, 1e-8)
+        inv = 1.0 / floor_var
+        return inv, 0.0, inv
+    i = min(max(int(seg), 0), max(0, n - 2))
+    j = min(i + 1, n - 1)
+    ds = arc[min(i + 1, arc.shape[0] - 1)] - arc[min(i, arc.shape[0] - 1)]
+    alpha = 0.0 if ds <= 1e-12 else (progress - arc[i]) / ds
+    alpha = min(max(alpha, 0.0), 1.0)
+    beta = 1.0 - alpha
+    c00 = beta * cov_blocks[i, 0, 0] + alpha * cov_blocks[j, 0, 0]
+    c01a = beta * cov_blocks[i, 0, 1] + alpha * cov_blocks[j, 0, 1]
+    c01b = beta * cov_blocks[i, 1, 0] + alpha * cov_blocks[j, 1, 0]
+    c11 = beta * cov_blocks[i, 1, 1] + alpha * cov_blocks[j, 1, 1]
+    floor_var = max(covariance_floor * covariance_floor, 1e-8)
+    a = max(c00 + floor_var, floor_var)
+    d = max(c11 + floor_var, floor_var)
+    b = 0.5 * (c01a + c01b)
+    max_b = 0.999999 * math.sqrt(max(a * d, 0.0))
+    b = min(max(b, -max_b), max_b)
+    det = max(a * d - b * b, 1e-14)
+    return d / det, -b / det, a / det
 
-        intercept_mode = (
-            cross_track_distance > intercept_lateral_threshold
-            or abs(heading_error) > intercept_heading_threshold
+
+@njit(cache=True)
+def _project_unicycle_rollout_ilqr_nb(X, ref, arc, cov_blocks, covariance_floor):
+    count = X.shape[0]
+    progress = np.zeros(count, dtype=np.float64)
+    qx = np.zeros(count, dtype=np.float64)
+    qy = np.zeros(count, dtype=np.float64)
+    tx = np.zeros(count, dtype=np.float64)
+    ty = np.zeros(count, dtype=np.float64)
+    heading = np.zeros(count, dtype=np.float64)
+    p00 = np.zeros(count, dtype=np.float64)
+    p01 = np.zeros(count, dtype=np.float64)
+    p11 = np.zeros(count, dtype=np.float64)
+    cursor = 0
+    for t in range(count):
+        values = _project_path_forward_ilqr_nb(ref, arc, X[t, 0], X[t, 1], cursor)
+        progress[t] = values[0]
+        qx[t] = values[1]
+        qy[t] = values[2]
+        tx[t] = values[3]
+        ty[t] = values[4]
+        heading[t] = values[5]
+        cursor = values[6]
+        a, b, d = _spatial_precision_ilqr_nb(cov_blocks, arc, cursor, progress[t], covariance_floor)
+        p00[t] = a
+        p01[t] = b
+        p11[t] = d
+    return progress, qx, qy, tx, ty, heading, p00, p01, p11
+
+@njit(cache=True)
+def _unicycle_ilqr_initial_controls_nb(x0, ref, arc, horizon, dt, v_min, v_max, omega_min, omega_max):
+    U = np.zeros((horizon, 2), dtype=np.float64)
+    x = np.empty(3, dtype=np.float64)
+    x[0] = x0[0]
+    x[1] = x0[1]
+    x[2] = x0[2]
+    cursor = 0
+    lower_v = max(0.0, v_min)
+    for t in range(horizon):
+        s, qx, qy, tx, ty, heading, cursor = _project_path_forward_ilqr_nb(
+            ref, arc, x[0], x[1], cursor
         )
-
-        if intercept_mode:
-            target_x, target_y = _path_intercept_point_nb(
-                ref, best_seg, best_qx, best_qy, intercept_lookahead
-            )
-            dx = target_x - px
-            dy = target_y - py
-            capture_heading = math.atan2(dy, dx)
-            capture_error = _wrap_angle_nb(capture_heading - theta)
-            forward = max(0.0, math.cos(capture_error))
-            desired_speed = min(max(reference_speed * forward * forward, 0.0), v_max)
-            omega = intercept_heading_gain * capture_error
-        else:
-            curvature = 0.0
-            if ref_len >= 3:
-                center = min(max(tangent_seg, 1), ref_len - 2)
-                x0p = ref[center - 1, 0]
-                y0p = ref[center - 1, 1]
-                x1p = ref[center, 0]
-                y1p = ref[center, 1]
-                x2p = ref[center + 1, 0]
-                y2p = ref[center + 1, 1]
-                a0x = x1p - x0p
-                a0y = y1p - y0p
-                b0x = x2p - x0p
-                b0y = y2p - y0p
-                l01 = math.sqrt(a0x * a0x + a0y * a0y)
-                d12x = x2p - x1p
-                d12y = y2p - y1p
-                l12 = math.sqrt(d12x * d12x + d12y * d12y)
-                l02 = math.sqrt(b0x * b0x + b0y * b0y)
-                denom = l01 * l12 * l02
-                if denom > 1e-12:
-                    cross = a0x * b0y - a0y * b0x
-                    curvature = 2.0 * cross / denom
-                if abs(curvature) < 1e-4:
-                    curvature = 0.0
-
-            forward = max(0.0, math.cos(heading_error))
-            desired_speed = min(max(reference_speed * forward * forward, 0.0), v_max)
-            omega = desired_speed * curvature - heading_gain * heading_error - lateral_gain * lateral_error
-
-        if terminal_endpoint:
-            remaining = math.sqrt(
-                (ref[best_seg + 1, 0] - best_qx) ** 2
-                + (ref[best_seg + 1, 1] - best_qy) ** 2
-            )
-            for i in range(best_seg + 1, ref_len - 1):
-                rx = ref[i + 1, 0] - ref[i, 0]
-                ry = ref[i + 1, 1] - ref[i, 1]
-                remaining += math.sqrt(rx * rx + ry * ry)
-            desired_speed = min(desired_speed, max(0.0, terminal_distance_gain * remaining))
-
-        if omega < omega_min:
-            omega = omega_min
-        elif omega > omega_max:
-            omega = omega_max
-        if desired_speed < v_min:
-            desired_speed = v_min
-
-        U[t, 0] = desired_speed
+        _ = (s, heading)
+        lookahead = 0.55
+        gx, gy = _path_intercept_point_nb(ref, cursor, qx, qy, lookahead)
+        desired = math.atan2(gy - x[1], gx - x[0])
+        err = _wrap_angle_nb(desired - x[2])
+        alignment = max(0.0, math.cos(err))
+        v = v_max * (0.25 + 0.75 * alignment * alignment)
+        v = min(max(v, lower_v), v_max)
+        omega = 3.0 * err
+        omega = min(max(omega, omega_min), omega_max)
+        U[t, 0] = v
         U[t, 1] = omega
-        px += desired_speed * math.cos(theta) * dt
-        py += desired_speed * math.sin(theta) * dt
-        theta = _wrap_angle_nb(theta + omega * dt)
+        x = unicycle_step_nb(x, U[t], dt)
     return U
 
 
 @njit(cache=True)
-def nominal_controls_to_track_paths_batch_nb(
-    x0, refs, horizon, reference_speed, heading_gain, lateral_gain,
-    terminal_distance_gain, intercept_lateral_threshold,
-    intercept_heading_threshold, intercept_lookahead, intercept_heading_gain,
-    dt, v_min, v_max, omega_min, omega_max
+def _unicycle_ilqr_total_cost_nb(
+    X, U, ref, arc, cov_blocks, covariance_floor,
+    mahalanobis_weight, heading_weight, progress_weight,
+    control_v_weight, control_omega_weight,
 ):
-    count = refs.shape[0]
-    output = np.empty((count, horizon, 2), dtype=np.float64)
-    for n in range(count):
-        controls = nominal_controls_to_track_path_nb(
-            x0, refs[n], horizon, reference_speed, heading_gain, lateral_gain,
-            terminal_distance_gain, intercept_lateral_threshold,
-            intercept_heading_threshold, intercept_lookahead, intercept_heading_gain,
-            dt, v_min, v_max, omega_min, omega_max,
+    progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_unicycle_rollout_ilqr_nb(
+        X, ref, arc, cov_blocks, covariance_floor
+    )
+    H = U.shape[0]
+    cost = 0.0
+    for t in range(H):
+        dx = X[t, 0] - qx[t]
+        dy = X[t, 1] - qy[t]
+        mx = p00[t] * dx + p01[t] * dy
+        my = p01[t] * dx + p11[t] * dy
+        mahal = dx * mx + dy * my
+        eh = _wrap_angle_nb(X[t, 2] - heading[t])
+        cost += mahalanobis_weight * mahal + heading_weight * eh * eh - progress_weight * progress[t]
+        cost += control_v_weight * U[t, 0] * U[t, 0] + control_omega_weight * U[t, 1] * U[t, 1]
+    return cost
+
+@njit(cache=True)
+def _invert_regularized_2x2_ilqr_nb(a00, a01, a11, regularization):
+    r = max(regularization, 1e-9)
+    a00 += r
+    a11 += r
+    det = a00 * a11 - a01 * a01
+    if det <= 1e-12:
+        a00 += 10.0 * r + 1e-6
+        a11 += 10.0 * r + 1e-6
+        det = max(a00 * a11 - a01 * a01, 1e-12)
+    return a11 / det, -a01 / det, a00 / det
+
+
+@njit(cache=True)
+def _unicycle_ilqr_backward_nb(
+    X, U, ref, arc, cov_blocks, covariance_floor, dt,
+    mahalanobis_weight, heading_weight, progress_weight,
+    control_v_weight, control_omega_weight, regularization,
+):
+    H = U.shape[0]
+    progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_unicycle_rollout_ilqr_nb(
+        X, ref, arc, cov_blocks, covariance_floor
+    )
+    kff = np.zeros((H, 2), dtype=np.float64)
+    Kfb = np.zeros((H, 2, 3), dtype=np.float64)
+
+    Vx = np.zeros(3, dtype=np.float64)
+    Vxx = np.zeros((3, 3), dtype=np.float64)
+
+    for t in range(H - 1, -1, -1):
+        theta = X[t, 2]
+        v = U[t, 0]
+        c = math.cos(theta)
+        sn = math.sin(theta)
+        A = np.eye(3, dtype=np.float64)
+        A[0, 2] = -v * sn * dt
+        A[1, 2] = v * c * dt
+        B = np.zeros((3, 2), dtype=np.float64)
+        B[0, 0] = c * dt
+        B[1, 0] = sn * dt
+        B[2, 1] = dt
+
+        dx = X[t, 0] - qx[t]
+        dy = X[t, 1] - qy[t]
+        mx = p00[t] * dx + p01[t] * dy
+        my = p01[t] * dx + p11[t] * dy
+        eh = _wrap_angle_nb(X[t, 2] - heading[t])
+        lx = np.zeros(3, dtype=np.float64)
+        lx[0] = 2.0 * mahalanobis_weight * mx - progress_weight * tx[t]
+        lx[1] = 2.0 * mahalanobis_weight * my - progress_weight * ty[t]
+        lx[2] = 2.0 * heading_weight * eh
+        lxx = np.zeros((3, 3), dtype=np.float64)
+        lxx[0, 0] = 2.0 * mahalanobis_weight * p00[t]
+        lxx[0, 1] = 2.0 * mahalanobis_weight * p01[t]
+        lxx[1, 0] = lxx[0, 1]
+        lxx[1, 1] = 2.0 * mahalanobis_weight * p11[t]
+        lxx[2, 2] = 2.0 * heading_weight
+        lu = np.array((2.0 * control_v_weight * U[t, 0], 2.0 * control_omega_weight * U[t, 1]), dtype=np.float64)
+        luu = np.zeros((2, 2), dtype=np.float64)
+        luu[0, 0] = 2.0 * control_v_weight
+        luu[1, 1] = 2.0 * control_omega_weight
+
+        Qx = lx + A.T @ Vx
+        Qu = lu + B.T @ Vx
+        Qxx = lxx + A.T @ Vxx @ A
+        Quu = luu + B.T @ Vxx @ B
+        Qux = B.T @ Vxx @ A
+
+        inv00, inv01, inv11 = _invert_regularized_2x2_ilqr_nb(
+            Quu[0, 0], 0.5 * (Quu[0, 1] + Quu[1, 0]), Quu[1, 1], regularization
         )
-        for t in range(horizon):
-            output[n, t, 0] = controls[t, 0]
-            output[n, t, 1] = controls[t, 1]
-    return output
+        k0 = -(inv00 * Qu[0] + inv01 * Qu[1])
+        k1 = -(inv01 * Qu[0] + inv11 * Qu[1])
+        kff[t, 0] = k0
+        kff[t, 1] = k1
+        for j in range(3):
+            Kfb[t, 0, j] = -(inv00 * Qux[0, j] + inv01 * Qux[1, j])
+            Kfb[t, 1, j] = -(inv01 * Qux[0, j] + inv11 * Qux[1, j])
+
+        K = Kfb[t]
+        kval = kff[t]
+        Vx = Qx + K.T @ Quu @ kval + K.T @ Qu + Qux.T @ kval
+        Vxx = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
+        Vxx = 0.5 * (Vxx + Vxx.T)
+    return kff, Kfb
+
+@njit(cache=True)
+def _unicycle_ilqr_forward_update_nb(x0, U, X, kff, Kfb, alpha, dt, v_min, v_max, omega_min, omega_max):
+    H = U.shape[0]
+    Unew = np.zeros_like(U)
+    Xnew = np.zeros_like(X)
+    Xnew[0, 0] = x0[0]
+    Xnew[0, 1] = x0[1]
+    Xnew[0, 2] = x0[2]
+    lower_v = max(0.0, v_min)
+    for t in range(H):
+        dx0 = Xnew[t, 0] - X[t, 0]
+        dx1 = Xnew[t, 1] - X[t, 1]
+        dx2 = _wrap_angle_nb(Xnew[t, 2] - X[t, 2])
+        du0 = alpha * kff[t, 0] + Kfb[t, 0, 0] * dx0 + Kfb[t, 0, 1] * dx1 + Kfb[t, 0, 2] * dx2
+        du1 = alpha * kff[t, 1] + Kfb[t, 1, 0] * dx0 + Kfb[t, 1, 1] * dx1 + Kfb[t, 1, 2] * dx2
+        u0 = min(max(U[t, 0] + du0, lower_v), v_max)
+        u1 = min(max(U[t, 1] + du1, omega_min), omega_max)
+        Unew[t, 0] = u0
+        Unew[t, 1] = u1
+        Xnew[t + 1] = unicycle_step_nb(Xnew[t], Unew[t], dt)
+    return Unew, Xnew
+
+
+@njit(cache=True)
+def _unicycle_ilqr_nominal_and_positions_nb(
+    x0, ref, cov_blocks, horizon, dt, v_min, v_max, omega_min, omega_max,
+    iterations, line_search_steps,
+    mahalanobis_weight, covariance_floor, heading_weight, progress_weight,
+    control_v_weight, control_omega_weight, regularization,
+):
+    Uzero = np.zeros((horizon, 2), dtype=np.float64)
+    positions = np.zeros(horizon, dtype=np.float64)
+    if ref.shape[0] < 2:
+        return Uzero, positions
+    arc = _path_arc_lengths_ilqr_nb(ref)
+    if arc[arc.shape[0] - 1] <= 1e-10:
+        return Uzero, positions
+
+    U = _unicycle_ilqr_initial_controls_nb(x0, ref, arc, horizon, dt, v_min, v_max, omega_min, omega_max)
+    X = rollout_unicycle_single_nb(x0, U, dt)
+    best_cost = _unicycle_ilqr_total_cost_nb(
+        X, U, ref, arc, cov_blocks, covariance_floor,
+        mahalanobis_weight, heading_weight, progress_weight,
+        control_v_weight, control_omega_weight,
+    )
+
+    for _ in range(max(1, int(iterations))):
+        kff, Kfb = _unicycle_ilqr_backward_nb(
+            X, U, ref, arc, cov_blocks, covariance_floor, dt,
+            mahalanobis_weight, heading_weight, progress_weight,
+            control_v_weight, control_omega_weight, regularization,
+        )
+        improved = False
+        alpha = 1.0
+        for _ls in range(max(1, int(line_search_steps))):
+            Utrial, Xtrial = _unicycle_ilqr_forward_update_nb(
+                x0, U, X, kff, Kfb, alpha, dt, v_min, v_max, omega_min, omega_max
+            )
+            trial_cost = _unicycle_ilqr_total_cost_nb(
+                Xtrial, Utrial, ref, arc, cov_blocks, covariance_floor,
+                mahalanobis_weight, heading_weight, progress_weight,
+                control_v_weight, control_omega_weight,
+            )
+            if math.isfinite(trial_cost) and trial_cost < best_cost - 1e-9:
+                U = Utrial
+                X = Xtrial
+                best_cost = trial_cost
+                improved = True
+                break
+            alpha *= 0.5
+        if not improved:
+            break
+
+    final_progress, _, _, _, _, _, _, _, _ = _project_unicycle_rollout_ilqr_nb(
+        X, ref, arc, cov_blocks, covariance_floor
+    )
+    for t in range(horizon):
+        positions[t] = final_progress[t]
+    return U, positions
+
 
 @njit(cache=True)
 def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, omega_max):
@@ -334,18 +508,14 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, 
         for t in range(horizon):
             dx = goal[0] - px
             dy = goal[1] - py
-            dist = math.sqrt(dx * dx + dy * dy)
             desired_heading = math.atan2(dy, dx)
             err = _wrap_angle_nb(desired_heading - theta)
             forward = math.cos(err)
             if forward < 0.0:
                 forward = 0.0
-            heading_scale = forward * forward
-            v = 0.2 + 2.2 * dist * heading_scale
+            v = v_max * forward * forward
             if v < v_min:
                 v = v_min
-            elif v > v_max:
-                v = v_max
             omega = 3.0 * err
             if omega < omega_min:
                 omega = omega_min
@@ -358,13 +528,13 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, 
             theta = _wrap_angle_nb(theta + omega * dt)
         return U
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_control, w_control_smooth):
         N = U.shape[0]
         H = horizon
         M = circle_radii.shape[0]
         costs = np.zeros(N, dtype=np.float64)
-        for n in range(N):
+        for n in prange(N):
             cost = 0.0
             for t in range(H):
                 px = X[n, t + 1, 0]
@@ -460,14 +630,14 @@ def min_clearance_nb(states, polys_padded, poly_lengths, robot_radius):
                     best = clearance
         return best
 
-@njit(cache=True)
+@njit(cache=True, parallel=True)
 def sensitivity_projected_covariances_nb(x0, nominal_controls, position_covariances, lookahead_steps, fd_v, fd_omega, pseudoinverse_damping, covariance_jitter, dt, v_min, v_max, omega_min, omega_max):
         """Project planar trajectory covariance into unicycle control space."""
         horizon = nominal_controls.shape[0]
         nominal_states = rollout_unicycle_single_nb(x0, nominal_controls, dt)
         projected = np.zeros((horizon, 2, 2), dtype=np.float64)
         damping_sq = pseudoinverse_damping * pseudoinverse_damping
-        for t in range(horizon):
+        for t in prange(horizon):
             interval = min(max(1, int(lookahead_steps)), horizon - t)
             jacobian = np.zeros((2, 2), dtype=np.float64)
             for control_index in range(2):
@@ -539,19 +709,6 @@ def _poly_vertices(obs) -> Array:
         return np.asarray(obs.vertices, dtype=np.float64)[:, :2]
     return np.asarray(obs, dtype=np.float64)[:, :2]
 
-def point_segment_distance_and_normal(p: Array, a: Array, b: Array) -> Tuple[float, Array]:
-    ab = b - a
-    denom = float(ab @ ab)
-    if denom <= 1e-12:
-        closest = a
-    else:
-        u = float(np.clip((p - a) @ ab / denom, 0.0, 1.0))
-        closest = a + u * ab
-    dvec = p - closest
-    dist = float(np.linalg.norm(dvec))
-    normal = np.array([1.0, 0.0]) if dist <= 1e-12 else dvec / dist
-    return (dist, normal)
-
 def point_in_poly(p: Array, poly: Array) -> bool:
     x, y = p
     inside = False
@@ -565,19 +722,6 @@ def point_in_poly(p: Array, poly: Array) -> bool:
                 inside = not inside
     return inside
 
-def polygon_signed_distance_and_normal(p: Array, obs) -> Tuple[float, Array]:
-    poly = _poly_vertices(obs)
-    best_dist = 1e309
-    best_normal = np.array([1.0, 0.0])
-    for i in range(poly.shape[0]):
-        d, n = point_segment_distance_and_normal(p, poly[i], poly[(i + 1) % poly.shape[0]])
-        if d < best_dist:
-            best_dist = d
-            best_normal = n
-    if point_in_poly(p, poly):
-        return (-best_dist, best_normal)
-    return (best_dist, best_normal)
-
 def min_clearance(states: Array, obstacles: Sequence, robot_radius: float) -> float:
     state_array = np.asarray(states, dtype=np.float64)
     if state_array.size == 0 or not obstacles:
@@ -585,40 +729,8 @@ def min_clearance(states: Array, obstacles: Sequence, robot_radius: float) -> fl
     padded, lengths = obstacles_to_padded_arrays(obstacles)
     return float(min_clearance_nb(state_array, padded, lengths, float(robot_radius)))
 
-def wrap_angle(a):
-    return (a + np.pi) % (2.0 * np.pi) - np.pi
-
 def unicycle_step(x: Array, u: Array, dt: float) -> Array:
     return unicycle_step_nb(np.asarray(x, dtype=np.float64), np.asarray(u, dtype=np.float64), float(dt))
-
-def segment_goal_entry_state(x0: Array, x1: Array, goal: Array, goal_tolerance: float) -> Tuple[bool, Array]:
-    p0 = np.asarray(x0[:2], dtype=np.float64)
-    p1 = np.asarray(x1[:2], dtype=np.float64)
-    g = np.asarray(goal, dtype=np.float64)
-    r = float(goal_tolerance)
-    if np.linalg.norm(p0 - g) <= r:
-        return (True, np.asarray(x0, dtype=np.float64).copy())
-    if np.linalg.norm(p1 - g) <= r:
-        return (True, np.asarray(x1, dtype=np.float64).copy())
-    d = p1 - p0
-    a = float(d @ d)
-    if a <= 1e-16:
-        return (False, np.asarray(x1, dtype=np.float64).copy())
-    f = p0 - g
-    b = 2.0 * float(f @ d)
-    c = float(f @ f) - r * r
-    disc = b * b - 4.0 * a * c
-    if disc < 0.0:
-        return (False, np.asarray(x1, dtype=np.float64).copy())
-    root = math.sqrt(max(0.0, disc))
-    roots = [q for q in ((-b - root) / (2.0 * a), (-b + root) / (2.0 * a)) if 0.0 <= q <= 1.0]
-    if not roots:
-        return (False, np.asarray(x1, dtype=np.float64).copy())
-    alpha = float(min(roots))
-    hit = np.asarray(x0, dtype=np.float64).copy()
-    hit[:2] = p0 + alpha * d
-    hit[2] = wrap_angle(float(x0[2]) + alpha * wrap_angle(float(x1[2]) - float(x0[2])))
-    return (True, hit)
 
 def rollout_unicycle(x0: Array, U: Array, dt: float) -> Array:
     return rollout_unicycle_single_nb(np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), float(dt))
@@ -626,37 +738,12 @@ def rollout_unicycle(x0: Array, U: Array, dt: float) -> Array:
 def rollout_unicycle_batch(x0: Array, U: Array, dt: float) -> Array:
     return rollout_unicycle_batch_nb(np.asarray(x0, dtype=np.float64), np.asarray(U, dtype=np.float64), float(dt))
 
-def softplus(z):
-    return np.log1p(np.exp(-np.abs(z))) + np.maximum(z, 0.0)
-
 def obstacle_circles_to_arrays(obstacle_circles: List[Tuple[Array, float]]) -> Tuple[Array, Array]:
     if not obstacle_circles:
         return (np.zeros((0, 2), dtype=np.float64), np.zeros(0, dtype=np.float64))
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
     radii = np.asarray([r for _, r in obstacle_circles], dtype=np.float64)
     return (centers, radii)
-
-def apply_terminal_goal_approach(x_current: Array, u: Array, goal: Array, goal_tolerance: float, cfg: MPPIConfig) -> Array:
-    cmd = np.asarray(u, dtype=np.float64).copy()
-    dx = float(goal[0] - x_current[0])
-    dy = float(goal[1] - x_current[1])
-    distance = math.hypot(dx, dy)
-    radius = max(float(cfg.terminal_slowdown_radius), goal_tolerance + 1e-06)
-    if distance >= radius:
-        return cmd
-    desired_heading = math.atan2(dy, dx)
-    heading_error = wrap_angle(desired_heading - float(x_current[2]))
-    remaining = max(0.0, distance)
-    heading_scale = max(0.0, math.cos(heading_error)) ** 2
-    terminal_v = min(float(cfg.terminal_max_speed), float(cfg.terminal_distance_gain) * remaining) * heading_scale
-    heading_fade = float(np.clip((distance - goal_tolerance) / max(float(cfg.terminal_heading_deadzone), 1e-06), 0.0, 1.0))
-    terminal_omega = heading_fade * float(np.clip(float(cfg.terminal_heading_gain) * heading_error, cfg.omega_min, cfg.omega_max))
-    normalized = np.clip((radius - distance) / max(radius - goal_tolerance, 1e-06), 0.0, 1.0)
-    blend = float(normalized ** max(float(cfg.terminal_blend_power), 1e-06))
-    cmd[0] = (1.0 - blend) * cmd[0] + blend * terminal_v
-    cmd[1] = (1.0 - blend) * cmd[1] + blend * terminal_omega
-    cmd[0] = max(0.0, cmd[0])
-    return cmd
 
 def apply_smooth_safe_control(x_current: Array, u: Array, previous_control: Optional[Array], obstacle_circles: List[Tuple[Array, float]], cfg: MPPIConfig) -> Array:
     cmd = np.asarray(u, dtype=np.float64).copy()
@@ -704,32 +791,51 @@ def obstacles_to_padded_arrays(obstacles: Sequence) -> Tuple[Array, Array]:
         lengths[i] = p.shape[0]
     return (padded, lengths)
 
-def nominal_controls_to_track_path(x0: Array, ref: Array, cfg) -> Array:
-    return nominal_controls_to_track_path_nb(
-        np.asarray(x0, dtype=np.float64), np.asarray(ref, dtype=np.float64), int(cfg.horizon),
-        float(cfg.prior_reference_speed), float(cfg.prior_tracking_heading_gain),
-        float(cfg.prior_tracking_lateral_gain), float(cfg.prior_tracking_terminal_distance_gain),
-        float(cfg.prior_intercept_lateral_threshold),
-        float(cfg.prior_intercept_heading_threshold),
-        float(cfg.prior_intercept_lookahead),
-        float(cfg.prior_intercept_heading_gain),
+def _prepare_ilqr_covariance(ref: Array, cov_blocks: Optional[Array], cfg) -> Array:
+    path = np.asarray(ref, dtype=np.float64)
+    n = len(path)
+    if cov_blocks is None:
+        var = float(cfg.prior_ilqr_covariance_fallback_std) ** 2
+        cov = np.zeros((n, 2, 2), dtype=np.float64)
+        cov[:, 0, 0] = var
+        cov[:, 1, 1] = var
+        return np.ascontiguousarray(cov)
+    cov = np.asarray(cov_blocks, dtype=np.float64)
+    if cov.shape != (n, 2, 2):
+        raise ValueError(f"cov_blocks must have shape ({n},2,2), got {cov.shape}")
+    cov = 0.5 * (cov + np.swapaxes(cov, 1, 2))
+    return np.ascontiguousarray(cov)
+
+
+def nominal_controls_and_arc_positions(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None
+) -> Tuple[Array, Array]:
+    path = np.asarray(ref, dtype=np.float64)
+    cov = _prepare_ilqr_covariance(path, cov_blocks, cfg)
+    return _unicycle_ilqr_nominal_and_positions_nb(
+        np.asarray(x0, dtype=np.float64), path, cov, int(cfg.horizon),
         float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
+        int(cfg.prior_ilqr_iterations), int(cfg.prior_ilqr_line_search_steps),
+        float(cfg.prior_ilqr_mahalanobis_weight), float(cfg.prior_ilqr_covariance_floor),
+        float(cfg.prior_ilqr_heading_weight), float(cfg.prior_ilqr_progress_weight),
+        float(cfg.prior_ilqr_control_v_weight), float(cfg.prior_ilqr_control_omega_weight),
+        float(cfg.prior_ilqr_regularization),
     )
 
-def nominal_controls_to_track_paths(x0: Array, refs: Array, cfg) -> Array:
-    reference_batch = np.asarray(refs, dtype=np.float64)
-    if reference_batch.ndim != 3 or reference_batch.shape[1:] != (int(cfg.horizon), 2):
-        raise ValueError(f"refs must have shape (N,{int(cfg.horizon)},2), got {reference_batch.shape}")
-    return nominal_controls_to_track_paths_batch_nb(
-        np.asarray(x0, dtype=np.float64), reference_batch, int(cfg.horizon),
-        float(cfg.prior_reference_speed), float(cfg.prior_tracking_heading_gain),
-        float(cfg.prior_tracking_lateral_gain), float(cfg.prior_tracking_terminal_distance_gain),
-        float(cfg.prior_intercept_lateral_threshold),
-        float(cfg.prior_intercept_heading_threshold),
-        float(cfg.prior_intercept_lookahead),
-        float(cfg.prior_intercept_heading_gain),
-        float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
-    )
+
+def prior_control_arc_positions(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None
+) -> Array:
+    _, positions = nominal_controls_and_arc_positions(x0, ref, cfg, cov_blocks)
+    return positions
+
+
+def nominal_controls_to_track_path(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None
+) -> Array:
+    controls, _ = nominal_controls_and_arc_positions(x0, ref, cfg, cov_blocks)
+    return controls
+
 
 def nominal_controls_to_goal(x0: Array, goal: Array, cfg) -> Array:
     return nominal_controls_to_goal_nb(
@@ -772,15 +878,43 @@ def sensitivity_projected_control_covariances(x0: Array, nominal_controls: Array
         float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
     )
 
+@njit(cache=True, parallel=True)
+def rollout_collision_mask_nb(X, circle_centers, circle_radii, robot_radius, hard_collision_clearance):
+    """Parallel early-exit collision test over independent MPPI rollouts."""
+    N = X.shape[0]
+    H = X.shape[1] - 1
+    M = circle_radii.shape[0]
+    mask = np.zeros(N, dtype=np.bool_)
+    for n in prange(N):
+        colliding = False
+        for t in range(H):
+            px = X[n, t + 1, 0]
+            py = X[n, t + 1, 1]
+            for j in range(M):
+                dx = px - circle_centers[j, 0]
+                dy = py - circle_centers[j, 1]
+                clearance = math.sqrt(dx * dx + dy * dy) - circle_radii[j] - robot_radius
+                if clearance < hard_collision_clearance:
+                    colliding = True
+                    break
+            if colliding:
+                break
+        mask[n] = colliding
+    return mask
+
+
 def rollout_collision_mask(X: Array, obstacle_circles: Sequence[Tuple[Array, float]], cfg: MPPIConfig) -> Array:
     if not obstacle_circles or X.shape[0] == 0:
         return np.zeros(X.shape[0], dtype=bool)
     centers = np.asarray([c for c, _ in obstacle_circles], dtype=np.float64)
     radii = np.asarray([r for _, r in obstacle_circles], dtype=np.float64)
-    points = np.asarray(X[:, 1:, :2], dtype=np.float64)
-    delta = points[:, :, None, :] - centers[None, None, :, :]
-    clearance = np.linalg.norm(delta, axis=-1) - radii[None, None, :] - float(cfg.robot_radius)
-    return np.any(clearance < float(cfg.hard_collision_clearance), axis=(1, 2))
+    return rollout_collision_mask_nb(
+        np.asarray(X, dtype=np.float64),
+        centers,
+        radii,
+        float(cfg.robot_radius),
+        float(cfg.hard_collision_clearance),
+    )
 
 def update_display_trajectory(info: Dict[str, object], x_current: Array, executed_u: Array, cfg: MPPIConfig) -> None:
     sequence = info.get('planned_control_sequence')
@@ -796,8 +930,6 @@ def initial_pose(start: Array, goal: Array) -> Array:
     direction = goal - start
     heading = math.atan2(direction[1], direction[0])
     return np.array([start[0], start[1], heading], dtype=np.float64)
-
-# Generic controller adapter -------------------------------------------------
 
 def control_noise_scale(cfg: MPPIConfig) -> Array:
     return np.asarray([cfg.noise_v, cfg.noise_omega], dtype=np.float64)
@@ -845,8 +977,8 @@ def apply_final_output(
     goal: Array,
     cfg: MPPIConfig,
 ) -> Array:
-    command = apply_terminal_goal_approach(x_current, control, goal, cfg.goal_tolerance, cfg)
-    return apply_smooth_safe_control(x_current, command, previous_control, obstacle_circles, cfg)
+    del goal
+    return apply_smooth_safe_control(x_current, control, previous_control, obstacle_circles, cfg)
 
 
 def render_output_trajectory(info, x_current: Array, control: Array, goal: Array, cfg: MPPIConfig) -> None:
@@ -860,8 +992,7 @@ def goal_reached(state: Array, goal: Array, cfg: MPPIConfig) -> bool:
 
 def advance_state(state: Array, control: Array, goal: Array, cfg: MPPIConfig) -> Tuple[Array, bool]:
     next_state = unicycle_step(state, control, cfg.dt)
-    arrived, state_at_goal = segment_goal_entry_state(state, next_state, goal, cfg.goal_tolerance)
-    return (state_at_goal if arrived else next_state), bool(arrived)
+    return next_state, goal_reached(next_state, goal, cfg)
 
 
 def minimum_clearance(states: Array, obstacles: Sequence, cfg: MPPIConfig) -> float:

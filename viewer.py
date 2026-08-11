@@ -7,7 +7,7 @@ import traceback
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 import numpy as np
-from system import ackermann, unicycle
+from system import ackermann, controller as controller_core, unicycle
 try:
     import tkinter as tk
     from tkinter import messagebox, ttk
@@ -128,7 +128,6 @@ class InteractiveMPPIViewer:
             return
         except tk.TclError:
             pass
-        # Portable fallback for window managers without a zoomed state.
         width = max(1080, int(self.root.winfo_screenwidth()))
         height = max(700, int(self.root.winfo_screenheight()))
         self.root.geometry(f'{width}x{height}+0+0')
@@ -154,7 +153,7 @@ class InteractiveMPPIViewer:
         self.swarm_seed_var = tk.StringVar(value='5')
         self.rollouts_var = tk.StringVar(value='512')
         self.speed_var = tk.StringVar(value='4.0')
-        self.show_collision_var = tk.BooleanVar(value=True)
+        self.show_collision_var = tk.BooleanVar(value=False)
         self.show_all_modes_var = tk.BooleanVar(value=False)
         self.status_var = tk.StringVar(value='Ready')
         self.frame_label_var = tk.StringVar(value='Frame 0 / 0')
@@ -169,6 +168,8 @@ class InteractiveMPPIViewer:
         row = self._add_entry(controls, row, 'Rollouts per step', self.rollouts_var)
         row = self._add_combo(controls, row, 'Playback speed', self.speed_var, ['0.5', '1.0', '2.0', '4.0', '8.0'])
         ttk.Checkbutton(controls, text='Show collision representation', variable=self.show_collision_var, command=self._redraw_current).grid(row=row, column=0, sticky='w', pady=(8, 2))
+        row += 1
+        ttk.Checkbutton(controls, text='Show all prior means', variable=self.show_all_modes_var, command=self._redraw_current).grid(row=row, column=0, sticky='w', pady=(2, 2))
         row += 1
         buttons = ttk.Frame(controls)
         buttons.grid(row=row, column=0, sticky='ew', pady=(14, 6))
@@ -403,7 +404,6 @@ class InteractiveMPPIViewer:
         warm_cfg.num_rollouts = 64
         if hasattr(warm_cfg, 'mode_select_rollouts_per_mode'):
             warm_cfg.mode_select_rollouts_per_mode = 8
-        warm_cfg.max_empirical_nominals_per_mode = min(warm_cfg.max_empirical_nominals_per_mode, 2)
         module.run_controller(variant, modes, base_obstacles, runtime_blocker, scene, seed=seed, trigger_progress=trigger_progress, blocker_active_from_start=blocker_from_start, max_steps=1, cfg=warm_cfg, record=False)
         self.numba_warm_cache.add(variant_value)
 
@@ -460,23 +460,33 @@ class InteractiveMPPIViewer:
         scenario = scenarios[scenario_id]
         fixed_centers = tuple((module.obstacle_center(obs).copy() for obs in scene.obstacles))
         blocker = module.make_wall_blockers_between_centers(centers=fixed_centers, pairs=scenario.wall_pairs, width=scenario.wall_width, extension=scenario.wall_extension)
+        prior_key = ('base', swarm_seed, layout_key)
+        if prior_key not in self.mode_cache:
+            self.mode_cache[prior_key] = module.build_homotopy_modes(
+                scene,
+                default_obstacles,
+                swarm_seed,
+            )
+        base_modes = self.mode_cache[prior_key]
+
         if condition == 'static_wall':
-            prior_obstacles = default_obstacles + blocker
-            base_obstacles = prior_obstacles
+            modes = [
+                mode
+                for mode in base_modes
+                if controller_core.geometric_mean_path_clearance(
+                    mode.mean_path, blocker
+                ) > 0.0
+            ]
+            base_obstacles = default_obstacles + blocker
             runtime_blocker: list[Any] = []
             blocker_from_start = True
             trigger_progress = None
-            prior_key = ('static', scenario_id, swarm_seed, layout_key)
         else:
-            prior_obstacles = default_obstacles
+            modes = list(base_modes)
             base_obstacles = default_obstacles
             runtime_blocker = [] if condition == 'no_wall' else blocker
             blocker_from_start = False
             trigger_progress = None if condition == 'no_wall' else scenario.trigger_progress
-            prior_key = ('base', swarm_seed, layout_key)
-        if prior_key not in self.mode_cache:
-            self.mode_cache[prior_key] = module.build_homotopy_modes(scene, prior_obstacles, swarm_seed)
-        modes = self.mode_cache[prior_key]
         try:
             variant = module.ControllerVariant(variant_value)
         except ValueError as exc:
@@ -696,8 +706,22 @@ class InteractiveMPPIViewer:
         if self.show_collision_var.get():
             self._draw_collision_representation(active_obstacles)
         selected_mode_index = self._selected_rollout_mode_index(frame)
+        if self.show_all_modes_var.get():
+            self._draw_all_prior_means(state)
         self._draw_prior(state, selected_mode_index)
         self.ax.plot(states[:frame + 1, 0], states[:frame + 1, 1], color='#1f77b4', linewidth=2.4, label='executed path', zorder=7)
+        nominal_ilqr = self._nominal_ilqr_output(frame)
+        # if nominal_ilqr is not None:
+        #     self.ax.plot(
+        #         nominal_ilqr[:, 0],
+        #         nominal_ilqr[:, 1],
+        #         color='#0066cc',
+        #         linewidth=2.0,
+        #         linestyle='-.',
+        #         alpha=0.95,
+        #         label='iLQR nominal',
+        #         zorder=7,
+        #     )
         output = self._optimal_output(frame)
         if output is not None:
             self.ax.plot(output[:, 0], output[:, 1], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output', zorder=8)
@@ -735,7 +759,7 @@ class InteractiveMPPIViewer:
         status = f'control: {control_text}\nselected rollout mode: {mode_text}\nwall: {wall_state}'
         if extra_text:
             status += '\n' + extra_text
-        legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='executed path'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='selected rollout prior')]
+        legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='executed path'), Line2D([0], [0], color='#0066cc', linewidth=2.0, linestyle='-.', label='iLQR nominal'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='selected rollout prior')]
         self.frame_label_var.set(f'Frame {frame} / {len(states) - 1}')
         self.canvas.draw_idle()
 
@@ -793,6 +817,52 @@ class InteractiveMPPIViewer:
             return None
         return output
 
+    def _nominal_ilqr_output(self, frame: int) -> Optional[np.ndarray]:
+        info = self._frame_info(frame)
+        if not info:
+            return None
+        output = info.get('nominal_ilqr_traj')
+        if output is None:
+            return None
+        output = np.asarray(output, dtype=float)
+        if output.ndim != 2 or output.shape[0] < 2 or output.shape[1] < 2:
+            return None
+        return output
+
+    def _draw_all_prior_means(self, state: np.ndarray) -> None:
+        """Draw every localized homotopy mean in gray for prior-selection debugging."""
+        assert self.bundle is not None
+        bundle = self.bundle
+        info = self._frame_info(self.frame_index) or {}
+        retained = {int(index) for index in info.get('retained_mode_indices', [])}
+
+        for mode_index, global_mode in enumerate(bundle.modes):
+            try:
+                local_mode = bundle.module.localize_mode_for_state(
+                    global_mode,
+                    state,
+                    bundle.cfg.horizon,
+                    step_distance=controller_core.prior_preview_step_distance(bundle.cfg),
+                )
+                mean = np.asarray(local_mode.mean_path, dtype=float)
+            except Exception:
+                if mode_index >= len(self._mode_mean_cache):
+                    continue
+                mean = np.asarray(self._mode_mean_cache[mode_index], dtype=float)
+
+            if mean.ndim != 2 or mean.shape[0] < 2 or mean.shape[1] < 2:
+                continue
+            is_retained = mode_index in retained
+            self.ax.plot(
+                mean[:, 0],
+                mean[:, 1],
+                color='0.45' if is_retained else '0.70',
+                linewidth=1.25 if is_retained else 0.9,
+                alpha=0.65 if is_retained else 0.45,
+                linestyle='-' if is_retained else '--',
+                zorder=4,
+            )
+
     def _draw_prior(self, state: np.ndarray, mode_index: Optional[int]) -> None:
         assert self.bundle is not None
         bundle = self.bundle
@@ -803,7 +873,12 @@ class InteractiveMPPIViewer:
         if not (0 <= mode_index < len(bundle.modes)):
             return
         global_mode = bundle.modes[mode_index]
-        local_mode = bundle.module.localize_mode_for_state(global_mode, state, bundle.cfg.horizon)
+        local_mode = bundle.module.localize_mode_for_state(
+            global_mode,
+            state,
+            bundle.cfg.horizon,
+            step_distance=controller_core.prior_preview_step_distance(bundle.cfg),
+        )
         mean = np.asarray(local_mode.mean_path, dtype=float)
         self.ax.plot(mean[:, 0], mean[:, 1], color='#9467bd', linewidth=2.2, alpha=0.9, zorder=6)
         gaussian_variants = {'gaussian_prior_mppi', 'sensitivity_projected_gaussian_prior_mppi', 'mode_selecting_gaussian_mppi'}
@@ -840,7 +915,12 @@ class InteractiveMPPIViewer:
             return
         indices = np.linspace(0, len(paths) - 1, min(10, len(paths)), dtype=int)
         for index in indices:
-            path = self.bundle.module.localize_path_for_state(paths[int(index)], state, self.bundle.cfg.horizon)
+            path = self.bundle.module.localize_path_for_state(
+                paths[int(index)],
+                state,
+                self.bundle.cfg.horizon,
+                step_distance=controller_core.prior_preview_step_distance(self.bundle.cfg),
+            )
             path = np.asarray(path, dtype=float)
             self.ax.plot(path[:, 0], path[:, 1], color='#9467bd', linewidth=0.8, alpha=0.18, zorder=2)
 
