@@ -294,13 +294,15 @@ def _unicycle_ilqr_initial_controls_nb(x0, ref, arc, horizon, dt, v_min, v_max, 
         s, qx, qy, tx, ty, heading, cursor = _project_path_forward_ilqr_nb(
             ref, arc, x[0], x[1], cursor
         )
-        _ = (s, heading)
+        _ = heading
+        remaining = max(0.0, arc[arc.shape[0] - 1] - s)
         lookahead = 0.55
         gx, gy = _path_intercept_point_nb(ref, cursor, qx, qy, lookahead)
         desired = math.atan2(gy - x[1], gx - x[0])
         err = _wrap_angle_nb(desired - x[2])
         alignment = max(0.0, math.cos(err))
-        v = v_max * (0.25 + 0.75 * alignment * alignment)
+        v_cap = min(v_max, 1.5 * remaining)
+        v = v_cap * (0.25 + 0.75 * alignment * alignment)
         v = min(max(v, lower_v), v_max)
         omega = 3.0 * err
         omega = min(max(omega, omega_min), omega_max)
@@ -314,7 +316,7 @@ def _unicycle_ilqr_initial_controls_nb(x0, ref, arc, horizon, dt, v_min, v_max, 
 def _unicycle_ilqr_total_cost_nb(
     X, U, ref, arc, cov_blocks, covariance_floor,
     mahalanobis_weight, heading_weight, progress_weight,
-    control_v_weight, control_omega_weight,
+    control_v_weight, control_omega_weight, terminal_position_weight, terminal_velocity_weight,
 ):
     progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_unicycle_rollout_ilqr_nb(
         X, ref, arc, cov_blocks, covariance_floor
@@ -330,6 +332,11 @@ def _unicycle_ilqr_total_cost_nb(
         eh = _wrap_angle_nb(X[t, 2] - heading[t])
         cost += mahalanobis_weight * mahal + heading_weight * eh * eh - progress_weight * progress[t]
         cost += control_v_weight * U[t, 0] * U[t, 0] + control_omega_weight * U[t, 1] * U[t, 1]
+    exT = X[H, 0] - ref[ref.shape[0] - 1, 0]
+    eyT = X[H, 1] - ref[ref.shape[0] - 1, 1]
+    cost += terminal_position_weight * (exT * exT + eyT * eyT)
+    if H > 0:
+        cost += terminal_velocity_weight * U[H - 1, 0] * U[H - 1, 0]
     return cost
 
 @njit(cache=True)
@@ -349,7 +356,7 @@ def _invert_regularized_2x2_ilqr_nb(a00, a01, a11, regularization):
 def _unicycle_ilqr_backward_nb(
     X, U, ref, arc, cov_blocks, covariance_floor, dt,
     mahalanobis_weight, heading_weight, progress_weight,
-    control_v_weight, control_omega_weight, regularization,
+    control_v_weight, control_omega_weight, terminal_position_weight, terminal_velocity_weight, regularization,
 ):
     H = U.shape[0]
     progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_unicycle_rollout_ilqr_nb(
@@ -360,6 +367,12 @@ def _unicycle_ilqr_backward_nb(
 
     Vx = np.zeros(3, dtype=np.float64)
     Vxx = np.zeros((3, 3), dtype=np.float64)
+    exT = X[H, 0] - ref[ref.shape[0] - 1, 0]
+    eyT = X[H, 1] - ref[ref.shape[0] - 1, 1]
+    Vx[0] = 2.0 * terminal_position_weight * exT
+    Vx[1] = 2.0 * terminal_position_weight * eyT
+    Vxx[0, 0] = 2.0 * terminal_position_weight
+    Vxx[1, 1] = 2.0 * terminal_position_weight
 
     for t in range(H - 1, -1, -1):
         theta = X[t, 2]
@@ -393,6 +406,9 @@ def _unicycle_ilqr_backward_nb(
         luu = np.zeros((2, 2), dtype=np.float64)
         luu[0, 0] = 2.0 * control_v_weight
         luu[1, 1] = 2.0 * control_omega_weight
+        if t == H - 1:
+            lu[0] += 2.0 * terminal_velocity_weight * U[t, 0]
+            luu[0, 0] += 2.0 * terminal_velocity_weight
 
         Qx = lx + A.T @ Vx
         Qu = lu + B.T @ Vx
@@ -446,7 +462,7 @@ def _unicycle_ilqr_nominal_and_positions_nb(
     x0, ref, cov_blocks, horizon, dt, v_min, v_max, omega_min, omega_max,
     iterations, line_search_steps,
     mahalanobis_weight, covariance_floor, heading_weight, progress_weight,
-    control_v_weight, control_omega_weight, regularization,
+    control_v_weight, control_omega_weight, terminal_position_weight, terminal_velocity_weight, regularization,
 ):
     Uzero = np.zeros((horizon, 2), dtype=np.float64)
     positions = np.zeros(horizon, dtype=np.float64)
@@ -461,14 +477,14 @@ def _unicycle_ilqr_nominal_and_positions_nb(
     best_cost = _unicycle_ilqr_total_cost_nb(
         X, U, ref, arc, cov_blocks, covariance_floor,
         mahalanobis_weight, heading_weight, progress_weight,
-        control_v_weight, control_omega_weight,
+        control_v_weight, control_omega_weight, terminal_position_weight, terminal_velocity_weight,
     )
 
     for _ in range(max(1, int(iterations))):
         kff, Kfb = _unicycle_ilqr_backward_nb(
             X, U, ref, arc, cov_blocks, covariance_floor, dt,
             mahalanobis_weight, heading_weight, progress_weight,
-            control_v_weight, control_omega_weight, regularization,
+            control_v_weight, control_omega_weight, terminal_position_weight, terminal_velocity_weight, regularization,
         )
         improved = False
         alpha = 1.0
@@ -479,7 +495,7 @@ def _unicycle_ilqr_nominal_and_positions_nb(
             trial_cost = _unicycle_ilqr_total_cost_nb(
                 Xtrial, Utrial, ref, arc, cov_blocks, covariance_floor,
                 mahalanobis_weight, heading_weight, progress_weight,
-                control_v_weight, control_omega_weight,
+                control_v_weight, control_omega_weight, terminal_position_weight, terminal_velocity_weight,
             )
             if math.isfinite(trial_cost) and trial_cost < best_cost - 1e-9:
                 U = Utrial
@@ -513,7 +529,8 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, 
             forward = math.cos(err)
             if forward < 0.0:
                 forward = 0.0
-            v = v_max * forward * forward
+            dist = math.sqrt(dx * dx + dy * dy)
+            v = min(v_max * forward * forward, 1.5 * dist)
             if v < v_min:
                 v = v_min
             omega = 3.0 * err
@@ -529,7 +546,7 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, 
         return U
 
 @njit(cache=True, parallel=True)
-def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_control, w_control_smooth):
+def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_control, w_control_smooth, w_terminal_position, w_terminal_velocity):
         N = U.shape[0]
         H = horizon
         M = circle_radii.shape[0]
@@ -561,6 +578,11 @@ def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horiz
                 dom = U[n, t + 1, 1] - U[n, t, 1]
                 smooth_cost += dv * dv + 0.2 * dom * dom
             cost += w_control_smooth * smooth_cost
+            gxT = X[n, H, 0] - goal[0]
+            gyT = X[n, H, 1] - goal[1]
+            cost += w_terminal_position * (gxT * gxT + gyT * gyT)
+            if H > 0:
+                cost += w_terminal_velocity * U[n, H - 1, 0] * U[n, H - 1, 0]
             costs[n] = cost
         return costs
 
@@ -819,7 +841,7 @@ def nominal_controls_and_arc_positions(
         float(cfg.prior_ilqr_mahalanobis_weight), float(cfg.prior_ilqr_covariance_floor),
         float(cfg.prior_ilqr_heading_weight), float(cfg.prior_ilqr_progress_weight),
         float(cfg.prior_ilqr_control_v_weight), float(cfg.prior_ilqr_control_omega_weight),
-        float(cfg.prior_ilqr_regularization),
+        float(cfg.w_terminal_position), float(cfg.w_terminal_velocity), float(cfg.prior_ilqr_regularization),
     )
 
 
@@ -849,6 +871,7 @@ def standard_mppi_costs_batch(X: Array, U: Array, obstacle_circles: List[Tuple[A
         np.asarray(X, dtype=np.float64), np.asarray(U, dtype=np.float64), centers, radii,
         np.asarray(goal, dtype=np.float64), int(cfg.horizon), float(cfg.robot_radius),
         float(cfg.w_goal), float(cfg.w_obstacle), float(cfg.w_control), float(cfg.w_control_smooth),
+        float(cfg.w_terminal_position), float(cfg.w_terminal_velocity),
     )
 
 def stable_representation_costs(X: Array, U: Array, obstacle_circles: List[Tuple[Array, float]], goal: Array, cfg: MPPIConfig) -> Array:
@@ -992,7 +1015,9 @@ def goal_reached(state: Array, goal: Array, cfg: MPPIConfig) -> bool:
 
 def advance_state(state: Array, control: Array, goal: Array, cfg: MPPIConfig) -> Tuple[Array, bool]:
     next_state = unicycle_step(state, control, cfg.dt)
-    return next_state, goal_reached(next_state, goal, cfg)
+    position_ok = goal_reached(next_state, goal, cfg)
+    speed_ok = abs(float(np.asarray(control, dtype=np.float64)[0])) <= float(cfg.terminal_velocity_tolerance)
+    return next_state, bool(position_ok and speed_ok)
 
 
 def minimum_clearance(states: Array, obstacles: Sequence, cfg: MPPIConfig) -> float:

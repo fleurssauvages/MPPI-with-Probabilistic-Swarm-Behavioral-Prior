@@ -64,16 +64,10 @@ class MPPIConfig(ctrl.ControllerConfig):
     prior_ilqr_control_steering_rate_weight: float = 0.01
     prior_ilqr_regularization: float = 0.05
 
-    vehicle_length: float = 0.81
-    vehicle_width: float = 0.36
+    vehicle_length: float = 0.80
+    vehicle_width: float = 0.35
     collision_substeps: int = 5
-    hard_collision_penalty: float = 800000.0
     rollout_goal_tolerance: float = 0.305
-    w_boundary: float = 500.0
-    boundary_xmin: float = 0.0
-    boundary_xmax: float = 10.0
-    boundary_ymin: float = 0.0
-    boundary_ymax: float = 10.0
 
     max_delta_accel: float = 1.2
     max_delta_steering_rate: float = 5.2
@@ -452,13 +446,14 @@ def _ackermann_ilqr_initial_controls_nb(
         s, qx, qy, tx, ty, heading, cursor = _project_path_forward_ilqr_nb(
             ref, arc, x[0], x[1], cursor
         )
-        _ = (s, tx, ty, heading)
+        _ = (tx, ty, heading)
+        remaining = max(0.0, arc[arc.shape[0] - 1] - s)
         lookahead = min(1.2, max(0.55, 0.55 + 0.22 * max(x[3], 0.0)))
         gx, gy = _path_intercept_point_nb(ref, cursor, qx, qy, lookahead)
         desired_heading = math.atan2(gy - x[1], gx - x[0])
         heading_error = _wrap_angle_nb(desired_heading - x[2])
         alignment = max(0.0, math.cos(heading_error))
-        desired_speed = v_max * (0.30 + 0.70 * alignment * alignment)
+        desired_speed = min(v_max * (0.30 + 0.70 * alignment * alignment), 1.5 * remaining)
         accel = 3.0 * (desired_speed - x[3])
         accel = min(max(accel, accel_min), accel_max)
         curvature = 2.0 * math.sin(heading_error) / max(lookahead, 1e-6)
@@ -486,7 +481,7 @@ def _ackermann_ilqr_initial_controls_nb(
 def _ackermann_ilqr_total_cost_nb(
     X, U, ref, arc, cov_blocks, covariance_floor,
     mahalanobis_weight, heading_weight, progress_weight,
-    control_accel_weight, control_steering_rate_weight,
+    control_accel_weight, control_steering_rate_weight, terminal_position_weight, terminal_velocity_weight,
 ):
     progress, qx, qy, tx, ty, heading, p00, p01, p11 = _project_ackermann_rollout_ilqr_nb(
         X, ref, arc, cov_blocks, covariance_floor
@@ -502,6 +497,10 @@ def _ackermann_ilqr_total_cost_nb(
         eh = _wrap_angle_nb(X[t, 2] - heading[t])
         cost += mahalanobis_weight * mahal + heading_weight * eh * eh - progress_weight * progress[t]
         cost += control_accel_weight * U[t, 0] * U[t, 0] + control_steering_rate_weight * U[t, 1] * U[t, 1]
+    exT = X[H, 0] - ref[ref.shape[0] - 1, 0]
+    eyT = X[H, 1] - ref[ref.shape[0] - 1, 1]
+    cost += terminal_position_weight * (exT * exT + eyT * eyT)
+    cost += terminal_velocity_weight * (X[H, 3] * X[H, 3] + X[H, 4] * X[H, 4])
     return cost
 
 @njit(cache=True)
@@ -616,7 +615,7 @@ def _ackermann_ilqr_linearize_nb(
 def _ackermann_ilqr_backward_nb(
     X, U, ref, arc, cov_blocks, covariance_floor,
     mahalanobis_weight, heading_weight, progress_weight,
-    control_accel_weight, control_steering_rate_weight, regularization,
+    control_accel_weight, control_steering_rate_weight, terminal_position_weight, terminal_velocity_weight, regularization,
     dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
     cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
     gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
@@ -633,6 +632,16 @@ def _ackermann_ilqr_backward_nb(
 
     Vx = np.zeros(7, dtype=np.float64)
     Vxx = np.zeros((7, 7), dtype=np.float64)
+    exT = X[H, 0] - ref[ref.shape[0] - 1, 0]
+    eyT = X[H, 1] - ref[ref.shape[0] - 1, 1]
+    Vx[0] = 2.0 * terminal_position_weight * exT
+    Vx[1] = 2.0 * terminal_position_weight * eyT
+    Vxx[0, 0] = 2.0 * terminal_position_weight
+    Vxx[1, 1] = 2.0 * terminal_position_weight
+    Vx[3] = 2.0 * terminal_velocity_weight * X[H, 3]
+    Vx[4] = 2.0 * terminal_velocity_weight * X[H, 4]
+    Vxx[3, 3] = 2.0 * terminal_velocity_weight
+    Vxx[4, 4] = 2.0 * terminal_velocity_weight
 
     for t in range(H - 1, -1, -1):
         A, B = _ackermann_ilqr_linearize_nb(
@@ -735,7 +744,7 @@ def _ackermann_ilqr_nominal_and_positions_nb(
     x0, ref, cov_blocks, horizon,
     iterations, line_search_steps,
     mahalanobis_weight, covariance_floor, heading_weight, progress_weight,
-    control_accel_weight, control_steering_rate_weight, regularization,
+    control_accel_weight, control_steering_rate_weight, terminal_position_weight, terminal_velocity_weight, regularization,
     dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
     cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
     gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
@@ -774,14 +783,14 @@ def _ackermann_ilqr_nominal_and_positions_nb(
     best_cost = _ackermann_ilqr_total_cost_nb(
         X, U, ref, arc, cov_blocks, covariance_floor,
         mahalanobis_weight, heading_weight, progress_weight,
-        control_accel_weight, control_steering_rate_weight,
+        control_accel_weight, control_steering_rate_weight, terminal_position_weight, terminal_velocity_weight,
     )
 
     for _ in range(max(1, int(iterations))):
         kff, Kfb = _ackermann_ilqr_backward_nb(
             X, U, ref, arc, cov_blocks, covariance_floor,
             mahalanobis_weight, heading_weight, progress_weight,
-            control_accel_weight, control_steering_rate_weight, regularization,
+            control_accel_weight, control_steering_rate_weight, terminal_position_weight, terminal_velocity_weight, regularization,
             dt, front_axle_distance, rear_axle_distance, mass, yaw_inertia,
             cornering_stiffness_front, cornering_stiffness_rear, tire_friction_coefficient,
             gravity, aerodynamic_drag_coefficient, rolling_resistance_force,
@@ -804,7 +813,7 @@ def _ackermann_ilqr_nominal_and_positions_nb(
             trial_cost = _ackermann_ilqr_total_cost_nb(
                 Xtrial, Utrial, ref, arc, cov_blocks, covariance_floor,
                 mahalanobis_weight, heading_weight, progress_weight,
-                control_accel_weight, control_steering_rate_weight,
+                control_accel_weight, control_steering_rate_weight, terminal_position_weight, terminal_velocity_weight,
             )
             if math.isfinite(trial_cost) and trial_cost < best_cost - 1e-9:
                 U = Utrial
@@ -838,7 +847,7 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, front_axle_distance, rear
             desired_heading = math.atan2(dy, dx)
             heading_error = _wrap_angle_nb(desired_heading - x[2])
             heading_scale = max(0.0, math.cos(heading_error)) ** 2
-            desired_speed = v_max * heading_scale
+            desired_speed = min(v_max * heading_scale, 1.5 * dist)
             accel = min(max(3.0 * (desired_speed - x[3]), accel_min), accel_max)
             lookahead = max(dist, 0.35)
             curvature = 2.0 * math.sin(heading_error) / lookahead
@@ -973,7 +982,7 @@ def apply_smooth_safe_control_nb(x_current, u, previous_control, has_previous_co
         return cmd
 
 @njit(cache=True, parallel=True)
-def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, vehicle_length, vehicle_width, w_goal, w_obstacle, w_control, w_control_smooth):
+def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, vehicle_length, vehicle_width, w_goal, w_obstacle, w_control, w_control_smooth, w_terminal_position, w_terminal_velocity):
         N = U.shape[0]
         H = horizon
         M = circle_radii.shape[0]
@@ -1003,45 +1012,12 @@ def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horiz
                 du1 = U[n, t + 1, 1] - U[n, t, 1]
                 smooth_cost += du0 * du0 + 0.2 * du1 * du1
             cost += w_control_smooth * smooth_cost
+            gxT = X[n, H, 0] - goal[0]
+            gyT = X[n, H, 1] - goal[1]
+            cost += w_terminal_position * (gxT * gxT + gyT * gyT)
+            cost += w_terminal_velocity * (X[n, H, 3] * X[n, H, 3] + X[n, H, 4] * X[n, H, 4])
             costs[n] = cost
         return costs
-
-@njit(cache=True, parallel=True)
-def boundary_penalty_nb(X, xmin, xmax, ymin, ymax, vehicle_length, vehicle_width, w_boundary, collision_substeps, hard_collision_clearance, hard_collision_penalty):
-        N = X.shape[0]
-        H = X.shape[1] - 1
-        extras = np.zeros(N, dtype=np.float64)
-        substeps = max(0, int(collision_substeps))
-        denominator = float(substeps + 1)
-        half_length = 0.5 * vehicle_length
-        half_width = 0.5 * vehicle_width
-        for n in prange(N):
-            cost = 0.0
-            for t in range(H):
-                x0 = X[n, t, 0]
-                y0 = X[n, t, 1]
-                h0 = X[n, t, 2]
-                x1 = X[n, t + 1, 0]
-                y1 = X[n, t + 1, 1]
-                dh = _wrap_angle_nb(X[n, t + 1, 2] - h0)
-                for q in range(1, substeps + 2):
-                    alpha = q / denominator
-                    px = x0 + alpha * (x1 - x0)
-                    py = y0 + alpha * (y1 - y0)
-                    heading = _wrap_angle_nb(h0 + alpha * dh)
-                    c = abs(math.cos(heading))
-                    s = abs(math.sin(heading))
-                    extent_x = half_length * c + half_width * s
-                    extent_y = half_length * s + half_width * c
-                    clearance = min(px - xmin - extent_x, xmax - px - extent_x, py - ymin - extent_y, ymax - py - extent_y)
-                    if q <= substeps:
-                        sp = _softplus_scalar_nb(8.0 * (0.0 - clearance))
-                        cost += w_boundary / denominator * sp * sp
-                    if clearance < hard_collision_clearance:
-                        penetration = hard_collision_clearance - clearance
-                        cost += hard_collision_penalty * (1.0 + penetration * penetration)
-            extras[n] = cost
-        return extras
 
 @njit(cache=True)
 def point_in_poly_nb(px, py, poly, n):
@@ -1376,8 +1352,10 @@ def ackermann_step(x: Array, u: Array, cfg: MPPIConfig) -> Array:
     return np.asarray(values, dtype=np.float64)
 
 def goal_pose_satisfied(state: Array, goal: Array, goal_tolerance: float, cfg: MPPIConfig) -> bool:
-    _ = cfg
-    return bool(np.linalg.norm(np.asarray(state[:2]) - np.asarray(goal)) <= goal_tolerance)
+    state = np.asarray(state, dtype=np.float64)
+    position_ok = np.linalg.norm(state[:2] - np.asarray(goal, dtype=np.float64)) <= goal_tolerance
+    speed_ok = math.hypot(float(state[3]), float(state[4])) <= float(cfg.terminal_velocity_tolerance)
+    return bool(position_ok and speed_ok)
 
 def _dynamic_model_arguments(cfg: MPPIConfig) -> Tuple[float, ...]:
     return (float(cfg.dt), float(cfg.front_axle_distance), float(cfg.rear_axle_distance), float(cfg.mass), float(cfg.yaw_inertia), float(cfg.cornering_stiffness_front), float(cfg.cornering_stiffness_rear), float(cfg.tire_friction_coefficient), float(cfg.gravity), float(cfg.aerodynamic_drag_coefficient), float(cfg.rolling_resistance_force), float(cfg.minimum_tire_speed), int(cfg.dynamics_substeps), float(cfg.v_min), float(cfg.v_max), float(cfg.lateral_velocity_limit), float(cfg.yaw_rate_limit), float(cfg.accel_min), float(cfg.accel_max), float(cfg.steering_min), float(cfg.steering_max), float(cfg.steering_rate_min), float(cfg.steering_rate_max))
@@ -1460,6 +1438,7 @@ def nominal_controls_and_arc_positions(
         float(cfg.prior_ilqr_mahalanobis_weight), float(cfg.prior_ilqr_covariance_floor),
         float(cfg.prior_ilqr_heading_weight), float(cfg.prior_ilqr_progress_weight),
         float(cfg.prior_ilqr_control_accel_weight), float(cfg.prior_ilqr_control_steering_rate_weight),
+        float(cfg.w_terminal_position), float(cfg.w_terminal_velocity),
         float(cfg.prior_ilqr_regularization), *_dynamic_model_arguments(cfg),
     )
 
@@ -1484,19 +1463,6 @@ def nominal_controls_to_goal(x0: Array, goal: Array, cfg: MPPIConfig) -> Array:
         *_dynamic_model_arguments(cfg)
     )
 
-def boundary_penalty(X: Array, cfg: MPPIConfig) -> Array:
-    states = np.asarray(X, dtype=np.float64)
-    if states.shape[0] == 0:
-        return np.zeros(0, dtype=np.float64)
-    return boundary_penalty_nb(
-        states,
-        float(cfg.boundary_xmin), float(cfg.boundary_xmax),
-        float(cfg.boundary_ymin), float(cfg.boundary_ymax),
-        float(cfg.vehicle_length), float(cfg.vehicle_width), float(cfg.w_boundary),
-        int(cfg.collision_substeps), float(cfg.hard_collision_clearance),
-        float(cfg.hard_collision_penalty),
-    )
-
 def standard_mppi_costs_batch(X: Array, U: Array, obstacle_circles: List[Tuple[Array, float]], goal: Array, cfg: MPPIConfig) -> Array:
     centers, radii = obstacle_circles_to_arrays(obstacle_circles)
     costs = standard_mppi_costs_batch_nb(
@@ -1504,8 +1470,9 @@ def standard_mppi_costs_batch(X: Array, U: Array, obstacle_circles: List[Tuple[A
         np.asarray(goal, dtype=np.float64), int(cfg.horizon),
         float(cfg.vehicle_length), float(cfg.vehicle_width), float(cfg.w_goal),
         float(cfg.w_obstacle), float(cfg.w_control), float(cfg.w_control_smooth),
+        float(cfg.w_terminal_position), float(cfg.w_terminal_velocity),
     )
-    return costs + boundary_penalty(X, cfg)
+    return costs
 
 def stable_representation_costs(X: Array, U: Array, obstacle_circles: List[Tuple[Array, float]], goal: Array, cfg: MPPIConfig) -> Array:
     return standard_mppi_costs_batch(X, U, obstacle_circles, goal, cfg)
@@ -1627,6 +1594,7 @@ def minimum_clearance(states: Array, obstacles: Sequence, cfg: MPPIConfig) -> fl
 
 
 SUPPORTED_VARIANTS = {
+    ControllerVariant.PLANNER_ILQR,
     ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI,
     ControllerVariant.GAUSSIAN_PRIOR_MPPI,
     ControllerVariant.CORRIDOR_PRIOR_MPPI,

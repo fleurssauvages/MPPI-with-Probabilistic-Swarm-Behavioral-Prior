@@ -7,7 +7,7 @@ import traceback
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 import numpy as np
-from system import ackermann, controller as controller_core, unicycle
+from system import ackermann, car_trailer, controller as controller_core, planar_quadrotor, unicycle
 try:
     import tkinter as tk
     from tkinter import messagebox, ttk
@@ -18,8 +18,16 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import Circle, Ellipse, Polygon
-UNICYCLE_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi'), ('Mode-selecting Gaussian', 'mode_selecting_gaussian_mppi'), ('Mode-selecting corridor', 'mode_selecting_corridor_mppi')]
-ACKERMAN_VARIANTS = [('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+UNICYCLE_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi'), ('Mode-selecting Gaussian', 'mode_selecting_gaussian_mppi'), ('Mode-selecting corridor', 'mode_selecting_corridor_mppi')]
+ACKERMAN_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+CAR_TRAILER_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+PLANAR_QUADROTOR_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+MODEL_OPTIONS = {
+    'Ackermann': ('ackerman', ackermann, ACKERMAN_VARIANTS),
+    'Unicycle': ('unicycle', unicycle, UNICYCLE_VARIANTS),
+    'Car + trailers': ('car_trailer', car_trailer, CAR_TRAILER_VARIANTS),
+    'Planar quadrotor': ('planar_quadrotor', planar_quadrotor, PLANAR_QUADROTOR_VARIANTS),
+}
 VARIANTS = list(ACKERMAN_VARIANTS)
 CONDITIONS = [('No wall', 'no_wall'), ('Static wall', 'static_wall'), ('Dynamic wall', 'dynamic_wall')]
 SCENARIOS = [('Wall 0-1', 'wall_0_1'), ('Wall 1-2', 'wall_1_2'), ('Walls 0-1 and 1-2', 'walls_0_1__1_2')]
@@ -88,7 +96,7 @@ class InteractiveMPPIViewer:
         self.root.title('Interactive MPPI viewer - Ackermann')
         self.root.minsize(1080, 700)
         self._maximize_window()
-        self.modules = {'ackerman': ackermann, 'unicycle': unicycle}
+        self.modules = {key: module for key, module, _ in MODEL_OPTIONS.values()}
         self.model_key = 'ackerman'
         self.module = self.modules[self.model_key]
         self.mode_cache: dict[tuple[Any, ...], list[Any]] = {}
@@ -107,6 +115,7 @@ class InteractiveMPPIViewer:
         self._obstacle_cache: dict[int, list[Any]] = {}
         self._circle_cache: dict[tuple[int, ...], list[tuple[np.ndarray, float]]] = {}
         self._mode_mean_cache: list[np.ndarray] = []
+        self._saved_trajectories: list[dict[str, Any]] = []
         self._edit_scene: Any = None
         self._editable_obstacle_vertices: list[np.ndarray] = []
         self._drag_obstacle_index: Optional[int] = None
@@ -147,7 +156,7 @@ class InteractiveMPPIViewer:
         ttk.Label(controls, text='Experiment', font=('TkDefaultFont', 12, 'bold')).grid(row=0, column=0, sticky='w', pady=(0, 10))
         self.model_var = tk.StringVar(value='Ackermann')
         self.variant_var = tk.StringVar(value='SPG prior')
-        self.condition_var = tk.StringVar(value='Dynamic wall')
+        self.condition_var = tk.StringVar(value='No wall')
         self.scenario_var = tk.StringVar(value='Walls 0-1 and 1-2')
         self.seed_var = tk.StringVar(value='1')
         self.swarm_seed_var = tk.StringVar(value='5')
@@ -158,7 +167,7 @@ class InteractiveMPPIViewer:
         self.status_var = tk.StringVar(value='Ready')
         self.frame_label_var = tk.StringVar(value='Frame 0 / 0')
         row = 1
-        row = self._add_combo(controls, row, 'Vehicle model', self.model_var, ['Unicycle', 'Ackermann'])
+        row = self._add_combo(controls, row, 'Vehicle model', self.model_var, list(MODEL_OPTIONS.keys()))
         self.model_var._combo_widget.bind('<<ComboboxSelected>>', self._on_model_changed)
         row = self._add_combo(controls, row, 'Controller variant', self.variant_var, [label for label, _ in VARIANTS])
         row = self._add_combo(controls, row, 'Condition', self.condition_var, [label for label, _ in CONDITIONS])
@@ -180,10 +189,14 @@ class InteractiveMPPIViewer:
         self.play_button.grid(row=1, column=0, sticky='ew', padx=(0, 3))
         self.restart_button = ttk.Button(buttons, text='Restart', command=self.restart_animation, state='disabled')
         self.restart_button.grid(row=1, column=1, sticky='ew', padx=(3, 0))
+        self.save_trajectory_button = ttk.Button(buttons, text='Save trajectory', command=self.save_trajectory, state='disabled')
+        self.save_trajectory_button.grid(row=2, column=0, sticky='ew', padx=(0, 3), pady=(6, 0))
+        self.reset_trajectories_button = ttk.Button(buttons, text='Reset trajectories', command=self.reset_trajectories)
+        self.reset_trajectories_button.grid(row=2, column=1, sticky='ew', padx=(3, 0), pady=(6, 0))
         self.edit_obstacles_button = ttk.Button(buttons, text='Edit obstacles', command=self.edit_obstacles)
-        self.edit_obstacles_button.grid(row=2, column=0, sticky='ew', padx=(0, 3), pady=(6, 0))
+        self.edit_obstacles_button.grid(row=3, column=0, sticky='ew', padx=(0, 3), pady=(6, 0))
         self.reset_obstacles_button = ttk.Button(buttons, text='Reset obstacles', command=self.reset_obstacles)
-        self.reset_obstacles_button.grid(row=2, column=1, sticky='ew', padx=(3, 0), pady=(6, 0))
+        self.reset_obstacles_button.grid(row=3, column=1, sticky='ew', padx=(3, 0), pady=(6, 0))
         row += 1
         ttk.Separator(controls).grid(row=row, column=0, sticky='ew', pady=10)
         row += 1
@@ -238,16 +251,20 @@ class InteractiveMPPIViewer:
         return row + 2
 
     def _on_model_changed(self, _event: Any=None) -> None:
-        requested = 'ackerman' if self.model_var.get() == 'Ackermann' else 'unicycle'
+        selected_label = self.model_var.get()
+        if selected_label not in MODEL_OPTIONS:
+            return
+        requested, requested_module, requested_variants = MODEL_OPTIONS[selected_label]
         if requested == self.model_key:
             return
         if self.worker is not None and self.worker.is_alive():
-            self.model_var.set('Ackermann' if self.model_key == 'ackerman' else 'Unicycle')
+            current_label = next(label for label, (key, _, _) in MODEL_OPTIONS.items() if key == self.model_key)
+            self.model_var.set(current_label)
             messagebox.showinfo('Simulation running', 'Wait for the current simulation before changing the model.')
             return
         self._stop_animation()
         self.model_key = requested
-        self.module = self.modules[requested]
+        self.module = requested_module
         self._reset_editable_obstacles(redraw=False)
         self.bundle = None
         self.frame_index = 0
@@ -259,7 +276,7 @@ class InteractiveMPPIViewer:
         self._circle_cache.clear()
         self._mode_mean_cache.clear()
         global VARIANTS, DISPLAY_TO_VARIANT, VARIANT_TO_DISPLAY
-        VARIANTS = list(ACKERMAN_VARIANTS if requested == 'ackerman' else UNICYCLE_VARIANTS)
+        VARIANTS = list(requested_variants)
         DISPLAY_TO_VARIANT = dict(VARIANTS)
         VARIANT_TO_DISPLAY = {value: label for label, value in VARIANTS}
         labels = [label for label, _ in VARIANTS]
@@ -270,6 +287,7 @@ class InteractiveMPPIViewer:
             self.variant_var.set('Gaussian prior')
         self.play_button.configure(state='disabled', text='Play')
         self.restart_button.configure(state='disabled')
+        self.save_trajectory_button.configure(state='disabled')
         self.frame_scale.configure(from_=0, to=0, state='disabled')
         self.frame_label_var.set('Frame 0 / 0')
         self.status_var.set(f'Loaded {self.model_var.get()} model')
@@ -327,6 +345,7 @@ class InteractiveMPPIViewer:
         self._mode_mean_cache.clear()
         self.play_button.configure(state='disabled', text='Play')
         self.restart_button.configure(state='disabled')
+        self.save_trajectory_button.configure(state='disabled')
         self.frame_scale.configure(from_=0, to=0, state='disabled')
         self.frame_label_var.set('Frame 0 / 0')
         self.status_var.set('Obstacle editing enabled. Drag a polygon and press Run selected case.')
@@ -428,6 +447,7 @@ class InteractiveMPPIViewer:
         self.run_button.configure(state='disabled')
         self.play_button.configure(state='disabled')
         self.restart_button.configure(state='disabled')
+        self.save_trajectory_button.configure(state='disabled')
         self.edit_obstacles_button.configure(state='disabled')
         self.reset_obstacles_button.configure(state='disabled')
         self.frame_scale.configure(state='disabled')
@@ -529,6 +549,7 @@ class InteractiveMPPIViewer:
         self.run_button.configure(state='normal')
         self.play_button.configure(state='normal')
         self.restart_button.configure(state='normal')
+        self.save_trajectory_button.configure(state='normal')
         self.edit_obstacles_button.configure(state='normal')
         self.reset_obstacles_button.configure(state='normal')
         summary = self._trial_summary(bundle)
@@ -542,6 +563,7 @@ class InteractiveMPPIViewer:
         if self.closing:
             return
         self.run_button.configure(state='normal')
+        self.save_trajectory_button.configure(state='normal' if self.bundle is not None else 'disabled')
         self.edit_obstacles_button.configure(state='normal')
         self.reset_obstacles_button.configure(state='normal')
         self.status_var.set('Simulation failed. See the error dialog.')
@@ -585,6 +607,50 @@ class InteractiveMPPIViewer:
         self.playing = True
         self.play_button.configure(text='Pause')
         self._schedule_tick()
+
+    def save_trajectory(self) -> None:
+        """Keep the current executed trajectory as a persistent comparison overlay."""
+        if self.bundle is None or self._states.ndim != 2 or len(self._states) < 2:
+            messagebox.showinfo('No trajectory', 'Run a case before saving its trajectory.')
+            return
+        trajectory = np.asarray(self._states[:, :2], dtype=float).copy()
+        label = VARIANT_TO_DISPLAY.get(self.bundle.variant_value, self.bundle.variant_value)
+        scenario = self.bundle.condition.replace('_', ' ')
+        self._saved_trajectories.append({
+            'xy': trajectory,
+            'label': f'{label} | {scenario}',
+            'model_key': self.model_key,
+        })
+        self.status_var.set(f'Saved trajectory #{len(self._saved_trajectories)} for comparison.')
+        self._redraw_current()
+
+    def reset_trajectories(self) -> None:
+        """Erase every saved comparison trajectory."""
+        count = len(self._saved_trajectories)
+        self._saved_trajectories.clear()
+        self.status_var.set(f'Cleared {count} saved trajector' + ('y.' if count == 1 else 'ies.'))
+        if self.bundle is not None:
+            self._draw_frame(self.frame_index)
+        else:
+            self._draw_empty()
+
+    def _draw_saved_trajectories(self) -> None:
+        """Draw saved trajectories below the active executed path."""
+        if not self._saved_trajectories:
+            return
+        fallback_colors = ('#d62728', '#2ca02c', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf')
+        for index, item in enumerate(self._saved_trajectories):
+            if item.get('model_key') != self.model_key:
+                continue
+            xy = np.asarray(item.get('xy'), dtype=float)
+            if xy.ndim != 2 or xy.shape[0] < 2 or xy.shape[1] < 2:
+                continue
+            color = fallback_colors[index % len(fallback_colors)]
+            self.ax.plot(
+                xy[:, 0], xy[:, 1],
+                color=color, linewidth=2.0, linestyle='-', alpha=0.78,
+                label=f"saved {index + 1}: {item.get('label', 'trajectory')}", zorder=5,
+            )
 
     def _stop_animation(self) -> None:
         self.playing = False
@@ -709,21 +775,22 @@ class InteractiveMPPIViewer:
         if self.show_all_modes_var.get():
             self._draw_all_prior_means(state)
         self._draw_prior(state, selected_mode_index)
+        self._draw_saved_trajectories()
         self.ax.plot(states[:frame + 1, 0], states[:frame + 1, 1], color='#1f77b4', linewidth=2.4, label='executed path', zorder=7)
         nominal_ilqr = self._nominal_ilqr_output(frame)
-        # if nominal_ilqr is not None:
-        #     self.ax.plot(
-        #         nominal_ilqr[:, 0],
-        #         nominal_ilqr[:, 1],
-        #         color='#0066cc',
-        #         linewidth=2.0,
-        #         linestyle='-.',
-        #         alpha=0.95,
-        #         label='iLQR nominal',
-        #         zorder=7,
-        #     )
+        if nominal_ilqr is not None:
+            self.ax.plot(
+                nominal_ilqr[:, 0],
+                nominal_ilqr[:, 1],
+                color='#0066cc',
+                linewidth=2.0,
+                linestyle='-.',
+                alpha=0.95,
+                label='iLQR nominal',
+                zorder=7,
+            )
         output = self._optimal_output(frame)
-        if output is not None:
+        if output is not None and bundle.variant_value != 'planner_ilqr':
             self.ax.plot(output[:, 0], output[:, 1], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output', zorder=8)
         self.ax.scatter([bundle.start[0]], [bundle.start[1]], s=65, marker='o', color='#2ca02c', zorder=9)
         self.ax.scatter([bundle.goal[0]], [bundle.goal[1]], s=140, marker='*', color='#d62728', zorder=9)
@@ -739,6 +806,10 @@ class InteractiveMPPIViewer:
         if frame < len(controls):
             if self.model_key == 'ackerman':
                 control_text = f'a={controls[frame, 0]:.2f}, delta_dot={controls[frame, 1]:.2f}'
+            elif self.model_key == 'car_trailer':
+                control_text = f'v={controls[frame, 0]:.2f}, delta_dot={controls[frame, 1]:.2f}'
+            elif self.model_key == 'planar_quadrotor':
+                control_text = f'f={controls[frame, 0]:.2f}, tau={controls[frame, 1]:.2f}'
             else:
                 control_text = f'v={controls[frame, 0]:.2f}, omega={controls[frame, 1]:.2f}'
         mode_text = 'none'
@@ -760,6 +831,12 @@ class InteractiveMPPIViewer:
         if extra_text:
             status += '\n' + extra_text
         legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='executed path'), Line2D([0], [0], color='#0066cc', linewidth=2.0, linestyle='-.', label='iLQR nominal'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='selected rollout prior')]
+        saved_handles = []
+        fallback_colors = ('#d62728', '#2ca02c', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf')
+        for index, item in enumerate(self._saved_trajectories):
+            if item.get('model_key') == self.model_key:
+                saved_handles.append(Line2D([0], [0], color=fallback_colors[index % len(fallback_colors)], linewidth=2.0, label=f"saved {index + 1}: {item.get('label', 'trajectory')}"))
+        self.ax.legend(handles=legend_handles + saved_handles, loc='best', fontsize=8)
         self.frame_label_var.set(f'Frame {frame} / {len(states) - 1}')
         self.canvas.draw_idle()
 
@@ -805,6 +882,16 @@ class InteractiveMPPIViewer:
             return None
         return infos[min(frame, len(infos) - 1)]
 
+    def _trim_output_at_goal_tolerance(self, output: np.ndarray) -> np.ndarray:
+        """Stop a displayed prediction at its first point inside goal_tolerance."""
+        assert self.bundle is not None
+        trajectory = np.asarray(output, dtype=float)
+        distances = np.linalg.norm(trajectory[:, :2] - self.bundle.goal[None, :2], axis=1)
+        inside = np.flatnonzero(distances <= float(self.bundle.cfg.goal_tolerance))
+        if inside.size:
+            return trajectory[: int(inside[0]) + 1]
+        return trajectory
+
     def _optimal_output(self, frame: int) -> Optional[np.ndarray]:
         info = self._frame_info(frame)
         if not info:
@@ -815,7 +902,7 @@ class InteractiveMPPIViewer:
         output = np.asarray(output, dtype=float)
         if output.ndim != 2 or output.shape[0] < 2 or output.shape[1] < 2:
             return None
-        return output
+        return self._trim_output_at_goal_tolerance(output)
 
     def _nominal_ilqr_output(self, frame: int) -> Optional[np.ndarray]:
         info = self._frame_info(frame)
@@ -827,7 +914,7 @@ class InteractiveMPPIViewer:
         output = np.asarray(output, dtype=float)
         if output.ndim != 2 or output.shape[0] < 2 or output.shape[1] < 2:
             return None
-        return output
+        return self._trim_output_at_goal_tolerance(output)
 
     def _draw_all_prior_means(self, state: np.ndarray) -> None:
         """Draw every localized homotopy mean in gray for prior-selection debugging."""
@@ -939,6 +1026,45 @@ class InteractiveMPPIViewer:
             self.ax.add_patch(Circle((x, y), radius=radius, facecolor='#17becf', edgecolor='black', linewidth=1.0, zorder=12))
             arrow_length = max(0.38, 1.8 * radius)
             self.ax.arrow(x, y, arrow_length * math.cos(heading), arrow_length * math.sin(heading), width=0.025, head_width=0.13, head_length=0.14, length_includes_head=True, color='black', zorder=13)
+            return
+        if self.model_key == 'car_trailer':
+            cfg = self.bundle.cfg
+            num_trailers = int(cfg.num_trailers)
+            expected = 4 + num_trailers
+            if state.size < expected:
+                raise ValueError(f'Car-trailer state must contain {expected} values for {num_trailers} trailers.')
+            x = float(state[0])
+            y = float(state[1])
+            heading = float(state[2])
+            trailer_headings = np.asarray(state[3:3 + num_trailers], dtype=float)
+            wheelbase = float(cfg.car_wheelbase)
+            trailer_length = float(cfg.trailer_length)
+            trailer_link_length = float(cfg.trailer_spacing)
+            body_width = max(2.0 * float(cfg.robot_radius), 0.36)
+            car_body = np.array([[-0.35 * wheelbase, -0.5 * body_width], [0.75 * wheelbase, -0.5 * body_width], [0.75 * wheelbase, 0.5 * body_width], [-0.35 * wheelbase, 0.5 * body_width]])
+            self.ax.add_patch(Polygon(self._transform_vehicle_points(car_body, (x, y), heading), closed=True, facecolor='#17becf', edgecolor='black', linewidth=1.1, alpha=0.92, zorder=12 + num_trailers))
+
+            trailer_body = np.array([[-0.45 * trailer_length, -0.48 * body_width], [0.45 * trailer_length, -0.48 * body_width], [0.45 * trailer_length, 0.48 * body_width], [-0.45 * trailer_length, 0.48 * body_width]])
+            previous = np.asarray([x, y], dtype=float)
+            fills = ('#9edae5', '#c7e9ef')
+            for i, trailer_heading in enumerate(trailer_headings):
+                center = previous - trailer_link_length * np.asarray([math.cos(float(trailer_heading)), math.sin(float(trailer_heading))])
+                self.ax.plot([previous[0], center[0]], [previous[1], center[1]], color='black', linewidth=1.2, zorder=12 + num_trailers - i)
+                self.ax.add_patch(Polygon(self._transform_vehicle_points(trailer_body, tuple(center), float(trailer_heading)), closed=True, facecolor=fills[i % len(fills)], edgecolor='black', linewidth=1.0, alpha=0.92, zorder=11 + num_trailers - i))
+                previous = center
+            return
+        if self.model_key == 'planar_quadrotor':
+            if state.size < 6:
+                raise ValueError('Planar quadrotor state must contain [x, y, vx, vy, theta, omega].')
+            x, y, _, _, theta, _ = map(float, state[:6])
+            arm = 0.30
+            endpoints = self._transform_vehicle_points(np.asarray([[-arm, 0.0], [arm, 0.0]]), (x, y), theta)
+            self.ax.plot(endpoints[:, 0], endpoints[:, 1], color='black', linewidth=2.0, zorder=13)
+            self.ax.add_patch(Circle((x, y), radius=0.08, facecolor='#17becf', edgecolor='black', linewidth=1.0, zorder=14))
+            for point in endpoints:
+                self.ax.add_patch(Circle((float(point[0]), float(point[1])), radius=0.07, fill=False, edgecolor='black', linewidth=1.2, zorder=14))
+            thrust_dir = self._transform_vehicle_points(np.asarray([[0.0, 0.0], [0.0, 0.34]]), (x, y), theta)
+            self.ax.plot(thrust_dir[:, 0], thrust_dir[:, 1], color='#17becf', linewidth=1.4, zorder=13)
             return
         if state.size < 7:
             raise ValueError('Ackermann state must contain [x, y, psi, vx, vy, r, delta].')
