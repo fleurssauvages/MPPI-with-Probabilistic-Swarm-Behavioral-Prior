@@ -7,7 +7,7 @@ import traceback
 from dataclasses import dataclass, replace
 from typing import Any, Optional
 import numpy as np
-from system import ackermann, car_trailer, controller as controller_core, planar_quadrotor, unicycle
+from system import ackermann, controller as controller_core, planar_quadrotor, planar_quadrotor_payload, unicycle
 try:
     import tkinter as tk
     from tkinter import messagebox, ttk
@@ -20,13 +20,13 @@ from matplotlib.path import Path as MplPath
 from matplotlib.patches import Circle, Ellipse, Polygon
 UNICYCLE_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi'), ('Mode-selecting Gaussian', 'mode_selecting_gaussian_mppi'), ('Mode-selecting corridor', 'mode_selecting_corridor_mppi')]
 ACKERMAN_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
-CAR_TRAILER_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 PLANAR_QUADROTOR_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+PLANAR_QUADROTOR_PAYLOAD_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 MODEL_OPTIONS = {
     'Ackermann': ('ackerman', ackermann, ACKERMAN_VARIANTS),
     'Unicycle': ('unicycle', unicycle, UNICYCLE_VARIANTS),
-    'Car + trailers': ('car_trailer', car_trailer, CAR_TRAILER_VARIANTS),
     'Planar quadrotor': ('planar_quadrotor', planar_quadrotor, PLANAR_QUADROTOR_VARIANTS),
+    'Planar quadrotor + hanging package': ('planar_quadrotor_payload', planar_quadrotor_payload, PLANAR_QUADROTOR_PAYLOAD_VARIANTS),
 }
 VARIANTS = list(ACKERMAN_VARIANTS)
 CONDITIONS = [('No wall', 'no_wall'), ('Static wall', 'static_wall'), ('Dynamic wall', 'dynamic_wall')]
@@ -557,29 +557,33 @@ class InteractiveMPPIViewer:
         scenario = scenarios[scenario_id]
         fixed_centers = tuple((module.obstacle_center(obs).copy() for obs in scene.obstacles))
         blocker = module.make_wall_blockers_between_centers(centers=fixed_centers, pairs=scenario.wall_pairs, width=scenario.wall_width, extension=scenario.wall_extension)
-        prior_key = ('base', swarm_seed, layout_key, state_layout_key(scene.start), state_layout_key(scene.goal))
-        if prior_key not in self.mode_cache:
-            self.mode_cache[prior_key] = module.build_homotopy_modes(
-                scene,
-                default_obstacles,
-                swarm_seed,
-            )
-        base_modes = self.mode_cache[prior_key]
+        base_prior_key = ('base', swarm_seed, layout_key, state_layout_key(scene.start), state_layout_key(scene.goal))
 
         if condition == 'static_wall':
-            modes = [
-                mode
-                for mode in base_modes
-                if controller_core.geometric_mean_path_clearance(
-                    mode.mean_path, blocker
-                ) > 0.0
-            ]
-            base_obstacles = default_obstacles + blocker
+            # A static wall is known before planning, so include it in both the graph
+            # and swarm planner instead of generating a base prior and filtering it later.
+            planner_obstacles = default_obstacles + blocker
+            prior_key = (
+                'static_wall', scenario_id, swarm_seed, layout_key,
+                state_layout_key(scene.start), state_layout_key(scene.goal),
+            )
+            if prior_key not in self.mode_cache:
+                self.mode_cache[prior_key] = module.build_homotopy_modes(
+                    scene, planner_obstacles, swarm_seed
+                )
+            modes = list(self.mode_cache[prior_key])
+            base_obstacles = planner_obstacles
             runtime_blocker: list[Any] = []
             blocker_from_start = True
             trigger_progress = None
         else:
-            modes = list(base_modes)
+            # Dynamic walls are intentionally absent from the original prior so that
+            # the controller must react after activation.  No-wall reuses the same prior.
+            if base_prior_key not in self.mode_cache:
+                self.mode_cache[base_prior_key] = module.build_homotopy_modes(
+                    scene, default_obstacles, swarm_seed
+                )
+            modes = list(self.mode_cache[base_prior_key])
             base_obstacles = default_obstacles
             runtime_blocker = [] if condition == 'no_wall' else blocker
             blocker_from_start = False
@@ -853,7 +857,7 @@ class InteractiveMPPIViewer:
             self._draw_all_prior_means(state)
         self._draw_prior(state, selected_mode_index)
         self._draw_saved_trajectories()
-        self.ax.plot(states[:frame + 1, 0], states[:frame + 1, 1], color='#1f77b4', linewidth=2.4, label='executed path', zorder=7)
+        self.ax.plot(states[:frame + 1, 0], states[:frame + 1, 1], color='#1f77b4', linewidth=2.4, label='Executed path', zorder=7)
         nominal_ilqr = self._nominal_ilqr_output(frame)
         if nominal_ilqr is not None:
             self.ax.plot(
@@ -883,10 +887,8 @@ class InteractiveMPPIViewer:
         if frame < len(controls):
             if self.model_key == 'ackerman':
                 control_text = f'a={controls[frame, 0]:.2f}, delta_dot={controls[frame, 1]:.2f}'
-            elif self.model_key == 'car_trailer':
-                control_text = f'v={controls[frame, 0]:.2f}, delta_dot={controls[frame, 1]:.2f}'
-            elif self.model_key == 'planar_quadrotor':
-                control_text = f'f={controls[frame, 0]:.2f}, tau={controls[frame, 1]:.2f}'
+            elif self.model_key in {'planar_quadrotor', 'planar_quadrotor_payload'}:
+                control_text = f'omega_r_dot={controls[frame, 0]:.2f}, omega_l_dot={controls[frame, 1]:.2f}'
             else:
                 control_text = f'v={controls[frame, 0]:.2f}, omega={controls[frame, 1]:.2f}'
         mode_text = 'none'
@@ -907,7 +909,7 @@ class InteractiveMPPIViewer:
         status = f'control: {control_text}\nselected rollout mode: {mode_text}\nwall: {wall_state}'
         if extra_text:
             status += '\n' + extra_text
-        legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='executed path'), Line2D([0], [0], color='#0066cc', linewidth=2.0, linestyle='-.', label='iLQR nominal'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='selected rollout prior')]
+        legend_handles = [Line2D([0], [0], color='#1f77b4', linewidth=2.4, label='Executed path'), Line2D([0], [0], color='#0066cc', linewidth=2.0, linestyle='-.', label='iLQR nominal'), Line2D([0], [0], color='#ff7f0e', linewidth=2.2, linestyle='--', label='MPPI output'), Line2D([0], [0], color='#9467bd', linewidth=2.0, label='Selected rollout prior')]
         saved_handles = []
         fallback_colors = ('#d62728', '#2ca02c', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf')
         for index, item in enumerate(self._saved_trajectories):
@@ -934,8 +936,16 @@ class InteractiveMPPIViewer:
             self._circle_cache[key] = circles
         cfg = self.bundle.cfg
         collision_radius = float(getattr(cfg, 'total_drone_radius', cfg.robot_radius))
+        payload_radius = (
+            float(cfg.payload_radius)
+            if self.model_key == 'planar_quadrotor_payload'
+            else None
+        )
         for center, radius in circles:
-            self.ax.add_patch(Circle(np.asarray(center)[:2], float(radius) + collision_radius, fill=False, edgecolor='#e377c2', linewidth=0.75, linestyle=':', alpha=0.45, zorder=4))
+            center_xy = np.asarray(center)[:2]
+            self.ax.add_patch(Circle(center_xy, float(radius) + collision_radius, fill=False, edgecolor='#e377c2', linewidth=0.75, linestyle=':', alpha=0.45, zorder=4))
+            if payload_radius is not None:
+                self.ax.add_patch(Circle(center_xy, float(radius) + payload_radius, fill=False, edgecolor='#ff7f0e', linewidth=0.75, linestyle=':', alpha=0.35, zorder=4))
 
     def _selected_rollout_mode_index(self, frame: int) -> Optional[int]:
         """Return the global mode that produced the displayed best rollout."""
@@ -1106,35 +1116,14 @@ class InteractiveMPPIViewer:
             arrow_length = max(0.38, 1.8 * radius)
             self.ax.arrow(x, y, arrow_length * math.cos(heading), arrow_length * math.sin(heading), width=0.025, head_width=0.13, head_length=0.14, length_includes_head=True, color='black', zorder=13)
             return
-        if self.model_key == 'car_trailer':
-            cfg = self.bundle.cfg
-            num_trailers = int(cfg.num_trailers)
-            expected = 4 + num_trailers
-            if state.size < expected:
-                raise ValueError(f'Car-trailer state must contain {expected} values for {num_trailers} trailers.')
-            x = float(state[0])
-            y = float(state[1])
-            heading = float(state[2])
-            trailer_headings = np.asarray(state[3:3 + num_trailers], dtype=float)
-            wheelbase = float(cfg.car_wheelbase)
-            trailer_length = float(cfg.trailer_length)
-            trailer_link_length = float(cfg.trailer_spacing)
-            body_width = max(2.0 * float(cfg.robot_radius), 0.36)
-            car_body = np.array([[-0.35 * wheelbase, -0.5 * body_width], [0.75 * wheelbase, -0.5 * body_width], [0.75 * wheelbase, 0.5 * body_width], [-0.35 * wheelbase, 0.5 * body_width]])
-            self.ax.add_patch(Polygon(self._transform_vehicle_points(car_body, (x, y), heading), closed=True, facecolor='#17becf', edgecolor='black', linewidth=1.1, alpha=0.92, zorder=12 + num_trailers))
-
-            trailer_body = np.array([[-0.45 * trailer_length, -0.48 * body_width], [0.45 * trailer_length, -0.48 * body_width], [0.45 * trailer_length, 0.48 * body_width], [-0.45 * trailer_length, 0.48 * body_width]])
-            previous = np.asarray([x, y], dtype=float)
-            fills = ('#9edae5', '#c7e9ef')
-            for i, trailer_heading in enumerate(trailer_headings):
-                center = previous - trailer_link_length * np.asarray([math.cos(float(trailer_heading)), math.sin(float(trailer_heading))])
-                self.ax.plot([previous[0], center[0]], [previous[1], center[1]], color='black', linewidth=1.2, zorder=12 + num_trailers - i)
-                self.ax.add_patch(Polygon(self._transform_vehicle_points(trailer_body, tuple(center), float(trailer_heading)), closed=True, facecolor=fills[i % len(fills)], edgecolor='black', linewidth=1.0, alpha=0.92, zorder=11 + num_trailers - i))
-                previous = center
-            return
-        if self.model_key == 'planar_quadrotor':
-            if state.size < 6:
-                raise ValueError('Planar quadrotor state must contain [x, y, vx, vy, theta, omega].')
+        if self.model_key in {'planar_quadrotor', 'planar_quadrotor_payload'}:
+            minimum_state = 10 if self.model_key == 'planar_quadrotor_payload' else 6
+            if state.size < minimum_state:
+                raise ValueError(
+                    'Planar quadrotor payload state must contain 10 values.'
+                    if self.model_key == 'planar_quadrotor_payload'
+                    else 'Planar quadrotor state must contain [x, y, vx, vy, theta, omega].'
+                )
             x, y, _, _, theta, _ = map(float, state[:6])
             cfg = self.bundle.cfg
             total_radius = float(cfg.total_drone_radius)
@@ -1142,6 +1131,12 @@ class InteractiveMPPIViewer:
             body_radius = float(cfg.body_radius)
             arm = max(0.0, total_radius - rotor_radius)
             endpoints = self._transform_vehicle_points(np.asarray([[-arm, 0.0], [arm, 0.0]]), (x, y), theta)
+
+            if self.model_key == 'planar_quadrotor_payload':
+                payload = np.asarray(self.bundle.module.payload_position(state, cfg), dtype=float)
+                self.ax.plot([x, payload[0]], [y, payload[1]], color='0.20', linewidth=1.5, zorder=11)
+                self.ax.add_patch(Circle((float(payload[0]), float(payload[1])), radius=float(cfg.payload_radius), facecolor='#ffbb78', edgecolor='black', linewidth=1.1, alpha=0.95, zorder=12))
+
             self.ax.plot(endpoints[:, 0], endpoints[:, 1], color='black', linewidth=2.0, zorder=13)
             self.ax.add_patch(Circle((x, y), radius=body_radius, facecolor='#17becf', edgecolor='black', linewidth=1.0, zorder=14))
             for point in endpoints:

@@ -15,8 +15,9 @@ except ImportError:
 
 Array = np.ndarray
 NUMBA_AVAILABLE = True
-MODEL_NAME = "planar_quadrotor"
+MODEL_NAME = "planar_quadrotor_payload"
 INITIAL_POSE_USES_CONFIG = True
+STATE_DIM = 10
 
 ControllerVariant = ctrl.ControllerVariant
 Scene = ctrl.Scene
@@ -44,6 +45,17 @@ class MPPIConfig(ctrl.ControllerConfig):
     rotor_speed_tracking_gain: float = 5.0
     attitude_kp: float = 12.0
     attitude_kd: float = 7.0
+
+    cable_length: float = 0.6
+    payload_mass: float = 0.25
+    payload_radius: float = 0.08
+    payload_angular_damping: float = 6.0
+    payload_swing_weight: float = 0.0
+    payload_swing_rate_weight: float = 0.0
+    payload_terminal_swing_weight: float = 100.0
+    payload_terminal_swing_rate_weight: float = 100.0
+    payload_angle_tolerance: float = 0.12
+    payload_rate_tolerance: float = 0.25
 
     dynamics_substeps: int = 5
     max_translational_speed: float = 2.5
@@ -80,6 +92,9 @@ class MPPIConfig(ctrl.ControllerConfig):
             ("rotor_speed_max", self.rotor_speed_max),
             ("rotor_accel_max", self.rotor_accel_max),
             ("rotor_speed_tracking_gain", self.rotor_speed_tracking_gain),
+            ("cable_length", self.cable_length),
+            ("payload_mass", self.payload_mass),
+            ("payload_radius", self.payload_radius),
             ("max_translational_speed", self.max_translational_speed),
             ("prior_ilqr_mahalanobis_weight", self.prior_ilqr_mahalanobis_weight),
             ("prior_ilqr_covariance_floor", self.prior_ilqr_covariance_floor),
@@ -93,9 +108,24 @@ class MPPIConfig(ctrl.ControllerConfig):
         ):
             if value <= 0.0:
                 raise ValueError(f"{name} must be positive.")
+        for name, value in (
+            ("payload_angular_damping", self.payload_angular_damping),
+            ("payload_swing_weight", self.payload_swing_weight),
+            ("payload_swing_rate_weight", self.payload_swing_rate_weight),
+            ("payload_terminal_swing_weight", self.payload_terminal_swing_weight),
+            ("payload_terminal_swing_rate_weight", self.payload_terminal_swing_rate_weight),
+            ("payload_angle_tolerance", self.payload_angle_tolerance),
+            ("payload_rate_tolerance", self.payload_rate_tolerance),
+        ):
+            if value < 0.0:
+                raise ValueError(f"{name} must be nonnegative.")
         self.dynamics_substeps = max(1, int(self.dynamics_substeps))
         self.prior_ilqr_iterations = max(1, int(self.prior_ilqr_iterations))
         self.prior_ilqr_line_search_steps = max(1, int(self.prior_ilqr_line_search_steps))
+        if self.hover_rotor_speed > self.rotor_speed_max + 1e-9:
+            raise ValueError(
+                "payload_mass is too large for hover with the configured rotor_speed_max/thrust_factor."
+            )
 
     @property
     def total_drone_radius(self) -> float:
@@ -103,8 +133,16 @@ class MPPIConfig(ctrl.ControllerConfig):
         return float(self.rotor_arm + self.rotor_radius)
 
     @property
+    def total_mass(self) -> float:
+        return float(self.mass + self.payload_mass)
+
+    @property
+    def payload_weight_newtons(self) -> float:
+        return float(self.payload_mass * self.gravity)
+
+    @property
     def hover_thrust(self) -> float:
-        return self.mass * self.gravity
+        return self.total_mass * self.gravity
 
     @property
     def hover_rotor_speed(self) -> float:
@@ -122,6 +160,9 @@ def _dynamic_args(cfg: MPPIConfig) -> tuple:
         float(cfg.rotor_arm),
         float(cfg.rotor_speed_max),
         float(cfg.rotor_accel_max),
+        float(cfg.cable_length),
+        float(cfg.payload_mass),
+        float(cfg.payload_angular_damping),
         int(cfg.dynamics_substeps),
     )
 
@@ -185,9 +226,32 @@ def _bounded_rotor_accel_nb(w, u, rotor_speed_max, rotor_accel_max):
 
 
 @njit(cache=True)
+def _payload_position_nb(state, cable_length):
+    """Point-mass package position for phi measured from downward vertical."""
+    phi = state[8]
+    return (
+        state[0] + cable_length * math.sin(phi),
+        state[1] - cable_length * math.cos(phi),
+    )
+
+
+@njit(cache=True)
 def _quad_rhs_nb(x, control, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                 thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max):
-    # State: [x, y, vx, vy, theta, omega, omega_r, omega_l]
+                 thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                 cable_length, payload_mass, payload_angular_damping):
+    """Coupled planar quadrotor + single-link suspended point-mass dynamics.
+
+    The cable is massless, inextensible, and attached at the quadrotor COM.  With
+    q = [x_q, y_q, phi], phi measured from downward vertical, Euler-Lagrange gives
+
+      (m+mL) xdd + mL*l*cos(phi)*phidd - mL*l*sin(phi)*phidot^2 = Fx
+      (m+mL) ydd + mL*l*sin(phi)*phidd + mL*l*cos(phi)*phidot^2 = Fy-(m+mL)g
+      cos(phi)*xdd + sin(phi)*ydd + l*phidd = -g*sin(phi)
+
+    where Fx/Fy contain rotor thrust and the original quadrotor drag model.  The
+    equations below use the equivalent closed-form solution for phidd, xdd, ydd.
+    """
+    # State: [x, y, vx, vy, theta, omega, omega_r, omega_l, phi, phi_dot]
     wr = min(max(x[6], 0.0), rotor_speed_max)
     wl = min(max(x[7], 0.0), rotor_speed_max)
     ur = _bounded_rotor_accel_nb(wr, control[0], rotor_speed_max, rotor_accel_max)
@@ -199,45 +263,83 @@ def _quad_rhs_nb(x, control, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
     vx = x[2]
     vy = x[3]
     theta = x[4]
-    c = math.cos(theta)
-    sn = math.sin(theta)
-    bxx = drag_x_coeff * c * c + drag_y_coeff * sn * sn
-    bxy = (drag_x_coeff - drag_y_coeff) * c * sn
-    byy = drag_x_coeff * sn * sn + drag_y_coeff * c * c
-    drag_x = bxx * vx + bxy * vy
-    drag_y = bxy * vx + byy * vy
+    ctheta = math.cos(theta)
+    stheta = math.sin(theta)
+    bxx = drag_x_coeff * ctheta * ctheta + drag_y_coeff * stheta * stheta
+    bxy = (drag_x_coeff - drag_y_coeff) * ctheta * stheta
+    byy = drag_x_coeff * stheta * stheta + drag_y_coeff * ctheta * ctheta
+    # The original planar-quadrotor implementation treats these coefficients as
+    # acceleration damping. Convert back to force so the mL->0 limit is identical.
+    drag_ax = bxx * vx + bxy * vy
+    drag_ay = bxy * vx + byy * vy
+    force_x = -f * stheta - mass * drag_ax
+    force_y = f * ctheta - mass * drag_ay
 
-    out = np.empty(8, dtype=np.float64)
+    phi = x[8]
+    phi_dot = x[9]
+    cphi = math.cos(phi)
+    sphi = math.sin(phi)
+    total_mass = mass + payload_mass
+
+    # Closed-form solution of the 3x3 translational/pendulum mass matrix.
+    # Strong viscous angular damping removes residual payload swing energy.
+    # The damping rate is expressed directly in 1/s so it stays easy to tune
+    # when payload mass or cable length changes.
+    phi_ddot = (
+        -(cphi * force_x + sphi * force_y) / (mass * cable_length)
+        - payload_angular_damping * phi_dot
+    )
+    x_ddot = (
+        force_x
+        + payload_mass * cable_length * sphi * phi_dot * phi_dot
+        - payload_mass * cable_length * cphi * phi_ddot
+    ) / total_mass
+    y_ddot = (
+        force_y
+        - total_mass * gravity
+        - payload_mass * cable_length * cphi * phi_dot * phi_dot
+        - payload_mass * cable_length * sphi * phi_ddot
+    ) / total_mass
+
+    out = np.empty(STATE_DIM, dtype=np.float64)
     out[0] = vx
     out[1] = vy
-    out[2] = -(f / mass) * sn - drag_x
-    out[3] = -gravity + (f / mass) * c - drag_y
+    out[2] = x_ddot
+    out[3] = y_ddot
     out[4] = x[5]
     out[5] = tau / inertia
     out[6] = ur
     out[7] = ul
+    out[8] = phi_dot
+    out[9] = phi_ddot
     return out
 
 
 @njit(cache=True)
 def _planar_quadrotor_step_nb(state, control, dt, mass, inertia, gravity,
                               drag_x_coeff, drag_y_coeff, thrust_factor,
-                              rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                              rotor_arm, rotor_speed_max, rotor_accel_max,
+                              cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     x = state.copy()
     u = _clip_quad_control_nb(control, rotor_accel_max)
     substeps = max(1, int(dynamics_substeps))
     h = dt / substeps
     for _ in range(substeps):
         k1 = _quad_rhs_nb(x, u, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max)
+                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                          cable_length, payload_mass, payload_angular_damping)
         k2 = _quad_rhs_nb(x + 0.5 * h * k1, u, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max)
+                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                          cable_length, payload_mass, payload_angular_damping)
         k3 = _quad_rhs_nb(x + 0.5 * h * k2, u, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max)
+                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                          cable_length, payload_mass, payload_angular_damping)
         k4 = _quad_rhs_nb(x + h * k3, u, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max)
+                          thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                          cable_length, payload_mass, payload_angular_damping)
         x = x + (h / 6.0) * (k1 + 2.0 * k2 + 2.0 * k3 + k4)
         x[4] = _wrap_angle_nb(x[4])
+        x[8] = _wrap_angle_nb(x[8])
         x[6] = min(max(x[6], 0.0), rotor_speed_max)
         x[7] = min(max(x[7], 0.0), rotor_speed_max)
     return x
@@ -246,16 +348,18 @@ def _planar_quadrotor_step_nb(state, control, dt, mass, inertia, gravity,
 @njit(cache=True)
 def _rollout_quad_single_nb(x0, U, dt, mass, inertia, gravity,
                             drag_x_coeff, drag_y_coeff, thrust_factor,
-                            rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                            rotor_arm, rotor_speed_max, rotor_accel_max,
+                            cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     H = U.shape[0]
-    X = np.zeros((H + 1, 8), dtype=np.float64)
-    for j in range(8):
+    X = np.zeros((H + 1, STATE_DIM), dtype=np.float64)
+    for j in range(STATE_DIM):
         X[0, j] = x0[j]
     for t in range(H):
         X[t + 1] = _planar_quadrotor_step_nb(
             X[t], U[t], dt, mass, inertia, gravity,
             drag_x_coeff, drag_y_coeff, thrust_factor,
-            rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
     return X
 
@@ -263,18 +367,20 @@ def _rollout_quad_single_nb(x0, U, dt, mass, inertia, gravity,
 @njit(cache=True, parallel=True)
 def _rollout_quad_batch_nb(x0, U, dt, mass, inertia, gravity,
                            drag_x_coeff, drag_y_coeff, thrust_factor,
-                           rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                           rotor_arm, rotor_speed_max, rotor_accel_max,
+                           cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     N = U.shape[0]
     H = U.shape[1]
-    X = np.zeros((N, H + 1, 8), dtype=np.float64)
+    X = np.zeros((N, H + 1, STATE_DIM), dtype=np.float64)
     for n in prange(N):
-        for j in range(8):
+        for j in range(STATE_DIM):
             X[n, 0, j] = x0[j]
         for t in range(H):
             X[n, t + 1] = _planar_quadrotor_step_nb(
                 X[n, t], U[n, t], dt, mass, inertia, gravity,
                 drag_x_coeff, drag_y_coeff, thrust_factor,
-                rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+                rotor_arm, rotor_speed_max, rotor_accel_max,
+                cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
             )
     return X
 
@@ -290,8 +396,11 @@ def _clip_quad_rows_nb(U, rotor_accel_max):
 
 @njit(cache=True, parallel=True)
 def _trajectory_costs_quad_nb(X, U, circle_centers, circle_radii, goal,
-                              robot_radius, rotor_accel_max,
-                              w_goal, w_obstacle, w_control, w_control_smooth, w_terminal_position, w_terminal_velocity):
+                              robot_radius, payload_radius, cable_length, rotor_accel_max,
+                              w_goal, w_obstacle, w_control, w_control_smooth,
+                              w_terminal_position, w_terminal_velocity,
+                              payload_swing_weight, payload_swing_rate_weight,
+                              payload_terminal_swing_weight, payload_terminal_swing_rate_weight):
     N = U.shape[0]
     H = U.shape[1]
     M = circle_radii.shape[0]
@@ -301,17 +410,32 @@ def _trajectory_costs_quad_nb(X, U, circle_centers, circle_radii, goal,
     for n in prange(N):
         cost = 0.0
         for t in range(H):
-            px = X[n, t + 1, 0]
-            py = X[n, t + 1, 1]
+            state = X[n, t + 1]
+            px = state[0]
+            py = state[1]
+            phi = _wrap_angle_nb(state[8])
+            phi_dot = state[9]
+            load_x = px + cable_length * math.sin(phi)
+            load_y = py - cable_length * math.cos(phi)
             dx = px - goal[0]
             dy = py - goal[1]
             cost += w_goal * inv_h * (dx * dx + dy * dy)
+            cost += inv_h * (
+                payload_swing_weight * phi * phi
+                + payload_swing_rate_weight * phi_dot * phi_dot
+            )
             for m in range(M):
                 cx = px - circle_centers[m, 0]
                 cy = py - circle_centers[m, 1]
-                clearance = math.sqrt(cx * cx + cy * cy) - circle_radii[m] - robot_radius
-                sp = _softplus_scalar_nb(8.0 * (-clearance))
-                cost += w_obstacle * sp * sp
+                clearance_q = math.sqrt(cx * cx + cy * cy) - circle_radii[m] - robot_radius
+                sp_q = _softplus_scalar_nb(8.0 * (-clearance_q))
+                cost += w_obstacle * sp_q * sp_q
+
+                lx = load_x - circle_centers[m, 0]
+                ly = load_y - circle_centers[m, 1]
+                clearance_l = math.sqrt(lx * lx + ly * ly) - circle_radii[m] - payload_radius
+                sp_l = _softplus_scalar_nb(8.0 * (-clearance_l))
+                cost += w_obstacle * sp_l * sp_l
         for t in range(H):
             ur = U[n, t, 0] * inv_a
             ul = U[n, t, 1] * inv_a
@@ -322,15 +446,20 @@ def _trajectory_costs_quad_nb(X, U, circle_centers, circle_radii, goal,
             cost += w_control_smooth * (dur * dur + dul * dul)
         gxT = X[n, H, 0] - goal[0]
         gyT = X[n, H, 1] - goal[1]
+        phiT = _wrap_angle_nb(X[n, H, 8])
+        phiDotT = X[n, H, 9]
         cost += w_terminal_position * (gxT * gxT + gyT * gyT)
         cost += w_terminal_velocity * (X[n, H, 2] * X[n, H, 2] + X[n, H, 3] * X[n, H, 3])
+        cost += payload_terminal_swing_weight * phiT * phiT
+        cost += payload_terminal_swing_rate_weight * phiDotT * phiDotT
         costs[n] = cost
     return costs
 
 
 @njit(cache=True, parallel=True)
 def _collision_mask_quad_nb(X, circle_centers, circle_radii,
-                            robot_radius, hard_collision_clearance):
+                            robot_radius, payload_radius, cable_length,
+                            hard_collision_clearance):
     N = X.shape[0]
     H = X.shape[1] - 1
     M = circle_radii.shape[0]
@@ -338,13 +467,21 @@ def _collision_mask_quad_nb(X, circle_centers, circle_radii,
     for n in prange(N):
         hit = False
         for t in range(H):
-            px = X[n, t + 1, 0]
-            py = X[n, t + 1, 1]
+            state = X[n, t + 1]
+            px = state[0]
+            py = state[1]
+            load_x, load_y = _payload_position_nb(state, cable_length)
             for m in range(M):
                 dx = px - circle_centers[m, 0]
                 dy = py - circle_centers[m, 1]
-                threshold = circle_radii[m] + robot_radius + hard_collision_clearance
-                if math.sqrt(dx * dx + dy * dy) < threshold:
+                threshold_q = circle_radii[m] + robot_radius + hard_collision_clearance
+                if math.sqrt(dx * dx + dy * dy) < threshold_q:
+                    hit = True
+                    break
+                ldx = load_x - circle_centers[m, 0]
+                ldy = load_y - circle_centers[m, 1]
+                threshold_l = circle_radii[m] + payload_radius + hard_collision_clearance
+                if math.sqrt(ldx * ldx + ldy * ldy) < threshold_l:
                     hit = True
                     break
             if hit:
@@ -357,12 +494,12 @@ def _collision_mask_quad_nb(X, circle_centers, circle_radii,
 def _spg_quad_nb(x0, U, cov, lookahead_steps, fd_thrust, fd_moment,
                  pseudoinverse_damping, covariance_jitter,
                  dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                 thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                 thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     H = U.shape[0]
     X = _rollout_quad_single_nb(
         x0, U, dt, mass, inertia, gravity,
         drag_x_coeff, drag_y_coeff, thrust_factor,
-        rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+        rotor_arm, rotor_speed_max, rotor_accel_max, cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
     )
     out = np.zeros((H, 2, 2), dtype=np.float64)
     damp2 = pseudoinverse_damping * pseudoinverse_damping
@@ -382,12 +519,12 @@ def _spg_quad_nb(x0, U, cov, lookahead_steps, fd_thrust, fd_moment,
                 plus = _planar_quadrotor_step_nb(
                     plus, up, dt, mass, inertia, gravity,
                     drag_x_coeff, drag_y_coeff, thrust_factor,
-                    rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+                    rotor_arm, rotor_speed_max, rotor_accel_max, cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
                 )
                 minus = _planar_quadrotor_step_nb(
                     minus, um, dt, mass, inertia, gravity,
                     drag_x_coeff, drag_y_coeff, thrust_factor,
-                    rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+                    rotor_arm, rotor_speed_max, rotor_accel_max, cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
                 )
             J[0, j] = (plus[0] - minus[0]) / (2.0 * eps)
             J[1, j] = (plus[1] - minus[1]) / (2.0 * eps)
@@ -520,19 +657,23 @@ def _prepare_cov(path: Array, cov_blocks: Optional[Array], cfg: MPPIConfig) -> A
 def _state_difference_nb(a, b):
     d = a - b
     d[4] = _wrap_angle_nb(d[4])
+    d[8] = _wrap_angle_nb(d[8])
     return d
 
 
 @njit(cache=True)
 def _stage_terms_nb(x, u, path, arc, cov, covariance_floor,
                     mahalanobis_weight, progress_weight,
-                    control_thrust_weight, control_moment_weight, rotor_accel_max):
+                    control_thrust_weight, control_moment_weight, rotor_accel_max,
+                    payload_swing_weight, payload_swing_rate_weight):
     progress, qx, qy, tx, ty, alpha, seg = _project_to_path_nb(x[0], x[1], path, arc)
     p00, p01, p11 = _precision_at_nb(cov, seg, alpha, covariance_floor)
     ex = x[0] - qx
     ey = x[1] - qy
     mx = p00 * ex + p01 * ey
     my = p01 * ex + p11 * ey
+    phi = _wrap_angle_nb(x[8])
+    phi_dot = x[9]
 
     inv_a = 1.0 / max(rotor_accel_max, 1e-9)
     collective = 0.5 * (u[0] + u[1]) * inv_a
@@ -542,16 +683,22 @@ def _stage_terms_nb(x, u, path, arc, cov, covariance_floor,
         - progress_weight * progress
         + control_thrust_weight * collective * collective
         + control_moment_weight * differential * differential
+        + payload_swing_weight * phi * phi
+        + payload_swing_rate_weight * phi_dot * phi_dot
     )
 
-    lx = np.zeros(8, dtype=np.float64)
+    lx = np.zeros(STATE_DIM, dtype=np.float64)
     lx[0] = 2.0 * mahalanobis_weight * mx - progress_weight * tx
     lx[1] = 2.0 * mahalanobis_weight * my - progress_weight * ty
-    lxx = np.zeros((8, 8), dtype=np.float64)
+    lx[8] = 2.0 * payload_swing_weight * phi
+    lx[9] = 2.0 * payload_swing_rate_weight * phi_dot
+    lxx = np.zeros((STATE_DIM, STATE_DIM), dtype=np.float64)
     lxx[0, 0] = 2.0 * mahalanobis_weight * p00
     lxx[0, 1] = 2.0 * mahalanobis_weight * p01
     lxx[1, 0] = lxx[0, 1]
     lxx[1, 1] = 2.0 * mahalanobis_weight * p11
+    lxx[8, 8] = 2.0 * payload_swing_weight
+    lxx[9, 9] = 2.0 * payload_swing_rate_weight
 
     lu = np.empty(2, dtype=np.float64)
     lu[0] = (control_thrust_weight * collective + control_moment_weight * differential) * inv_a
@@ -562,18 +709,21 @@ def _stage_terms_nb(x, u, path, arc, cov, covariance_floor,
     luu[1, 1] = luu[0, 0]
     luu[0, 1] = scale * (control_thrust_weight - control_moment_weight)
     luu[1, 0] = luu[0, 1]
-    lux = np.zeros((2, 8), dtype=np.float64)
+    lux = np.zeros((2, STATE_DIM), dtype=np.float64)
     return cost, lx, lxx, lu, luu, lux, progress
 
 
 @njit(cache=True)
 def _linearize_nb(x, u, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                  thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
-    nx = 8
+                  thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                  cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
+    nx = STATE_DIM
     nu = 2
     A = np.zeros((nx, nx), dtype=np.float64)
     B = np.zeros((nx, nu), dtype=np.float64)
-    eps_x = np.array([1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-2, 1e-2], dtype=np.float64)
+    eps_x = np.array([
+        1e-4, 1e-4, 1e-4, 1e-4, 1e-5, 1e-5, 1e-2, 1e-2, 1e-5, 1e-4
+    ], dtype=np.float64)
     eps_u = np.array([1.0, 1.0], dtype=np.float64)
     for j in range(nx):
         xp = x.copy()
@@ -582,11 +732,13 @@ def _linearize_nb(x, u, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
         xm[j] -= eps_x[j]
         fp = _planar_quadrotor_step_nb(
             xp, u, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
         fm = _planar_quadrotor_step_nb(
             xm, u, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
         diff = _state_difference_nb(fp, fm)
         for r in range(nx):
@@ -598,11 +750,13 @@ def _linearize_nb(x, u, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
         um[j] -= eps_u[j]
         fp = _planar_quadrotor_step_nb(
             x, up, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
         fm = _planar_quadrotor_step_nb(
             x, um, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
         diff = _state_difference_nb(fp, fm)
         for r in range(nx):
@@ -612,7 +766,7 @@ def _linearize_nb(x, u, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
 
 @njit(cache=True)
 def _guidance_control_nb(x, qx, qy, tx, ty, max_translational_speed,
-                         mass, inertia, gravity, thrust_factor, rotor_arm,
+                         mass, payload_mass, inertia, gravity, thrust_factor, rotor_arm,
                          rotor_speed_max, rotor_accel_max, rotor_speed_tracking_gain,
                          attitude_kp, attitude_kd):
     target_vx = max_translational_speed * tx
@@ -621,7 +775,9 @@ def _guidance_control_nb(x, qx, qy, tx, ty, max_translational_speed,
     desired_ay = 2.2 * (target_vy - x[3]) + 1.2 * (qy - x[1])
     thrust_x = desired_ax
     thrust_y = desired_ay + gravity
-    f = mass * math.sqrt(thrust_x * thrust_x + thrust_y * thrust_y)
+    # Use the combined supported mass. The iLQR refinement then handles the
+    # pendulum coupling and swing explicitly through the full 10-state dynamics.
+    f = (mass + payload_mass) * math.sqrt(thrust_x * thrust_x + thrust_y * thrust_y)
     theta_des = math.atan2(-thrust_x, thrust_y)
     theta_error = _wrap_angle_nb(theta_des - x[4])
     tau = inertia * (attitude_kp * theta_error - attitude_kd * x[5])
@@ -641,7 +797,8 @@ def _guidance_control_nb(x, qx, qy, tx, ty, max_translational_speed,
 def _initial_path_controls_nb(x0, path, H, max_translational_speed,
                               rotor_speed_tracking_gain, attitude_kp, attitude_kd,
                               dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                              thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                              thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                              cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     U = np.zeros((H, 2), dtype=np.float64)
     x = x0.copy()
     arc = _path_arc_nb(path)
@@ -651,12 +808,13 @@ def _initial_path_controls_nb(x0, path, H, max_translational_speed,
         target_speed = min(max_translational_speed, 1.5 * remaining)
         U[t] = _guidance_control_nb(
             x, qx, qy, tx, ty, target_speed,
-            mass, inertia, gravity, thrust_factor, rotor_arm,
+            mass, payload_mass, inertia, gravity, thrust_factor, rotor_arm,
             rotor_speed_max, rotor_accel_max, rotor_speed_tracking_gain, attitude_kp, attitude_kd,
         )
         x = _planar_quadrotor_step_nb(
             x, U[t], dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
     return U
 
@@ -686,12 +844,16 @@ def _invert_regularized_2x2_nb(M):
 def _ilqr_total_cost_nb(x0, U, path, arc, cov, covariance_floor,
                         mahalanobis_weight, progress_weight,
                         control_thrust_weight, control_moment_weight, rotor_accel_max,
+                        payload_swing_weight, payload_swing_rate_weight,
                         terminal_position_weight, terminal_velocity_weight,
+                        payload_terminal_swing_weight, payload_terminal_swing_rate_weight,
                         dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                        thrust_factor, rotor_arm, rotor_speed_max, dynamics_substeps):
+                        thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max_dyn,
+                        cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     X = _rollout_quad_single_nb(
         x0, U, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-        thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+        thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max_dyn,
+        cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
     )
     H = U.shape[0]
     positions = np.zeros(H, dtype=np.float64)
@@ -701,13 +863,18 @@ def _ilqr_total_cost_nb(x0, U, path, arc, cov, covariance_floor,
             X[t], U[t], path, arc, cov, covariance_floor,
             mahalanobis_weight, progress_weight,
             control_thrust_weight, control_moment_weight, rotor_accel_max,
+            payload_swing_weight, payload_swing_rate_weight,
         )
         cost += c
         positions[t] = progress
     exT = X[H, 0] - path[path.shape[0] - 1, 0]
     eyT = X[H, 1] - path[path.shape[0] - 1, 1]
+    phiT = _wrap_angle_nb(X[H, 8])
+    phiDotT = X[H, 9]
     cost += terminal_position_weight * (exT * exT + eyT * eyT)
     cost += terminal_velocity_weight * (X[H, 2] * X[H, 2] + X[H, 3] * X[H, 3])
+    cost += payload_terminal_swing_weight * phiT * phiT
+    cost += payload_terminal_swing_rate_weight * phiDotT * phiDotT
     return cost, X, positions
 
 
@@ -716,10 +883,14 @@ def _ilqr_nominal_nb(x0, path, cov, H, iterations, line_search_steps,
                      max_translational_speed, covariance_floor,
                      mahalanobis_weight, progress_weight,
                      control_thrust_weight, control_moment_weight,
-                     terminal_position_weight, terminal_velocity_weight, regularization,
+                     payload_swing_weight, payload_swing_rate_weight,
+                     terminal_position_weight, terminal_velocity_weight,
+                     payload_terminal_swing_weight, payload_terminal_swing_rate_weight,
+                     regularization,
                      rotor_speed_tracking_gain, attitude_kp, attitude_kd,
                      dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                     thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                     thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                     cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     if path.shape[0] < 2:
         return np.zeros((H, 2), dtype=np.float64), np.zeros(H, dtype=np.float64)
 
@@ -728,34 +899,40 @@ def _ilqr_nominal_nb(x0, path, cov, H, iterations, line_search_steps,
         x0, path, H, max_translational_speed,
         rotor_speed_tracking_gain, attitude_kp, attitude_kd,
         dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-        thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+        thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+        cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
     )
     best_cost, X, positions = _ilqr_total_cost_nb(
         x0, U, path, arc, cov, covariance_floor,
         mahalanobis_weight, progress_weight,
         control_thrust_weight, control_moment_weight, rotor_accel_max,
+        payload_swing_weight, payload_swing_rate_weight,
         terminal_position_weight, terminal_velocity_weight,
+        payload_terminal_swing_weight, payload_terminal_swing_rate_weight,
         dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-        thrust_factor, rotor_arm, rotor_speed_max, dynamics_substeps,
+        thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+        cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
     )
 
     for _ in range(iterations):
-        A = np.zeros((H, 8, 8), dtype=np.float64)
-        B = np.zeros((H, 8, 2), dtype=np.float64)
-        lx = np.zeros((H, 8), dtype=np.float64)
-        lxx = np.zeros((H, 8, 8), dtype=np.float64)
+        A = np.zeros((H, STATE_DIM, STATE_DIM), dtype=np.float64)
+        B = np.zeros((H, STATE_DIM, 2), dtype=np.float64)
+        lx = np.zeros((H, STATE_DIM), dtype=np.float64)
+        lxx = np.zeros((H, STATE_DIM, STATE_DIM), dtype=np.float64)
         lu = np.zeros((H, 2), dtype=np.float64)
         luu = np.zeros((H, 2, 2), dtype=np.float64)
-        lux = np.zeros((H, 2, 8), dtype=np.float64)
+        lux = np.zeros((H, 2, STATE_DIM), dtype=np.float64)
         for t in range(H):
             At, Bt = _linearize_nb(
                 X[t], U[t], dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+                thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
             )
             _, lxt, lxxt, lut, luut, luxt, _ = _stage_terms_nb(
                 X[t], U[t], path, arc, cov, covariance_floor,
                 mahalanobis_weight, progress_weight,
                 control_thrust_weight, control_moment_weight, rotor_accel_max,
+                payload_swing_weight, payload_swing_rate_weight,
             )
             A[t] = At
             B[t] = Bt
@@ -765,10 +942,12 @@ def _ilqr_nominal_nb(x0, path, cov, H, iterations, line_search_steps,
             luu[t] = luut
             lux[t] = luxt
 
-        Vx = np.zeros(8, dtype=np.float64)
-        Vxx = np.zeros((8, 8), dtype=np.float64)
+        Vx = np.zeros(STATE_DIM, dtype=np.float64)
+        Vxx = np.zeros((STATE_DIM, STATE_DIM), dtype=np.float64)
         exT = X[H, 0] - path[path.shape[0] - 1, 0]
         eyT = X[H, 1] - path[path.shape[0] - 1, 1]
+        phiT = _wrap_angle_nb(X[H, 8])
+        phiDotT = X[H, 9]
         Vx[0] = 2.0 * terminal_position_weight * exT
         Vx[1] = 2.0 * terminal_position_weight * eyT
         Vxx[0, 0] = 2.0 * terminal_position_weight
@@ -777,8 +956,12 @@ def _ilqr_nominal_nb(x0, path, cov, H, iterations, line_search_steps,
         Vx[3] = 2.0 * terminal_velocity_weight * X[H, 3]
         Vxx[2, 2] = 2.0 * terminal_velocity_weight
         Vxx[3, 3] = 2.0 * terminal_velocity_weight
+        Vx[8] = 2.0 * payload_terminal_swing_weight * phiT
+        Vx[9] = 2.0 * payload_terminal_swing_rate_weight * phiDotT
+        Vxx[8, 8] = 2.0 * payload_terminal_swing_weight
+        Vxx[9, 9] = 2.0 * payload_terminal_swing_rate_weight
         k = np.zeros((H, 2), dtype=np.float64)
-        K = np.zeros((H, 2, 8), dtype=np.float64)
+        K = np.zeros((H, 2, STATE_DIM), dtype=np.float64)
 
         for t in range(H - 1, -1, -1):
             At = A[t]
@@ -811,15 +994,18 @@ def _ilqr_nominal_nb(x0, path, cov, H, iterations, line_search_steps,
                 Xnew[t + 1] = _planar_quadrotor_step_nb(
                     Xnew[t], Unew[t], dt, mass, inertia, gravity,
                     drag_x_coeff, drag_y_coeff, thrust_factor, rotor_arm,
-                    rotor_speed_max, rotor_accel_max, dynamics_substeps,
+                    rotor_speed_max, rotor_accel_max, cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
                 )
             candidate_cost, candidate_X, candidate_pos = _ilqr_total_cost_nb(
                 x0, Unew, path, arc, cov, covariance_floor,
                 mahalanobis_weight, progress_weight,
                 control_thrust_weight, control_moment_weight, rotor_accel_max,
+                payload_swing_weight, payload_swing_rate_weight,
                 terminal_position_weight, terminal_velocity_weight,
+                payload_terminal_swing_weight, payload_terminal_swing_rate_weight,
                 dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                thrust_factor, rotor_arm, rotor_speed_max, dynamics_substeps,
+                thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
             )
             if candidate_cost < best_cost:
                 U = Unew
@@ -837,7 +1023,8 @@ def _ilqr_nominal_nb(x0, path, cov, H, iterations, line_search_steps,
 def _nominal_controls_to_goal_nb(x0, goal, H, max_translational_speed,
                                  rotor_speed_tracking_gain, attitude_kp, attitude_kd,
                                  dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                                 thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                                 thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                                 cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     x = x0.copy()
     U = np.zeros((H, 2), dtype=np.float64)
     for t in range(H):
@@ -853,12 +1040,13 @@ def _nominal_controls_to_goal_nb(x0, goal, H, max_translational_speed,
         target_speed = min(max_translational_speed, 1.5 * dist)
         U[t] = _guidance_control_nb(
             x, goal[0], goal[1], tx, ty, target_speed,
-            mass, inertia, gravity, thrust_factor, rotor_arm, rotor_speed_max,
+            mass, payload_mass, inertia, gravity, thrust_factor, rotor_arm, rotor_speed_max,
             rotor_accel_max, rotor_speed_tracking_gain, attitude_kp, attitude_kd,
         )
         x = _planar_quadrotor_step_nb(
             x, U[t], dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
     return U
 
@@ -897,7 +1085,9 @@ def nominal_controls_and_arc_positions(x0: Array, ref: Array, cfg: MPPIConfig, c
         float(cfg.max_translational_speed), float(cfg.prior_ilqr_covariance_floor),
         float(cfg.prior_ilqr_mahalanobis_weight), float(cfg.prior_ilqr_progress_weight),
         float(cfg.prior_ilqr_control_thrust_weight), float(cfg.prior_ilqr_control_moment_weight),
+        float(cfg.payload_swing_weight), float(cfg.payload_swing_rate_weight),
         float(cfg.w_terminal_position), float(cfg.w_terminal_velocity),
+        float(cfg.payload_terminal_swing_weight), float(cfg.payload_terminal_swing_rate_weight),
         float(cfg.prior_ilqr_regularization),
         float(cfg.rotor_speed_tracking_gain), float(cfg.attitude_kp), float(cfg.attitude_kd),
         *_dynamic_args(cfg),
@@ -960,6 +1150,8 @@ def trajectory_costs(states: Array, controls: Array, obstacle_circles, goal: Arr
         radii,
         np.asarray(goal, dtype=np.float64),
         float(cfg.total_drone_radius),
+        float(cfg.payload_radius),
+        float(cfg.cable_length),
         float(cfg.rotor_accel_max),
         float(cfg.w_goal),
         float(cfg.w_obstacle),
@@ -967,6 +1159,10 @@ def trajectory_costs(states: Array, controls: Array, obstacle_circles, goal: Arr
         float(cfg.w_control_smooth),
         float(cfg.w_terminal_position),
         float(cfg.w_terminal_velocity),
+        float(cfg.payload_swing_weight),
+        float(cfg.payload_swing_rate_weight),
+        float(cfg.payload_terminal_swing_weight),
+        float(cfg.payload_terminal_swing_rate_weight),
     )
 
 
@@ -978,12 +1174,16 @@ def collision_mask(states: Array, obstacle_circles, goal: Array, cfg: MPPIConfig
         centers,
         radii,
         float(cfg.total_drone_radius),
+        float(cfg.payload_radius),
+        float(cfg.cable_length),
         float(cfg.hard_collision_clearance),
     )
 
 
 @njit(cache=True, parallel=True)
-def _mean_path_clearance_nb(path, circle_centers, circle_radii, robot_radius):
+def _mean_path_clearance_nb(path, circle_centers, circle_radii,
+                            robot_radius, payload_radius, cable_length):
+    """Prior screening with the package assumed to hang vertically below the path."""
     n = path.shape[0]
     m = circle_radii.shape[0]
     if n == 0 or m == 0:
@@ -992,13 +1192,20 @@ def _mean_path_clearance_nb(path, circle_centers, circle_radii, robot_radius):
     for i in prange(n):
         px = path[i, 0]
         py = path[i, 1]
+        load_x = px
+        load_y = py - cable_length
         best = math.inf
         for j in range(m):
             dx = px - circle_centers[j, 0]
             dy = py - circle_centers[j, 1]
-            value = math.sqrt(dx * dx + dy * dy) - circle_radii[j] - robot_radius
-            if value < best:
-                best = value
+            value_q = math.sqrt(dx * dx + dy * dy) - circle_radii[j] - robot_radius
+            if value_q < best:
+                best = value_q
+            ldx = load_x - circle_centers[j, 0]
+            ldy = load_y - circle_centers[j, 1]
+            value_l = math.sqrt(ldx * ldx + ldy * ldy) - circle_radii[j] - payload_radius
+            if value_l < best:
+                best = value_l
         local_best[i] = best
     return np.min(local_best)
 
@@ -1010,20 +1217,29 @@ def mean_path_clearance(path: Array, obstacle_circles, cfg: MPPIConfig) -> float
         centers,
         radii,
         float(cfg.total_drone_radius),
+        float(cfg.payload_radius),
+        float(cfg.cable_length),
     ))
 
 
 @njit(cache=True)
-def _quad_circle_clearance_nb(state, circle_centers, circle_radii, robot_radius):
+def _quad_payload_circle_clearance_nb(state, circle_centers, circle_radii,
+                                      robot_radius, payload_radius, cable_length):
     if circle_radii.shape[0] == 0:
         return math.inf
+    load_x, load_y = _payload_position_nb(state, cable_length)
     best = math.inf
     for j in range(circle_radii.shape[0]):
         dx = state[0] - circle_centers[j, 0]
         dy = state[1] - circle_centers[j, 1]
-        value = math.sqrt(dx * dx + dy * dy) - circle_radii[j] - robot_radius
-        if value < best:
-            best = value
+        value_q = math.sqrt(dx * dx + dy * dy) - circle_radii[j] - robot_radius
+        if value_q < best:
+            best = value_q
+        ldx = load_x - circle_centers[j, 0]
+        ldy = load_y - circle_centers[j, 1]
+        value_l = math.sqrt(ldx * ldx + ldy * ldy) - circle_radii[j] - payload_radius
+        if value_l < best:
+            best = value_l
     return best
 
 
@@ -1031,22 +1247,29 @@ def _quad_circle_clearance_nb(state, circle_centers, circle_radii, robot_radius)
 def _apply_final_output_nb(x_current, control,
                            circle_centers, circle_radii,
                            enforce_one_step_safety, one_step_safety_clearance,
-                           robot_radius, rotor_speed_tracking_gain, attitude_kp, attitude_kd,
+                           robot_radius, payload_radius,
+                           rotor_speed_tracking_gain, attitude_kp, attitude_kd,
                            dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-                           thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
+                           thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+                           cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     cmd = _clip_quad_control_nb(control, rotor_accel_max)
     if enforce_one_step_safety and circle_radii.shape[0] > 0:
         nxt = _planar_quadrotor_step_nb(
             x_current, cmd, dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
-            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
+            cable_length, payload_mass, payload_angular_damping, dynamics_substeps,
         )
-        next_clearance = _quad_circle_clearance_nb(nxt, circle_centers, circle_radii, robot_radius)
-        current_clearance = _quad_circle_clearance_nb(x_current, circle_centers, circle_radii, robot_radius)
+        next_clearance = _quad_payload_circle_clearance_nb(
+            nxt, circle_centers, circle_radii, robot_radius, payload_radius, cable_length
+        )
+        current_clearance = _quad_payload_circle_clearance_nb(
+            x_current, circle_centers, circle_radii, robot_radius, payload_radius, cable_length
+        )
         if next_clearance < one_step_safety_clearance and next_clearance < current_clearance - 1e-4:
-            # Hold current position while driving attitude and rotor speeds back toward hover.
+            # Hold quadrotor position; the coupled model naturally lets the payload settle.
             cmd = _guidance_control_nb(
                 x_current, x_current[0], x_current[1], 0.0, 0.0, 0.0,
-                mass, inertia, gravity, thrust_factor, rotor_arm, rotor_speed_max,
+                mass, payload_mass, inertia, gravity, thrust_factor, rotor_arm, rotor_speed_max,
                 rotor_accel_max, rotor_speed_tracking_gain, attitude_kp, attitude_kd,
             )
     return cmd
@@ -1063,6 +1286,7 @@ def apply_final_output(x_current: Array, control: Array, previous_control: Optio
         bool(cfg.enforce_one_step_safety),
         float(cfg.one_step_safety_clearance),
         float(cfg.total_drone_radius),
+        float(cfg.payload_radius),
         float(cfg.rotor_speed_tracking_gain),
         float(cfg.attitude_kp),
         float(cfg.attitude_kd),
@@ -1085,13 +1309,21 @@ def render_output_trajectory(info: Dict[str, object], x_current: Array, control:
 def _initial_pose_nb(start, hover_rotor_speed):
     return np.array([
         start[0], start[1], 0.0, 0.0, 0.0, 0.0,
-        hover_rotor_speed, hover_rotor_speed,
+        hover_rotor_speed, hover_rotor_speed, 0.0, 0.0,
     ], dtype=np.float64)
 
 
 def initial_pose(start: Array, goal: Array, cfg: MPPIConfig) -> Array:
     del goal
     return _initial_pose_nb(np.asarray(start, dtype=np.float64), float(cfg.hover_rotor_speed))
+
+
+def payload_position(state: Array, cfg: MPPIConfig) -> Array:
+    state = np.asarray(state, dtype=np.float64)
+    if state.size < STATE_DIM:
+        raise ValueError(f"payload quadrotor state must contain {STATE_DIM} values.")
+    px, py = _payload_position_nb(state, float(cfg.cable_length))
+    return np.asarray([px, py], dtype=np.float64)
 
 
 @njit(cache=True)
@@ -1107,7 +1339,9 @@ def goal_reached(state: Array, goal: Array, cfg: MPPIConfig) -> bool:
         state, np.asarray(goal, dtype=np.float64), float(cfg.goal_tolerance),
     ))
     speed_ok = math.hypot(float(state[2]), float(state[3])) <= float(cfg.terminal_velocity_tolerance)
-    return bool(position_ok and speed_ok)
+    swing_ok = abs(float(_wrap_angle_nb(state[8]))) <= float(cfg.payload_angle_tolerance)
+    swing_rate_ok = abs(float(state[9])) <= float(cfg.payload_rate_tolerance)
+    return bool(position_ok and speed_ok and swing_ok and swing_rate_ok)
 
 
 def advance_state(state: Array, control: Array, goal: Array, cfg: MPPIConfig) -> Tuple[Array, bool]:
@@ -1171,34 +1405,45 @@ def _point_in_polygon_nb(px, py, polygon, n):
     return inside
 
 
+@njit(cache=True)
+def _circle_polygon_clearance_nb(px, py, radius, poly, n):
+    distance = math.inf
+    for i in range(n):
+        j = i + 1
+        if j == n:
+            j = 0
+        d = _point_segment_distance_nb(
+            px, py, poly[i, 0], poly[i, 1], poly[j, 0], poly[j, 1]
+        )
+        if d < distance:
+            distance = d
+    if _point_in_polygon_nb(px, py, poly, n):
+        distance = -distance
+    return distance - radius
+
+
 @njit(cache=True, parallel=True)
-def _minimum_clearance_nb(states, polygons, polygon_lengths, robot_radius):
+def _minimum_clearance_nb(states, polygons, polygon_lengths,
+                          robot_radius, payload_radius, cable_length):
     count = states.shape[0]
     if count == 0 or polygon_lengths.shape[0] == 0:
         return math.inf
     per_state = np.full(count, math.inf, dtype=np.float64)
     for sidx in prange(count):
-        px = states[sidx, 0]
-        py = states[sidx, 1]
+        state = states[sidx]
+        px = state[0]
+        py = state[1]
+        load_x, load_y = _payload_position_nb(state, cable_length)
         best = math.inf
         for obs in range(polygon_lengths.shape[0]):
             n = int(polygon_lengths[obs])
             poly = polygons[obs]
-            distance = math.inf
-            for i in range(n):
-                j = i + 1
-                if j == n:
-                    j = 0
-                d = _point_segment_distance_nb(
-                    px, py, poly[i, 0], poly[i, 1], poly[j, 0], poly[j, 1]
-                )
-                if d < distance:
-                    distance = d
-            if _point_in_polygon_nb(px, py, poly, n):
-                distance = -distance
-            clearance = distance - robot_radius
-            if clearance < best:
-                best = clearance
+            cq = _circle_polygon_clearance_nb(px, py, robot_radius, poly, n)
+            if cq < best:
+                best = cq
+            cl = _circle_polygon_clearance_nb(load_x, load_y, payload_radius, poly, n)
+            if cl < best:
+                best = cl
         per_state[sidx] = best
     return np.min(per_state)
 
@@ -1210,6 +1455,8 @@ def minimum_clearance(states: Array, obstacles: Sequence, cfg: MPPIConfig) -> fl
         polygons,
         lengths,
         float(cfg.total_drone_radius),
+        float(cfg.payload_radius),
+        float(cfg.cable_length),
     ))
 
 
