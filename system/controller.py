@@ -59,7 +59,7 @@ class ControllerConfig:
     w_terminal_position: float = 100.0
     w_terminal_velocity: float = 100.0
     terminal_velocity_tolerance: float = 0.1
-    goal_tolerance: float = 0.5
+    goal_tolerance: float = 0.1
 
     mode_select_rollouts_per_mode: int = 0
     max_nearby_prior_modes: int = 32
@@ -162,7 +162,10 @@ REP_CONTROL_BANK = 3
 REP_SENSITIVITY_PROJECTED_GAUSSIAN = 4
 
 def prior_preview_step_distance(cfg: Any) -> float:
-    max_speed = max(0.0, float(getattr(cfg, "v_max", 2.8)))
+    max_speed = max(
+        0.0,
+        float(getattr(cfg, "max_translational_speed", getattr(cfg, "v_max", 2.8))),
+    )
     dt = float(getattr(cfg, "dt", 0.12))
     return max(1e-6, max_speed * dt)
 
@@ -822,7 +825,7 @@ def build_default_scene() -> Scene:
         np.asarray([[3.0, 1.5], [5.2, 2.2], [4.7, 4.0], [2.8, 3.4]]),
         np.asarray([[6.2, 6.0], [8.5, 6.3], [8.1, 8.2], [6.8, 8.], [5.9, 7.4]]),
         np.asarray([[2.0, 6.8], [3.3, 6.1], [4.2, 6.9], [3.2, 7.3], [3.7, 8.1], [2.6, 8.3]]),
-        np.asarray([[1.8, 4.2], [2.7, 4.0], [3.0, 4.8], [2.3, 5.3], [1.7, 4.9]]),
+        np.asarray([[1.2, 4.2], [2.1, 4.0], [2.4, 4.8], [1.7, 5.3], [1.1, 4.9]]),
         np.asarray([[4.6, 5.1], [5.4, 5.0], [5.8, 5.7], [5.0, 6.2], [4.4, 5.7]]),
         np.asarray([[7.9, 3.0], [9.0, 3.2], [8.8, 4.2], [7.7, 4.0]]),
         np.asarray([[5.7, 1.0], [6.6, 1.2], [6.4, 2.3], [5.6, 2.1]]),
@@ -2072,7 +2075,10 @@ def run_controller(
         raise ValueError(f"{getattr(model, 'MODEL_NAME', 'model')} does not support {variant.value}.")
 
     rng = np.random.default_rng(seed)
-    state = model.initial_pose(scene.start, scene.goal)
+    if getattr(model, "INITIAL_POSE_USES_CONFIG", False):
+        state = model.initial_pose(scene.start, scene.goal, cfg)
+    else:
+        state = model.initial_pose(scene.start, scene.goal)
     states = [state.copy()]
     controls: list[Array] = []
     infos: list[dict[str, object]] = []

@@ -55,7 +55,7 @@ class MPPIConfig(ctrl.ControllerConfig):
 
     max_delta_v: float = 0.7
     max_delta_steering_rate: float = 1.4
-    enforce_one_step_safety: bool = True
+    enforce_one_step_safety: bool = False
     one_step_safety_clearance: float = 0.0
 
     def __post_init__(self) -> None:
@@ -584,13 +584,41 @@ def _initial_path_controls_nb(x0, path, H, dt, car_wheelbase, trailer_link_lengt
     arc = _path_arc_nb(path)
     for t in range(H):
         progress, _, _, tx, ty, _, _ = _project_to_path_nb(x[0], x[1], path, arc)
-        desired_heading = math.atan2(ty, tx)
-        heading_error = _wrap_angle_nb(desired_heading - x[2])
+        arc_remaining = max(0.0, arc[arc.shape[0] - 1] - progress)
+
+        # Near the end of the path, projection progress can clamp to arc[-1]
+        # while the car is still spatially offset from the endpoint.  The old
+        # code then forced v=0, which is an absorbing state for a car because
+        # psi_dot = v/L*tan(delta).  Use actual endpoint distance for terminal
+        # capture and allow a short reverse correction when the goal is behind.
+        end_dx = path[path.shape[0] - 1, 0] - x[0]
+        end_dy = path[path.shape[0] - 1, 1] - x[1]
+        end_dist = math.sqrt(end_dx * end_dx + end_dy * end_dy)
+        terminal_capture = arc_remaining < 0.75 or end_dist < 0.75
+
+        direction = 1.0
+        speed_limit = v_max
+        if terminal_capture and end_dist > 1e-9:
+            desired_heading = math.atan2(end_dy, end_dx)
+            forward_error = _wrap_angle_nb(desired_heading - x[2])
+            reverse_error = _wrap_angle_nb(desired_heading + math.pi - x[2])
+            if v_min < 0.0 and abs(reverse_error) < abs(forward_error):
+                direction = -1.0
+                speed_limit = min(v_max, -v_min)
+                heading_error = reverse_error
+            else:
+                heading_error = forward_error
+            remaining = end_dist
+        else:
+            desired_heading = math.atan2(ty, tx)
+            heading_error = _wrap_angle_nb(desired_heading - x[2])
+            remaining = max(arc_remaining, end_dist)
+
         alignment = max(0.0, math.cos(heading_error))
-        remaining = max(0.0, arc[arc.shape[0] - 1] - progress)
-        v = min(v_max * (0.25 + 0.75 * alignment * alignment), 1.5 * remaining)
-        lookahead = max(0.5, min(1.2, 0.55 + 0.2 * max(v, 0.0)))
-        curvature = 2.0 * math.sin(heading_error) / lookahead
+        speed_mag = min(speed_limit * (0.25 + 0.75 * alignment * alignment), 1.5 * remaining)
+        v = direction * speed_mag
+        lookahead = max(0.5, min(1.2, 0.55 + 0.2 * abs(v)))
+        curvature = direction * 2.0 * math.sin(heading_error) / lookahead
         desired_delta = math.atan(car_wheelbase * curvature)
         desired_delta = min(max(desired_delta, steering_min), steering_max)
         delta_dot = 5.0 * (desired_delta - x[3 + num_trailers])
@@ -788,14 +816,37 @@ def _nominal_controls_to_goal_nb(x0, goal, H, dt, car_wheelbase, trailer_link_le
         dx = goal[0] - x[0]
         dy = goal[1] - x[1]
         dist = math.sqrt(dx * dx + dy * dy)
-        desired = math.atan2(dy, dx)
-        err = _wrap_angle_nb(desired - x[2])
-        v = min(v_max * max(0.0, math.cos(err)) ** 2, 1.5 * dist)
-        desired_delta = math.atan(2.0 * car_wheelbase * math.sin(err) / max(dist, 0.35))
-        desired_delta = min(max(desired_delta, steering_min), steering_max)
-        rate = 4.0 * (desired_delta - x[3 + num_trailers])
-        U[t, 0] = v
-        U[t, 1] = min(max(rate, steering_rate_min), steering_rate_max)
+        if dist <= 1e-9:
+            U[t, 0] = 0.0
+            U[t, 1] = 0.0
+        else:
+            desired = math.atan2(dy, dx)
+            forward_error = _wrap_angle_nb(desired - x[2])
+            reverse_error = _wrap_angle_nb(desired + math.pi - x[2])
+
+            direction = 1.0
+            speed_limit = v_max
+            err = forward_error
+            if v_min < 0.0 and abs(reverse_error) < abs(forward_error):
+                # The old controller used max(0, cos(err))^2.  Once the goal
+                # entered the rear half-plane this made v exactly zero.  Since
+                # heading cannot change at v=0, that created a permanent
+                # near-goal deadlock.  Reverse toward the target instead.
+                direction = -1.0
+                speed_limit = min(v_max, -v_min)
+                err = reverse_error
+
+            alignment = max(0.0, math.cos(err))
+            speed_mag = min(speed_limit * (0.20 + 0.80 * alignment * alignment), 1.5 * dist)
+            v = direction * speed_mag
+            desired_delta = math.atan(
+                direction * 2.0 * car_wheelbase * math.sin(err) / max(dist, 0.35)
+            )
+            desired_delta = min(max(desired_delta, steering_min), steering_max)
+            rate = 4.0 * (desired_delta - x[3 + num_trailers])
+            U[t, 0] = v
+            U[t, 1] = min(max(rate, steering_rate_min), steering_rate_max)
+
         x = _car_trailer_step_nb(
             x, U[t], dt, car_wheelbase, trailer_link_length, num_trailers,
             steering_min, steering_max, v_min, v_max,

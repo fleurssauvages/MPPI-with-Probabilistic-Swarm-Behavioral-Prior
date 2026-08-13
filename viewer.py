@@ -89,6 +89,11 @@ def obstacle_layout_key(vertices_list: list[np.ndarray]) -> tuple[tuple[float, .
     """Stable cache key for an interactively edited obstacle layout."""
     return tuple(tuple(np.round(np.asarray(vertices, dtype=float).ravel(), 6)) for vertices in vertices_list)
 
+
+def state_layout_key(value: np.ndarray) -> tuple[float, ...]:
+    """Stable cache key for an interactively edited start or goal state."""
+    return tuple(np.round(np.asarray(value, dtype=float).ravel(), 6))
+
 class InteractiveMPPIViewer:
 
     def __init__(self, root: tk.Tk) -> None:
@@ -118,9 +123,13 @@ class InteractiveMPPIViewer:
         self._saved_trajectories: list[dict[str, Any]] = []
         self._edit_scene: Any = None
         self._editable_obstacle_vertices: list[np.ndarray] = []
+        self._editable_start = np.empty(0, dtype=float)
+        self._editable_goal = np.empty(0, dtype=float)
         self._drag_obstacle_index: Optional[int] = None
+        self._drag_point_kind: Optional[str] = None
         self._drag_anchor: Optional[np.ndarray] = None
         self._drag_original_vertices: Optional[np.ndarray] = None
+        self._drag_original_point: Optional[np.ndarray] = None
         self._reset_editable_obstacles(redraw=False)
         self._build_ui()
         self.poll_after_id = self.root.after(100, self._poll_worker)
@@ -193,9 +202,9 @@ class InteractiveMPPIViewer:
         self.save_trajectory_button.grid(row=2, column=0, sticky='ew', padx=(0, 3), pady=(6, 0))
         self.reset_trajectories_button = ttk.Button(buttons, text='Reset trajectories', command=self.reset_trajectories)
         self.reset_trajectories_button.grid(row=2, column=1, sticky='ew', padx=(3, 0), pady=(6, 0))
-        self.edit_obstacles_button = ttk.Button(buttons, text='Edit obstacles', command=self.edit_obstacles)
+        self.edit_obstacles_button = ttk.Button(buttons, text='Edit scene', command=self.edit_obstacles)
         self.edit_obstacles_button.grid(row=3, column=0, sticky='ew', padx=(0, 3), pady=(6, 0))
-        self.reset_obstacles_button = ttk.Button(buttons, text='Reset obstacles', command=self.reset_obstacles)
+        self.reset_obstacles_button = ttk.Button(buttons, text='Reset scene', command=self.reset_obstacles)
         self.reset_obstacles_button.grid(row=3, column=1, sticky='ew', padx=(3, 0), pady=(6, 0))
         row += 1
         ttk.Separator(controls).grid(row=row, column=0, sticky='ew', pady=10)
@@ -310,11 +319,11 @@ class InteractiveMPPIViewer:
             self.ax.set_xlim(xmin, xmax)
             self.ax.set_ylim(ymin, ymax)
             self._draw_obstacles(self._editable_obstacle_vertices)
-            start = np.asarray(self._edit_scene.start, dtype=float)
-            goal = np.asarray(self._edit_scene.goal, dtype=float)
+            start = self._editable_start
+            goal = self._editable_goal
             self.ax.scatter([start[0]], [start[1]], s=65, marker='o', color='#2ca02c', zorder=9)
             self.ax.scatter([goal[0]], [goal[1]], s=140, marker='*', color='#d62728', zorder=9)
-            self.ax.set_title('Drag obstacles to reposition them, then run the selected case')
+            self.ax.set_title('Drag obstacles, start, or goal, then run the selected case')
         self.ax.set_aspect('equal', adjustable='box')
         self.ax.grid(True, alpha=0.2)
         self.ax.set_xlabel('x')
@@ -324,16 +333,20 @@ class InteractiveMPPIViewer:
     def _reset_editable_obstacles(self, *, redraw: bool=True) -> None:
         self._edit_scene = self.module.build_default_scene()
         self._editable_obstacle_vertices = [polygon_vertices(obstacle).copy() for obstacle in self._edit_scene.obstacles]
+        self._editable_start = np.asarray(self._edit_scene.start, dtype=float).copy()
+        self._editable_goal = np.asarray(self._edit_scene.goal, dtype=float).copy()
         self._drag_obstacle_index = None
+        self._drag_point_kind = None
         self._drag_anchor = None
         self._drag_original_vertices = None
+        self._drag_original_point = None
         self.mode_cache.clear()
         if redraw and hasattr(self, 'ax'):
             self._draw_empty()
 
     def edit_obstacles(self) -> None:
         if self.worker is not None and self.worker.is_alive():
-            messagebox.showinfo('Simulation running', 'Wait for the current simulation before editing obstacles.')
+            messagebox.showinfo('Simulation running', 'Wait for the current simulation before editing the scene.')
             return
         self._stop_animation()
         self.bundle = None
@@ -348,60 +361,108 @@ class InteractiveMPPIViewer:
         self.save_trajectory_button.configure(state='disabled')
         self.frame_scale.configure(from_=0, to=0, state='disabled')
         self.frame_label_var.set('Frame 0 / 0')
-        self.status_var.set('Obstacle editing enabled. Drag a polygon and press Run selected case.')
+        self.status_var.set('Scene editing enabled. Drag an obstacle, the start circle, or the goal star, then press Run selected case.')
         self._draw_empty()
 
     def reset_obstacles(self) -> None:
         if self.worker is not None and self.worker.is_alive():
-            messagebox.showinfo('Simulation running', 'Wait for the current simulation before resetting obstacles.')
+            messagebox.showinfo('Simulation running', 'Wait for the current simulation before resetting the scene.')
             return
         self.edit_obstacles()
         self._reset_editable_obstacles(redraw=True)
-        self.status_var.set('Obstacle layout reset. Drag a polygon or run the selected case.')
+        self.status_var.set('Scene reset. Drag an obstacle, start, or goal, or run the selected case.')
 
     def _obstacle_editing_enabled(self) -> bool:
         return self.bundle is None and not (self.worker is not None and self.worker.is_alive())
+
+    def _plot_point_hit(self, event: Any, point: np.ndarray, radius_px: float) -> bool:
+        """Return True when a mouse event lands near a data point in screen space."""
+        if event.x is None or event.y is None or point.size < 2:
+            return False
+        display = self.ax.transData.transform(np.asarray(point[:2], dtype=float))
+        return math.hypot(float(event.x) - float(display[0]), float(event.y) - float(display[1])) <= radius_px
 
     def _on_plot_press(self, event: Any) -> None:
         if not self._obstacle_editing_enabled() or event.inaxes is not self.ax or event.button != 1:
             return
         if event.xdata is None or event.ydata is None:
             return
-        point = (float(event.xdata), float(event.ydata))
+        point = np.asarray([float(event.xdata), float(event.ydata)], dtype=float)
+
+        # Give start/goal markers priority over polygons if they overlap.
+        if self._plot_point_hit(event, self._editable_start, 14.0):
+            self._drag_point_kind = 'start'
+            self._drag_anchor = point
+            self._drag_original_point = self._editable_start.copy()
+            self.status_var.set('Dragging start. Release to place it.')
+            return
+        if self._plot_point_hit(event, self._editable_goal, 18.0):
+            self._drag_point_kind = 'goal'
+            self._drag_anchor = point
+            self._drag_original_point = self._editable_goal.copy()
+            self.status_var.set('Dragging goal. Release to place it.')
+            return
+
+        point_tuple = (float(point[0]), float(point[1]))
         for index in range(len(self._editable_obstacle_vertices) - 1, -1, -1):
             vertices = self._editable_obstacle_vertices[index]
-            if MplPath(vertices, closed=True).contains_point(point, radius=0.03):
+            if MplPath(vertices, closed=True).contains_point(point_tuple, radius=0.03):
                 self._drag_obstacle_index = index
-                self._drag_anchor = np.asarray(point, dtype=float)
+                self._drag_anchor = point
                 self._drag_original_vertices = vertices.copy()
                 self.status_var.set(f'Dragging obstacle {index}. Release to place it.')
                 return
 
     def _on_plot_motion(self, event: Any) -> None:
-        if self._drag_obstacle_index is None or self._drag_anchor is None or self._drag_original_vertices is None:
+        if self._drag_anchor is None:
             return
         if event.inaxes is not self.ax or event.xdata is None or event.ydata is None:
             return
-        delta = np.asarray([float(event.xdata), float(event.ydata)], dtype=float) - self._drag_anchor
-        original = self._drag_original_vertices
+
+        current = np.asarray([float(event.xdata), float(event.ydata)], dtype=float)
         if self._edit_scene is not None:
             xmin, xmax, ymin, ymax = normalized_bounds(self._edit_scene.bounds_xy)
-            delta[0] = float(np.clip(delta[0], xmin - np.min(original[:, 0]), xmax - np.max(original[:, 0])))
-            delta[1] = float(np.clip(delta[1], ymin - np.min(original[:, 1]), ymax - np.max(original[:, 1])))
+        else:
+            xmin, xmax, ymin, ymax = (-np.inf, np.inf, -np.inf, np.inf)
+
+        if self._drag_point_kind is not None and self._drag_original_point is not None:
+            edited = self._drag_original_point.copy()
+            edited[0] = float(np.clip(current[0], xmin, xmax))
+            edited[1] = float(np.clip(current[1], ymin, ymax))
+            if self._drag_point_kind == 'start':
+                self._editable_start = edited
+            else:
+                self._editable_goal = edited
+            self._draw_empty()
+            return
+
+        if self._drag_obstacle_index is None or self._drag_original_vertices is None:
+            return
+        delta = current - self._drag_anchor
+        original = self._drag_original_vertices
+        delta[0] = float(np.clip(delta[0], xmin - np.min(original[:, 0]), xmax - np.max(original[:, 0])))
+        delta[1] = float(np.clip(delta[1], ymin - np.min(original[:, 1]), ymax - np.max(original[:, 1])))
         self._editable_obstacle_vertices[self._drag_obstacle_index] = original + delta
         self._draw_empty()
 
     def _on_plot_release(self, event: Any) -> None:
-        if self._drag_obstacle_index is None:
+        moved_point = self._drag_point_kind
+        moved_obstacle = self._drag_obstacle_index
+        if moved_point is None and moved_obstacle is None:
             return
-        index = self._drag_obstacle_index
+
         self._drag_obstacle_index = None
+        self._drag_point_kind = None
         self._drag_anchor = None
         self._drag_original_vertices = None
+        self._drag_original_point = None
         self.mode_cache.clear()
         self._obstacle_cache.clear()
         self._circle_cache.clear()
-        self.status_var.set(f'Obstacle {index} moved. Press Run selected case to recompute the prior and controller trajectory.')
+        if moved_point is not None:
+            self.status_var.set(f'{moved_point.capitalize()} moved. Press Run selected case to recompute the prior and controller trajectory.')
+        else:
+            self.status_var.set(f'Obstacle {moved_obstacle} moved. Press Run selected case to recompute the prior and controller trajectory.')
         self._draw_empty()
 
     def _get_module(self) -> Any:
@@ -452,7 +513,17 @@ class InteractiveMPPIViewer:
         self.reset_obstacles_button.configure(state='disabled')
         self.frame_scale.configure(state='disabled')
         self.status_var.set('Loading controller and generating the trajectory prior. The first construction can take several minutes due to the Numba routines.')
-        settings = {'condition': condition, 'scenario_id': scenario_id, 'variant_value': variant_value, 'seed': seed, 'swarm_seed': swarm_seed, 'rollouts': rollouts, 'obstacle_vertices': [vertices.copy() for vertices in self._editable_obstacle_vertices]}
+        settings = {
+            'condition': condition,
+            'scenario_id': scenario_id,
+            'variant_value': variant_value,
+            'seed': seed,
+            'swarm_seed': swarm_seed,
+            'rollouts': rollouts,
+            'obstacle_vertices': [vertices.copy() for vertices in self._editable_obstacle_vertices],
+            'start': self._editable_start.copy(),
+            'goal': self._editable_goal.copy(),
+        }
         self.worker = threading.Thread(target=self._simulation_worker, args=(settings,), daemon=True)
         self.worker.start()
 
@@ -463,7 +534,7 @@ class InteractiveMPPIViewer:
         except Exception:
             self.worker_queue.put(('error', traceback.format_exc()))
 
-    def _prepare_and_run_trial(self, *, condition: str, scenario_id: str, variant_value: str, seed: int, swarm_seed: int, rollouts: int, obstacle_vertices: list[np.ndarray]) -> TrialBundle:
+    def _prepare_and_run_trial(self, *, condition: str, scenario_id: str, variant_value: str, seed: int, swarm_seed: int, rollouts: int, obstacle_vertices: list[np.ndarray], start: np.ndarray, goal: np.ndarray) -> TrialBundle:
         module = self._get_module()
         cfg = make_protocol_config(module, rollouts)
         scene = module.build_default_scene()
@@ -471,7 +542,13 @@ class InteractiveMPPIViewer:
         if len(obstacle_vertices) != len(templates):
             raise ValueError('Edited obstacle layout does not match the current scene.')
         default_obstacles = [obstacle_from_vertices(template, vertices) for template, vertices in zip(templates, obstacle_vertices)]
-        scene = replace(scene, obstacles=tuple(default_obstacles))
+        edited_start = np.asarray(start, dtype=float).copy()
+        edited_goal = np.asarray(goal, dtype=float).copy()
+        if edited_start.shape != np.asarray(scene.start).shape:
+            raise ValueError('Edited start state shape does not match the current scene.')
+        if edited_goal.shape != np.asarray(scene.goal).shape:
+            raise ValueError('Edited goal state shape does not match the current scene.')
+        scene = replace(scene, obstacles=tuple(default_obstacles), start=edited_start, goal=edited_goal)
         layout_key = obstacle_layout_key(obstacle_vertices)
         scenarios = {scenario.scenario_id: scenario for scenario in module.default_dynamic_wall_scenarios()}
         if scenario_id not in scenarios:
@@ -480,7 +557,7 @@ class InteractiveMPPIViewer:
         scenario = scenarios[scenario_id]
         fixed_centers = tuple((module.obstacle_center(obs).copy() for obs in scene.obstacles))
         blocker = module.make_wall_blockers_between_centers(centers=fixed_centers, pairs=scenario.wall_pairs, width=scenario.wall_width, extension=scenario.wall_extension)
-        prior_key = ('base', swarm_seed, layout_key)
+        prior_key = ('base', swarm_seed, layout_key, state_layout_key(scene.start), state_layout_key(scene.goal))
         if prior_key not in self.mode_cache:
             self.mode_cache[prior_key] = module.build_homotopy_modes(
                 scene,
@@ -512,7 +589,7 @@ class InteractiveMPPIViewer:
         except ValueError as exc:
             raise ValueError(f'The selected module does not implement {variant_value!r}.') from exc
         self._warm_numba_for_case(module=module, variant=variant, variant_value=variant_value, modes=modes, base_obstacles=base_obstacles, runtime_blocker=runtime_blocker, scene=scene, trigger_progress=trigger_progress, blocker_from_start=blocker_from_start, cfg=cfg, seed=seed)
-        result = module.run_controller(variant, modes, base_obstacles, runtime_blocker, scene, seed=seed, trigger_progress=trigger_progress, blocker_active_from_start=blocker_from_start, max_steps=250, cfg=cfg, record=True)
+        result = module.run_controller(variant, modes, base_obstacles, runtime_blocker, scene, seed=seed, trigger_progress=trigger_progress, blocker_active_from_start=blocker_from_start, max_steps=200, cfg=cfg, record=True)
         return TrialBundle(module=module, condition=condition, scenario_id=scenario_id, variant_value=variant_value, cfg=cfg, result=result, modes=modes, start=scene.start.copy(), goal=scene.goal.copy(), bounds_xy=scene.bounds_xy, base_obstacles=list(base_obstacles), blocker=list(runtime_blocker), controller_seed=seed, swarm_seed=swarm_seed)
 
     def _poll_worker(self) -> None:
@@ -855,8 +932,10 @@ class InteractiveMPPIViewer:
             except Exception:
                 circles = []
             self._circle_cache[key] = circles
+        cfg = self.bundle.cfg
+        collision_radius = float(getattr(cfg, 'total_drone_radius', cfg.robot_radius))
         for center, radius in circles:
-            self.ax.add_patch(Circle(np.asarray(center)[:2], float(radius) + float(self.bundle.cfg.robot_radius), fill=False, edgecolor='#e377c2', linewidth=0.75, linestyle=':', alpha=0.45, zorder=4))
+            self.ax.add_patch(Circle(np.asarray(center)[:2], float(radius) + collision_radius, fill=False, edgecolor='#e377c2', linewidth=0.75, linestyle=':', alpha=0.45, zorder=4))
 
     def _selected_rollout_mode_index(self, frame: int) -> Optional[int]:
         """Return the global mode that produced the displayed best rollout."""
@@ -1057,12 +1136,16 @@ class InteractiveMPPIViewer:
             if state.size < 6:
                 raise ValueError('Planar quadrotor state must contain [x, y, vx, vy, theta, omega].')
             x, y, _, _, theta, _ = map(float, state[:6])
-            arm = 0.30
+            cfg = self.bundle.cfg
+            total_radius = float(cfg.total_drone_radius)
+            rotor_radius = float(cfg.rotor_radius)
+            body_radius = float(cfg.body_radius)
+            arm = max(0.0, total_radius - rotor_radius)
             endpoints = self._transform_vehicle_points(np.asarray([[-arm, 0.0], [arm, 0.0]]), (x, y), theta)
             self.ax.plot(endpoints[:, 0], endpoints[:, 1], color='black', linewidth=2.0, zorder=13)
-            self.ax.add_patch(Circle((x, y), radius=0.08, facecolor='#17becf', edgecolor='black', linewidth=1.0, zorder=14))
+            self.ax.add_patch(Circle((x, y), radius=body_radius, facecolor='#17becf', edgecolor='black', linewidth=1.0, zorder=14))
             for point in endpoints:
-                self.ax.add_patch(Circle((float(point[0]), float(point[1])), radius=0.07, fill=False, edgecolor='black', linewidth=1.2, zorder=14))
+                self.ax.add_patch(Circle((float(point[0]), float(point[1])), radius=rotor_radius, fill=False, edgecolor='black', linewidth=1.2, zorder=14))
             thrust_dir = self._transform_vehicle_points(np.asarray([[0.0, 0.0], [0.0, 0.34]]), (x, y), theta)
             self.ax.plot(thrust_dir[:, 0], thrust_dir[:, 1], color='#17becf', linewidth=1.4, zorder=13)
             return

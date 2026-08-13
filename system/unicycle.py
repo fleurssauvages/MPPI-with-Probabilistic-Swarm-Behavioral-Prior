@@ -48,7 +48,7 @@ class MPPIConfig(ctrl.ControllerConfig):
 
     max_delta_v: float = 0.7
     max_delta_omega: float = 1.4
-    enforce_one_step_safety: bool = True
+    enforce_one_step_safety: bool = False
     one_step_safety_clearance: float = 0.0
 
 

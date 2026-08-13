@@ -71,7 +71,7 @@ class MPPIConfig(ctrl.ControllerConfig):
 
     max_delta_accel: float = 1.2
     max_delta_steering_rate: float = 5.2
-    enforce_one_step_safety: bool = True
+    enforce_one_step_safety: bool = False
     one_step_safety_clearance: float = 0.0
 
     @property
