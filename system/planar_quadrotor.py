@@ -34,11 +34,8 @@ class MPPIConfig(ctrl.ControllerConfig):
     drag_x: float = 0.3
     drag_y: float = 0.3
     thrust_factor: float = 3.8281e-5
-    rotor_arm: float = 0.175
 
-    # Planar collision/display geometry.  The total drone radius is the
-    # center-to-outer-rotor extent and is the single source of truth for
-    # obstacle inflation, collision checks, clearance, and viewer drawing.
+    rotor_arm: float = 0.3
     rotor_radius: float = 0.07
     body_radius: float = 0.08
 
