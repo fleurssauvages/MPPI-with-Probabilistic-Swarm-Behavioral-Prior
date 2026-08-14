@@ -23,18 +23,17 @@ ACKERMAN_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standa
 PLANAR_QUADROTOR_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 PLANAR_QUADROTOR_PAYLOAD_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 MODEL_OPTIONS = {
-    'Ackermann': ('ackerman', ackermann, ACKERMAN_VARIANTS),
     'Unicycle': ('unicycle', unicycle, UNICYCLE_VARIANTS),
+    'Ackermann': ('ackerman', ackermann, ACKERMAN_VARIANTS),
     'Planar quadrotor': ('planar_quadrotor', planar_quadrotor, PLANAR_QUADROTOR_VARIANTS),
     'Planar quadrotor + hanging package': ('planar_quadrotor_payload', planar_quadrotor_payload, PLANAR_QUADROTOR_PAYLOAD_VARIANTS),
 }
 VARIANTS = list(ACKERMAN_VARIANTS)
 CONDITIONS = [('No wall', 'no_wall'), ('Static wall', 'static_wall'), ('Dynamic wall', 'dynamic_wall')]
-SCENARIOS = [('Wall 0-1', 'wall_0_1'), ('Wall 1-2', 'wall_1_2'), ('Walls 0-1 and 1-2', 'walls_0_1__1_2')]
+DEFAULT_WALL_SCENARIO = 'walls_0_1__1_2'
 DISPLAY_TO_VARIANT = dict(VARIANTS)
 VARIANT_TO_DISPLAY = {value: label for label, value in VARIANTS}
 DISPLAY_TO_CONDITION = dict(CONDITIONS)
-DISPLAY_TO_SCENARIO = dict(SCENARIOS)
 
 @dataclass
 class TrialBundle:
@@ -166,10 +165,9 @@ class InteractiveMPPIViewer:
         self.model_var = tk.StringVar(value='Ackermann')
         self.variant_var = tk.StringVar(value='SPG prior')
         self.condition_var = tk.StringVar(value='No wall')
-        self.scenario_var = tk.StringVar(value='Walls 0-1 and 1-2')
         self.seed_var = tk.StringVar(value='1')
-        self.swarm_seed_var = tk.StringVar(value='5')
-        self.rollouts_var = tk.StringVar(value='512')
+        self.swarm_seed_var = tk.StringVar(value='1')
+        self.rollouts_var = tk.StringVar(value='1024')
         self.speed_var = tk.StringVar(value='4.0')
         self.show_collision_var = tk.BooleanVar(value=False)
         self.show_all_modes_var = tk.BooleanVar(value=False)
@@ -180,7 +178,6 @@ class InteractiveMPPIViewer:
         self.model_var._combo_widget.bind('<<ComboboxSelected>>', self._on_model_changed)
         row = self._add_combo(controls, row, 'Controller variant', self.variant_var, [label for label, _ in VARIANTS])
         row = self._add_combo(controls, row, 'Condition', self.condition_var, [label for label, _ in CONDITIONS])
-        row = self._add_combo(controls, row, 'Wall scenario', self.scenario_var, [label for label, _ in SCENARIOS])
         row = self._add_entry(controls, row, 'Controller seed', self.seed_var)
         row = self._add_entry(controls, row, 'Swarm seed', self.swarm_seed_var)
         row = self._add_entry(controls, row, 'Rollouts per step', self.rollouts_var)
@@ -229,8 +226,6 @@ class InteractiveMPPIViewer:
         )
         self.status_label.grid(row=row, column=0, sticky='nsew', pady=(4, 0))
         controls.rowconfigure(row, weight=1)
-        self.condition_var.trace_add('write', lambda *_: self._update_condition_controls())
-        self._update_condition_controls()
         self.figure = Figure(figsize=(10, 8))
         self.ax = self.figure.add_subplot(111)
         self.figure.subplots_adjust(left=0.07, right=0.98, bottom=0.07, top=0.93)
@@ -302,11 +297,6 @@ class InteractiveMPPIViewer:
         self.status_var.set(f'Loaded {self.model_var.get()} model')
         self.root.title(f'Interactive MPPI viewer - {self.model_var.get()}')
         self._draw_empty()
-
-    def _update_condition_controls(self) -> None:
-        combo = getattr(self.scenario_var, '_combo_widget', None)
-        if combo is not None:
-            combo.configure(state='disabled' if self.condition_var.get() == 'No wall' else 'readonly')
 
     def _draw_empty(self) -> None:
         self.ax.clear()
@@ -501,7 +491,7 @@ class InteractiveMPPIViewer:
             messagebox.showerror('Invalid settings', str(exc))
             return
         condition = DISPLAY_TO_CONDITION[self.condition_var.get()]
-        scenario_id = DISPLAY_TO_SCENARIO[self.scenario_var.get()]
+        scenario_id = DEFAULT_WALL_SCENARIO
         variant_value = DISPLAY_TO_VARIANT[self.variant_var.get()]
         self._stop_animation()
         self.bundle = None

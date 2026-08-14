@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import math
+import os
 import pickle
 import time
+from concurrent.futures import ThreadPoolExecutor
+from threading import Lock
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -10,12 +13,20 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from numba import njit
+    from numba import njit, prange
 except Exception:
     njit = None
+    prange = range
 
 Array = np.ndarray
 NUMBA_AVAILABLE = njit is not None
+
+# iLQR mode solves are independent and the Numba entry kernels release the GIL.
+# Keep one persistent pool to avoid per-control-step thread creation overhead.
+_ILQR_MAX_WORKERS = max(1, min(8, int(os.cpu_count() or 1)))
+_ILQR_EXECUTOR = ThreadPoolExecutor(max_workers=_ILQR_MAX_WORKERS, thread_name_prefix="ilqr")
+_ILQR_WARM_KEYS: set[tuple[str, bool]] = set()
+_ILQR_WARM_LOCK = Lock()
 
 
 class ControllerVariant(str, Enum):
@@ -54,10 +65,8 @@ class ControllerConfig:
 
     w_goal: float = 10.0
     w_obstacle: float = 50.0
-    w_control: float = 0.0
-    w_control_smooth: float = 0.0
-    w_terminal_position: float = 1000.0
-    w_terminal_velocity: float = 1000.0
+    w_terminal_position: float = 100.0
+    w_terminal_velocity: float = 100.0
     terminal_velocity_tolerance: float = 0.1
     goal_tolerance: float = 0.1
 
@@ -144,6 +153,14 @@ class MPPIHomotopyMode:
     sample_paths: Optional[List[Array]] = None
     arc_length: Optional[Array] = None
     gaussian_variance: Optional[Array] = None
+
+
+@dataclass(frozen=True)
+class PackedModeBank:
+    """Dense mode geometry packed once for allocation-free Numba localization."""
+    mean_paths: Array
+    arc_lengths: Array
+    lengths: Array
 
 
 @dataclass(frozen=True)
@@ -283,6 +300,28 @@ def _ensure_mode_prior_cache(mode: MPPIHomotopyMode) -> MPPIHomotopyMode:
     if mode.arc_length is None or mode.gaussian_variance is None:
         return prepare_mode_prior_cache(mode)
     return mode
+
+
+def pack_mode_bank(modes: Sequence[MPPIHomotopyMode]) -> PackedModeBank:
+    """Pack mean paths and arc lengths once for repeated controller localization."""
+    if not modes:
+        return PackedModeBank(
+            np.zeros((0, 0, 2), dtype=np.float64),
+            np.zeros((0, 0), dtype=np.float64),
+            np.zeros(0, dtype=np.int64),
+        )
+    cached = [_ensure_mode_prior_cache(mode) for mode in modes]
+    lengths = np.asarray([len(mode.mean_path) for mode in cached], dtype=np.int64)
+    max_len = int(np.max(lengths)) if lengths.size else 0
+    paths = np.zeros((len(cached), max_len, 2), dtype=np.float64)
+    arcs = np.zeros((len(cached), max_len), dtype=np.float64)
+    for i, mode in enumerate(cached):
+        n = int(lengths[i])
+        if n <= 0:
+            continue
+        paths[i, :n] = np.asarray(mode.mean_path, dtype=np.float64)[:, :2]
+        arcs[i, :n] = np.asarray(mode.arc_length, dtype=np.float64)[:n]
+    return PackedModeBank(np.ascontiguousarray(paths), np.ascontiguousarray(arcs), np.ascontiguousarray(lengths))
 
 
 def _planner_symbols() -> tuple[Any, Any, Any, Any, Any, Any]:
@@ -435,9 +474,9 @@ def localize_mode_for_state_with_index(
     end = int(np.searchsorted(arc, preview_end, side="left"))
     end = min(max(end, index + 1), len(mean_path) - 1)
 
-    local_mean = np.ascontiguousarray(mean_path[index : end + 1].copy())
-    local_cov = np.ascontiguousarray(np.asarray(mode.cov_blocks, dtype=np.float64)[index : end + 1].copy())
-    local_gaussian = np.ascontiguousarray(np.asarray(mode.gaussian_variance, dtype=np.float64)[index : end + 1].copy())
+    local_mean = np.ascontiguousarray(mean_path[index : end + 1])
+    local_cov = np.ascontiguousarray(np.asarray(mode.cov_blocks, dtype=np.float64)[index : end + 1])
+    local_gaussian = np.ascontiguousarray(np.asarray(mode.gaussian_variance, dtype=np.float64)[index : end + 1])
     local_arc = np.ascontiguousarray(arc[index : end + 1] - s0)
 
     return (
@@ -738,6 +777,129 @@ else:
     _geometric_mean_path_clearance_nb = None
 
 
+if njit is not None:
+    @njit(cache=True)
+    def _geometric_mean_path_clearance_range_nb(path, start, end, polygons_padded, polygon_lengths):
+        if end < start or polygon_lengths.shape[0] == 0:
+            return 1e18
+        best = 1e18
+        for m in range(polygon_lengths.shape[0]):
+            n = int(polygon_lengths[m])
+            if n < 2:
+                continue
+            poly = polygons_padded[m]
+            for i in range(start, end + 1):
+                if _point_in_polygon_padded_nb(path[i, 0], path[i, 1], poly, n):
+                    return -1e-9
+            for i in range(start, end):
+                ax = path[i, 0]; ay = path[i, 1]
+                bx = path[i + 1, 0]; by = path[i + 1, 1]
+                for j in range(n):
+                    k = j + 1
+                    if k == n:
+                        k = 0
+                    if _segments_intersect_geometric_nb(
+                        ax, ay, bx, by, poly[j, 0], poly[j, 1], poly[k, 0], poly[k, 1]
+                    ):
+                        return -1e-9
+            for i in range(start, end + 1):
+                px = path[i, 0]; py = path[i, 1]
+                for j in range(n):
+                    k = j + 1
+                    if k == n:
+                        k = 0
+                    distance = _point_segment_distance_geometric_nb(
+                        px, py, poly[j, 0], poly[j, 1], poly[k, 0], poly[k, 1]
+                    )
+                    if distance < best:
+                        best = distance
+        return best
+
+    @njit(cache=True, parallel=True)
+    def _localize_mode_bank_nb(mean_paths, arc_lengths, lengths, px, py, recent_positions, H, ds,
+                               polygons_padded, polygon_lengths, compute_clearance):
+        M = lengths.shape[0]
+        starts = np.zeros(M, dtype=np.int64)
+        ends = np.zeros(M, dtype=np.int64)
+        distances = np.empty(M, dtype=np.float64)
+        clearances = np.empty(M, dtype=np.float64)
+        preview_span = max(0, H - 1) * ds
+        for m in prange(M):
+            n = int(lengths[m])
+            if n < 2:
+                starts[m] = 0
+                ends[m] = max(0, n - 1)
+                distances[m] = math.inf
+                clearances[m] = math.inf
+                continue
+            best_d2 = math.inf
+            nearest = 0
+            for i in range(n):
+                dx = mean_paths[m, i, 0] - px
+                dy = mean_paths[m, i, 1] - py
+                d2 = dx * dx + dy * dy
+                if d2 < best_d2:
+                    best_d2 = d2
+                    nearest = i
+            start = min(nearest, n - 2)
+            s0 = arc_lengths[m, start]
+            preview_end = min(s0 + preview_span, arc_lengths[m, n - 1])
+            end = start + 1
+            while end < n - 1 and arc_lengths[m, end] < preview_end:
+                end += 1
+            starts[m] = start
+            ends[m] = end
+
+            local_best = math.inf
+            for i in range(start, end + 1):
+                dx = mean_paths[m, i, 0] - px
+                dy = mean_paths[m, i, 1] - py
+                d2 = dx * dx + dy * dy
+                if d2 < local_best:
+                    local_best = d2
+            centerline_distance = math.sqrt(local_best)
+            for h in range(recent_positions.shape[0]):
+                hist_best = math.inf
+                hx = recent_positions[h, 0]
+                hy = recent_positions[h, 1]
+                for i in range(n):
+                    dx = mean_paths[m, i, 0] - hx
+                    dy = mean_paths[m, i, 1] - hy
+                    d2 = dx * dx + dy * dy
+                    if d2 < hist_best:
+                        hist_best = d2
+                hd = math.sqrt(hist_best)
+                if hd > centerline_distance:
+                    centerline_distance = hd
+            distances[m] = centerline_distance
+            if compute_clearance:
+                clearances[m] = _geometric_mean_path_clearance_range_nb(
+                    mean_paths[m], start, end, polygons_padded, polygon_lengths
+                )
+            else:
+                clearances[m] = math.inf
+        return starts, ends, distances, clearances
+
+    @njit(cache=True, parallel=True)
+    def _mode_nearest_distances_nb(mean_paths, lengths, px, py):
+        M = lengths.shape[0]
+        distances = np.empty(M, dtype=np.float64)
+        for m in prange(M):
+            n = int(lengths[m])
+            best = math.inf
+            for i in range(n):
+                dx = mean_paths[m, i, 0] - px
+                dy = mean_paths[m, i, 1] - py
+                d2 = dx * dx + dy * dy
+                if d2 < best:
+                    best = d2
+            distances[m] = math.sqrt(best)
+        return distances
+else:
+    _localize_mode_bank_nb = None
+    _mode_nearest_distances_nb = None
+
+
 def geometric_mean_path_clearance_packed(path: Array, polygons_padded: Array, polygon_lengths: Array) -> float:
     p = np.ascontiguousarray(np.asarray(path, dtype=np.float64))
     if p.ndim != 2 or p.shape[0] == 0 or polygon_lengths.size == 0:
@@ -969,7 +1131,8 @@ def make_temporally_correlated_noise(
         scale = np.asarray(scale_override, dtype=np.float64)
     if scale.shape != (2,):
         raise ValueError("model.control_noise_scale(cfg) must return shape (2,).")
-    noise = rng.normal(size=(n, H, 2)) * scale[None, None, :]
+    noise = rng.normal(size=(n, H, 2))
+    noise *= scale[None, None, :]
     alpha = float(cfg.temporal_noise_smoothing)
     if _temporal_smooth_noise_nb is not None:
         return _temporal_smooth_noise_nb(noise, alpha)
@@ -988,10 +1151,10 @@ def sample_controls_around_nominal(
     if n <= 0:
         return np.zeros((0, cfg.horizon, 2), dtype=np.float64)
     center = np.asarray(nominal, dtype=np.float64)
-    controls = np.repeat(center[None, :, :], n, axis=0)
-    noise = make_temporally_correlated_noise(model, n, cfg.horizon, cfg, rng)
-    controls += noise
-    return model.clip_control_batch(controls, cfg)
+    controls = make_temporally_correlated_noise(model, n, cfg.horizon, cfg, rng)
+    controls += center[None, :, :]
+    clip_inplace = getattr(model, "clip_control_batch_inplace", None)
+    return clip_inplace(controls, cfg) if clip_inplace is not None else model.clip_control_batch(controls, cfg)
 
 
 def sample_exact_control_bank(
@@ -1041,10 +1204,17 @@ def sample_exact_control_bank(
         )
         localized.append(local_path)
 
-    candidate_array = np.asarray(
-        [model.nominal_controls_to_track_path(x_current, path, cfg) for path in localized],
-        dtype=np.float64,
-    )
+    if len(localized) <= 1 or _ILQR_MAX_WORKERS <= 1:
+        candidate_array = np.asarray(
+            [model.nominal_controls_to_track_path(x_current, path, cfg) for path in localized],
+            dtype=np.float64,
+        )
+    else:
+        futures = [
+            _ILQR_EXECUTOR.submit(model.nominal_controls_to_track_path, x_current, path, cfg)
+            for path in localized
+        ]
+        candidate_array = np.asarray([future.result() for future in futures], dtype=np.float64)
 
     controls = candidate_array[np.arange(n, dtype=np.int64) % selected_count].copy()
     return model.clip_control_batch(controls, cfg)
@@ -1057,13 +1227,7 @@ def nominal_controls_and_arc_positions(
     cfg: Any,
     cov_blocks: Optional[Array] = None,
 ) -> Tuple[Array, Array]:
-    """Compute a spatially covariance-conditioned iLQR nominal once.
-
-    ``cov_blocks`` is indexed by geometric path position, never by control time.
-    The model projects every predicted state onto ``path`` and interpolates the
-    covariance at that projected arc position.  The returned positions are the
-    physical progress of the optimized rollout and are reused by Gaussian/SPG.
-    """
+    """Compute one cold spatially covariance-conditioned iLQR nominal."""
     combined = getattr(model, "nominal_controls_and_arc_positions", None)
     if combined is not None:
         controls, positions = combined(x_current, path, cfg, cov_blocks)
@@ -1071,6 +1235,115 @@ def nominal_controls_and_arc_positions(
     controls = model.nominal_controls_to_track_path(x_current, path, cfg, cov_blocks)
     positions = model.prior_control_arc_positions(x_current, path, cfg, cov_blocks)
     return np.asarray(controls, dtype=np.float64), np.asarray(positions, dtype=np.float64)
+
+
+def _solve_mode_nominal_worker(model: Any, x_current: Array, mode: MPPIHomotopyMode, cfg: Any, need_jacobians: bool):
+    if need_jacobians:
+        combined = getattr(model, "nominal_controls_and_arc_positions_with_jacobians", None)
+        project = getattr(model, "project_control_covariances_from_jacobians", None)
+        if combined is not None and project is not None:
+            controls, positions, A, B = combined(
+                x_current, mode.mean_path, cfg, mode.cov_blocks, None
+            )
+            return (
+                np.asarray(controls, dtype=np.float64),
+                np.asarray(positions, dtype=np.float64),
+                np.asarray(A, dtype=np.float64),
+                np.asarray(B, dtype=np.float64),
+            )
+    controls, positions = nominal_controls_and_arc_positions(
+        model, x_current, mode.mean_path, cfg, mode.cov_blocks
+    )
+    return controls, positions, None, None
+
+
+def parallel_mode_nominals(
+    model: Any,
+    x_current: Array,
+    local_modes: Sequence[MPPIHomotopyMode],
+    cfg: Any,
+    *,
+    need_jacobians: bool = False,
+) -> List[Tuple[Array, Array, Optional[Array], Optional[Array]]]:
+    """Solve independent cold iLQR mode priors concurrently, preserving mode order."""
+    if not local_modes:
+        return []
+    if len(local_modes) == 1 or _ILQR_MAX_WORKERS <= 1:
+        return [_solve_mode_nominal_worker(model, x_current, local_modes[0], cfg, need_jacobians)]
+
+    # Do not send multiple threads into the same Numba dispatcher while its first
+    # specialization is compiling.  That can multiply cold-start compile work.
+    # Warm exactly one solve per model/path type, then use the persistent pool.
+    model_key = str(getattr(model, "MODEL_NAME", getattr(model, "__name__", type(model).__name__)))
+    warm_key = (model_key, bool(need_jacobians))
+    first_solution = None
+    with _ILQR_WARM_LOCK:
+        if warm_key not in _ILQR_WARM_KEYS:
+            first_solution = _solve_mode_nominal_worker(
+                model, x_current, local_modes[0], cfg, need_jacobians
+            )
+            _ILQR_WARM_KEYS.add(warm_key)
+
+    start_index = 1 if first_solution is not None else 0
+    futures = [
+        _ILQR_EXECUTOR.submit(_solve_mode_nominal_worker, model, x_current, mode, cfg, need_jacobians)
+        for mode in local_modes[start_index:]
+    ]
+    tail = [future.result() for future in futures]
+    return ([first_solution] + tail) if first_solution is not None else tail
+
+
+def _sample_gaussian_from_nominal(
+    model: Any, local_mode: MPPIHomotopyMode, ilqr_nominal: Array, control_positions: Array,
+    n: int, cfg: Any, rng: np.random.Generator,
+) -> Array:
+    H = int(cfg.horizon)
+    noise = make_temporally_correlated_noise(model, n, H, cfg, rng)
+    variance = sample_dense_scalar_at_arc_positions(
+        np.asarray(local_mode.gaussian_variance, dtype=np.float64),
+        np.asarray(local_mode.arc_length, dtype=np.float64),
+        control_positions,
+    )
+    sigma_ref = max(float(cfg.sigma_ref), 1e-9)
+    noise *= (np.sqrt(np.maximum(variance, 0.0)) / sigma_ref)[None, :, None]
+    noise += np.asarray(ilqr_nominal, dtype=np.float64)[None, :, :]
+    clip_inplace = getattr(model, "clip_control_batch_inplace", None)
+    return clip_inplace(noise, cfg) if clip_inplace is not None else model.clip_control_batch(noise, cfg)
+
+
+def _sample_spg_from_nominal(
+    model: Any, x_current: Array, local_mode: MPPIHomotopyMode, ilqr_nominal: Array,
+    control_positions: Array, A: Optional[Array], B: Optional[Array], n: int, cfg: Any,
+    rng: np.random.Generator,
+) -> Array:
+    H = int(cfg.horizon)
+    cov_at_controls = sample_dense_covariance_at_arc_positions(
+        np.asarray(local_mode.cov_blocks, dtype=np.float64),
+        np.asarray(local_mode.arc_length, dtype=np.float64),
+        control_positions,
+    )
+    project_from_jacobians = getattr(model, "project_control_covariances_from_jacobians", None)
+    if A is not None and B is not None and project_from_jacobians is not None:
+        projected = project_from_jacobians(A, B, cov_at_controls, cfg)
+    else:
+        projected = model.project_control_covariances(x_current, ilqr_nominal, cov_at_controls, cfg)
+    standard_noise = make_temporally_correlated_noise(
+        model, n, H, cfg, rng, scale_override=np.ones(2, dtype=np.float64)
+    )
+    if _apply_projected_covariance_nb is not None:
+        noise = _apply_projected_covariance_nb(standard_noise, np.asarray(projected, dtype=np.float64))
+    else:
+        noise = np.zeros_like(standard_noise)
+        for t in range(H):
+            covariance = 0.5 * (projected[t] + projected[t].T)
+            if not np.all(np.isfinite(covariance)):
+                covariance = np.zeros((2, 2), dtype=np.float64)
+            eigenvalues, eigenvectors = np.linalg.eigh(covariance)
+            square_root = eigenvectors @ np.diag(np.sqrt(np.maximum(eigenvalues, 0.0))) @ eigenvectors.T
+            noise[:, t, :] = standard_noise[:, t, :] @ square_root.T
+    noise += np.asarray(ilqr_nominal, dtype=np.float64)[None, :, :]
+    clip_inplace = getattr(model, "clip_control_batch_inplace", None)
+    return clip_inplace(noise, cfg) if clip_inplace is not None else model.clip_control_batch(noise, cfg)
 
 
 def sample_gaussian_controls_with_nominal(
@@ -1102,8 +1375,9 @@ def sample_gaussian_controls_with_nominal(
     sigma_ref = max(float(cfg.sigma_ref), 1e-9)
     scale = np.sqrt(np.maximum(variance, 0.0)) / sigma_ref
     noise *= scale[None, :, None]
-    controls = np.asarray(ilqr_nominal, dtype=np.float64)[None, :, :] + noise
-    controls = model.clip_control_batch(controls, cfg)
+    noise += np.asarray(ilqr_nominal, dtype=np.float64)[None, :, :]
+    clip_inplace = getattr(model, "clip_control_batch_inplace", None)
+    controls = clip_inplace(noise, cfg) if clip_inplace is not None else model.clip_control_batch(noise, cfg)
     return controls, np.asarray(ilqr_nominal, dtype=np.float64).copy()
 
 def sample_gaussian_controls(
@@ -1132,24 +1406,35 @@ def sample_sensitivity_projected_gaussian_controls_with_nominal(
     *,
     goal: Optional[Array] = None,
 ) -> Tuple[Array, Array]:
-    """SPG proposal centered exactly on the path-tracking iLQR solution."""
+    """SPG proposal centered on iLQR and reusing its dynamics Jacobians when available."""
     del goal
     H = int(cfg.horizon)
     if n <= 0:
         return np.zeros((0, H, 2), dtype=np.float64), np.zeros((H, 2), dtype=np.float64)
-    ilqr_nominal, control_positions = nominal_controls_and_arc_positions(
-        model, x_current, local_mode.mean_path, cfg, local_mode.cov_blocks
-    )
-    projected = model.project_control_covariances(
-        x_current,
-        ilqr_nominal,
-        sample_dense_covariance_at_arc_positions(
+    local_mode = _ensure_mode_prior_cache(local_mode)
+    cov_at_controls = None
+    with_jacobians = getattr(model, "nominal_controls_and_arc_positions_with_jacobians", None)
+    project_from_jacobians = getattr(model, "project_control_covariances_from_jacobians", None)
+    if with_jacobians is not None and project_from_jacobians is not None:
+        ilqr_nominal, control_positions, A, B = with_jacobians(
+            x_current, local_mode.mean_path, cfg, local_mode.cov_blocks, None
+        )
+        cov_at_controls = sample_dense_covariance_at_arc_positions(
             np.asarray(local_mode.cov_blocks, dtype=np.float64),
             np.asarray(local_mode.arc_length, dtype=np.float64),
             control_positions,
-        ),
-        cfg,
-    )
+        )
+        projected = project_from_jacobians(A, B, cov_at_controls, cfg)
+    else:
+        ilqr_nominal, control_positions = nominal_controls_and_arc_positions(
+            model, x_current, local_mode.mean_path, cfg, local_mode.cov_blocks
+        )
+        cov_at_controls = sample_dense_covariance_at_arc_positions(
+            np.asarray(local_mode.cov_blocks, dtype=np.float64),
+            np.asarray(local_mode.arc_length, dtype=np.float64),
+            control_positions,
+        )
+        projected = model.project_control_covariances(x_current, ilqr_nominal, cov_at_controls, cfg)
     standard_noise = make_temporally_correlated_noise(
         model, n, H, cfg, rng, scale_override=np.ones(2, dtype=np.float64)
     )
@@ -1164,8 +1449,9 @@ def sample_sensitivity_projected_gaussian_controls_with_nominal(
             eigenvalues, eigenvectors = np.linalg.eigh(covariance)
             square_root = eigenvectors @ np.diag(np.sqrt(np.maximum(eigenvalues, 0.0))) @ eigenvectors.T
             noise[:, t, :] = standard_noise[:, t, :] @ square_root.T
-    controls = np.asarray(ilqr_nominal, dtype=np.float64)[None, :, :] + noise
-    controls = model.clip_control_batch(controls, cfg)
+    noise += np.asarray(ilqr_nominal, dtype=np.float64)[None, :, :]
+    clip_inplace = getattr(model, "clip_control_batch_inplace", None)
+    controls = clip_inplace(noise, cfg) if clip_inplace is not None else model.clip_control_batch(noise, cfg)
     return controls, np.asarray(ilqr_nominal, dtype=np.float64).copy()
 
 def sample_sensitivity_projected_gaussian_controls(
@@ -1205,15 +1491,23 @@ def nearby_mode_indices(
     x_current: Array,
     cfg: Any,
     cached_clearances: Optional[Array] = None,
+    *,
+    packed_mode_bank: Optional[PackedModeBank] = None,
 ) -> List[int]:
-    """Sequentially keep the nearest feasible modes, up to the configured limit."""
+    """Sequentially keep the nearest feasible modes, using packed Numba distances."""
     if not global_modes:
         return []
     position = np.asarray(x_current[:2], dtype=np.float64)
-    distances = np.asarray(
-        [float(np.min(np.linalg.norm(np.asarray(mode.mean_path) - position[None, :], axis=1))) for mode in global_modes],
-        dtype=np.float64,
-    )
+    bank = packed_mode_bank if packed_mode_bank is not None else pack_mode_bank(global_modes)
+    if _mode_nearest_distances_nb is not None:
+        distances = _mode_nearest_distances_nb(
+            bank.mean_paths, bank.lengths, float(position[0]), float(position[1])
+        )
+    else:
+        distances = np.asarray(
+            [float(np.min(np.linalg.norm(np.asarray(mode.mean_path) - position[None, :], axis=1))) for mode in global_modes],
+            dtype=np.float64,
+        )
     order = np.argsort(distances)
     if cached_clearances is None or not cfg.suppress_blocked_modes:
         feasible = np.ones(len(global_modes), dtype=bool)
@@ -1309,85 +1603,97 @@ def localize_all_feasible_mean_modes(
     cfg: Any,
     progress: Dict[str, int],
     state_history: Optional[Sequence[Array]] = None,
+    *,
+    packed_mode_bank: Optional[PackedModeBank] = None,
+    packed_polygons: Optional[Tuple[Array, Array]] = None,
 ) -> Tuple[List[int], List[MPPIHomotopyMode], List[float], List[float], Dict[str, int]]:
-    """Localize every prior mean and retain nearby, collision-free means.
-
-    The centerline-distance gate is evaluated on the localized usable forward
-    horizon for the current point and on the global centerline for the most recent
-    ``cfg.centerline_history_points`` states.  No top-k pruning is applied: every mode within
-    ``cfg.max_centerline_distance`` is considered, then blocked means are removed.
-    Collision filtering is evaluated on the localized forward horizon, not on the
-    complete global mean path.  Since the prior is geometric, this validity test
-    uses the dense mean centerline against the true obstacle polygons, with no
-    vehicle-footprint inflation.  Footprint-aware collision checking remains in
-    the MPPI rollout model.
-    """
+    """Localize and filter all prior means using one packed Numba geometry pass."""
     active_indices: List[int] = []
     active_modes: List[MPPIHomotopyMode] = []
     active_clearances: List[float] = []
-    all_clearances: List[float] = []
     new_progress = dict(progress)
     initial_prior_pass = len(progress) == 0
+    if not global_modes:
+        return active_indices, active_modes, active_clearances, [], new_progress
 
-    if (not initial_prior_pass) and cfg.suppress_blocked_modes and obstacles:
-        polygons_padded, polygon_lengths = obstacle_polygons_to_padded_arrays(obstacles)
+    bank = packed_mode_bank if packed_mode_bank is not None else pack_mode_bank(global_modes)
+    position = np.asarray(x_current[:2], dtype=np.float64)
+    history_count = max(1, int(cfg.centerline_history_points))
+    if state_history:
+        recent_positions = np.empty((min(history_count, len(state_history)), 2), dtype=np.float64)
+        selected_history = state_history[-recent_positions.shape[0]:]
+        for i, state in enumerate(selected_history):
+            recent_positions[i, 0] = float(state[0])
+            recent_positions[i, 1] = float(state[1])
+    else:
+        recent_positions = np.zeros((0, 2), dtype=np.float64)
+
+    compute_clearance = bool((not initial_prior_pass) and cfg.suppress_blocked_modes and obstacles)
+    if compute_clearance:
+        if packed_polygons is None:
+            polygons_padded, polygon_lengths = obstacle_polygons_to_padded_arrays(obstacles)
+        else:
+            polygons_padded, polygon_lengths = packed_polygons
     else:
         polygons_padded = np.zeros((0, 0, 2), dtype=np.float64)
         polygon_lengths = np.zeros(0, dtype=np.int64)
 
-    for global_index, mode in enumerate(global_modes):
-        key = str(mode.signature)
-        local_mode, index = localize_mode_for_state_with_index(
-            mode,
-            x_current,
-            cfg.horizon,
-            step_distance=prior_preview_step_distance(cfg),
+    if _localize_mode_bank_nb is not None:
+        starts, ends, distances, clearances = _localize_mode_bank_nb(
+            bank.mean_paths, bank.arc_lengths, bank.lengths,
+            float(position[0]), float(position[1]), np.ascontiguousarray(recent_positions),
+            max(1, int(cfg.horizon)), prior_preview_step_distance(cfg),
+            np.ascontiguousarray(polygons_padded), np.ascontiguousarray(polygon_lengths),
+            compute_clearance,
         )
-        new_progress[key] = index
-
-        position = np.asarray(x_current[:2], dtype=np.float64)
-        local_centerline = np.asarray(local_mode.mean_path, dtype=np.float64)
-        if local_centerline.size == 0:
-            centerline_distance = float("inf")
-        else:
-            delta = local_centerline[:, :2] - position[None, :]
-            centerline_distance = float(np.sqrt(np.min(np.sum(delta * delta, axis=1))))
-
-        if state_history:
-            history_count = max(1, int(cfg.centerline_history_points))
-            recent_positions = np.asarray(
-                [np.asarray(state, dtype=np.float64)[:2] for state in state_history[-history_count:]],
-                dtype=np.float64,
+    else:
+        starts = np.zeros(len(global_modes), dtype=np.int64)
+        ends = np.zeros(len(global_modes), dtype=np.int64)
+        distances = np.empty(len(global_modes), dtype=np.float64)
+        clearances = np.full(len(global_modes), np.inf, dtype=np.float64)
+        for i, mode in enumerate(global_modes):
+            local, start_idx = localize_mode_for_state_with_index(
+                mode, x_current, cfg.horizon, step_distance=prior_preview_step_distance(cfg)
             )
-            global_centerline = np.asarray(mode.mean_path, dtype=np.float64)[:, :2]
-            if recent_positions.size == 0 or global_centerline.size == 0:
-                history_centerline_distance = float("inf")
-            else:
-                history_delta = (
-                    recent_positions[:, None, :] - global_centerline[None, :, :]
+            starts[i] = start_idx
+            ends[i] = start_idx + len(local.mean_path) - 1
+            delta = np.asarray(local.mean_path)[:, :2] - position[None, :]
+            distances[i] = float(np.sqrt(np.min(np.sum(delta * delta, axis=1))))
+            if compute_clearance:
+                clearances[i] = geometric_mean_path_clearance_packed(
+                    local.mean_path, polygons_padded, polygon_lengths
                 )
-                history_distances = np.sqrt(np.min(np.sum(history_delta * history_delta, axis=2), axis=1))
-                history_centerline_distance = float(np.max(history_distances))
-            centerline_distance = max(centerline_distance, history_centerline_distance)
 
-        if initial_prior_pass:
-            clearance = float("inf")
-        elif cfg.suppress_blocked_modes and obstacles:
-            clearance = geometric_mean_path_clearance_packed(local_mode.mean_path, polygons_padded, polygon_lengths)
-        else:
-            clearance = float("inf")
-
-        all_clearances.append(clearance)
-
+    all_clearances = [float(value) for value in clearances]
+    max_centerline_distance = float(cfg.max_centerline_distance)
+    for global_index, mode in enumerate(global_modes):
+        mode = _ensure_mode_prior_cache(mode)
+        index = int(starts[global_index])
+        end_index = int(ends[global_index])
+        new_progress[str(mode.signature)] = index
         if not initial_prior_pass:
-            if centerline_distance > float(cfg.max_centerline_distance):
+            if float(distances[global_index]) > max_centerline_distance:
                 continue
-            if cfg.suppress_blocked_modes and obstacles and clearance <= 0.0:
+            if compute_clearance and float(clearances[global_index]) <= 0.0:
                 continue
 
+        mean_path = np.asarray(mode.mean_path, dtype=np.float64)
+        arc = np.asarray(mode.arc_length, dtype=np.float64)
+        s0 = float(arc[index])
+        local_mode = MPPIHomotopyMode(
+            signature=mode.signature,
+            probability=mode.probability,
+            mean_path=np.ascontiguousarray(mean_path[index:end_index + 1]),
+            cov_blocks=np.ascontiguousarray(np.asarray(mode.cov_blocks, dtype=np.float64)[index:end_index + 1]),
+            sample_paths=None,
+            arc_length=np.ascontiguousarray(arc[index:end_index + 1] - s0),
+            gaussian_variance=np.ascontiguousarray(
+                np.asarray(mode.gaussian_variance, dtype=np.float64)[index:end_index + 1]
+            ),
+        )
         active_indices.append(int(global_index))
         active_modes.append(local_mode)
-        active_clearances.append(clearance)
+        active_clearances.append(float(clearances[global_index]))
 
     return active_indices, active_modes, active_clearances, all_clearances, new_progress
 
@@ -1403,20 +1709,86 @@ def softmin_score(costs: Array, cfg: Any) -> float:
     return float(rho - float(cfg.lambda_temperature) * math.log(np.sum(z) / len(values) + 1e-12))
 
 
-def reject_colliding_rollouts(
+if NUMBA_AVAILABLE:
+    @njit(cache=True)
+    def _mppi_weighted_sequence_nb(costs, controls, temperature):
+        n = costs.shape[0]
+        H = controls.shape[1]
+        d = controls.shape[2]
+        out = np.zeros((H, d), dtype=np.float64)
+        finite_count = 0
+        rho = math.inf
+        for i in range(n):
+            if math.isfinite(costs[i]):
+                finite_count += 1
+                if costs[i] < rho:
+                    rho = costs[i]
+        if finite_count == 0:
+            if n == 0:
+                return out
+            inv_n = 1.0 / n
+            for i in range(n):
+                for h in range(H):
+                    for j in range(d):
+                        out[h, j] += inv_n * controls[i, h, j]
+            return out
+        total = 0.0
+        for i in range(n):
+            if math.isfinite(costs[i]):
+                w = math.exp(-(costs[i] - rho) / temperature)
+                total += w
+                for h in range(H):
+                    for j in range(d):
+                        out[h, j] += w * controls[i, h, j]
+        if total <= 1e-12:
+            inv_count = 1.0 / finite_count
+            for h in range(H):
+                for j in range(d):
+                    out[h, j] = 0.0
+            for i in range(n):
+                if math.isfinite(costs[i]):
+                    for h in range(H):
+                        for j in range(d):
+                            out[h, j] += inv_count * controls[i, h, j]
+        else:
+            inv_total = 1.0 / total
+            for h in range(H):
+                for j in range(d):
+                    out[h, j] *= inv_total
+        return out
+else:
+    _mppi_weighted_sequence_nb = None
+
+
+def _prepare_model_obstacles(model: Any, obstacle_circles):
+    pack = getattr(model, "pack_obstacle_circles", None)
+    return pack(obstacle_circles) if pack is not None else None
+
+
+def _rollout_costs_and_collisions(
     model: Any,
-    costs: Array,
-    states: Array,
-    obstacle_circles: Sequence[Tuple[Array, float]],
+    x_current: Array,
+    controls: Array,
+    obstacle_circles,
     goal: Array,
     cfg: Any,
-) -> Array:
-    if not obstacle_circles or states.shape[0] == 0:
-        return np.asarray(costs, dtype=np.float64)
-    colliding = model.collision_mask(states, obstacle_circles, goal, cfg)
-    rejected = np.asarray(costs, dtype=np.float64).copy()
-    rejected[colliding] = np.inf
-    return rejected
+    packed_obstacles=None,
+) -> Tuple[Array, Array, Optional[Array]]:
+    fused = getattr(model, "rollout_costs_and_collisions", None)
+    if fused is not None:
+        costs, colliding = fused(
+            x_current, controls, obstacle_circles, goal, cfg,
+            packed_obstacles=packed_obstacles,
+        )
+        return np.asarray(costs, dtype=np.float64), np.asarray(colliding, dtype=bool), None
+    states = model.rollout_batch(x_current, controls, cfg)
+    raw_costs = model.trajectory_costs(states, controls, obstacle_circles, goal, cfg)
+    colliding = (
+        model.collision_mask(states, obstacle_circles, goal, cfg)
+        if obstacle_circles else np.zeros(len(controls), dtype=bool)
+    )
+    return np.asarray(raw_costs, dtype=np.float64), np.asarray(colliding, dtype=bool), states
+
 
 def mppi_weights(costs: Array, cfg: Any) -> Array:
     costs = np.asarray(costs, dtype=np.float64)
@@ -1435,12 +1807,16 @@ def mppi_weights(costs: Array, cfg: Any) -> Array:
 
 
 def mppi_weighted_control_sequence(model: Any, costs: Array, controls: Array, cfg: Any) -> Array:
-    sequence = np.tensordot(mppi_weights(costs, cfg), controls, axes=(0, 0))
+    costs_arr = np.ascontiguousarray(np.asarray(costs, dtype=np.float64))
+    controls_arr = np.ascontiguousarray(np.asarray(controls, dtype=np.float64))
+    if _mppi_weighted_sequence_nb is not None:
+        sequence = _mppi_weighted_sequence_nb(costs_arr, controls_arr, float(cfg.lambda_temperature))
+    else:
+        sequence = np.tensordot(mppi_weights(costs_arr, cfg), controls_arr, axes=(0, 0))
+    clip_sequence = getattr(model, "clip_control_sequence", None)
+    if clip_sequence is not None:
+        return np.asarray(clip_sequence(sequence, cfg), dtype=np.float64)
     return model.clip_control_batch(np.asarray(sequence, dtype=np.float64)[None, :, :], cfg)[0]
-
-
-def best_output_trajectory_from_costs(costs: Array, states: Array) -> Array:
-    return np.asarray(states[int(np.argmin(costs))], dtype=np.float64).copy()
 
 
 def _single_sequence_evaluation(
@@ -1450,13 +1826,26 @@ def _single_sequence_evaluation(
     obstacle_circles: Sequence[Tuple[Array, float]],
     goal: Array,
     cfg: Any,
+    packed_obstacles=None,
 ) -> Tuple[float, Array, bool]:
-    controls = model.clip_control_batch(np.asarray(sequence, dtype=np.float64)[None, :, :], cfg)
-    states = model.rollout_batch(x_current, controls, cfg)
-    raw_cost = float(model.trajectory_costs(states, controls, obstacle_circles, goal, cfg)[0])
-    colliding = bool(model.collision_mask(states, obstacle_circles, goal, cfg)[0]) if obstacle_circles else False
-    return (np.inf if colliding else raw_cost), np.asarray(states[0]).copy(), colliding
-
+    clip_sequence = getattr(model, "clip_control_sequence", None)
+    if clip_sequence is not None:
+        controls = np.asarray(clip_sequence(sequence, cfg), dtype=np.float64)
+    else:
+        controls = model.clip_control_batch(np.asarray(sequence, dtype=np.float64)[None, :, :], cfg)[0]
+    evaluate = getattr(model, "evaluate_sequence", None)
+    if evaluate is not None:
+        raw_cost, states, colliding = evaluate(
+            x_current, controls, obstacle_circles, goal, cfg,
+            packed_obstacles=packed_obstacles,
+        )
+        return (np.inf if colliding else float(raw_cost)), np.asarray(states), bool(colliding)
+    states = model.rollout_single(x_current, controls, cfg)
+    batch_states = states[None, :, :]
+    batch_controls = controls[None, :, :]
+    raw_cost = float(model.trajectory_costs(batch_states, batch_controls, obstacle_circles, goal, cfg)[0])
+    colliding = bool(model.collision_mask(batch_states, obstacle_circles, goal, cfg)[0]) if obstacle_circles else False
+    return (np.inf if colliding else raw_cost), np.asarray(states), colliding
 
 def _finite_cost_mean(costs: Array) -> float:
     values = np.asarray(costs, dtype=np.float64)
@@ -1469,13 +1858,15 @@ def _accept_improving_candidate(
     x_current: Array,
     current: Array,
     current_cost: float,
+    current_traj: Array,
     candidate: Array,
     obstacle_circles: Sequence[Tuple[Array, float]],
     goal: Array,
     cfg: Any,
+    packed_obstacles=None,
 ) -> Tuple[Array, float, Array, bool]:
     candidate_cost, candidate_traj, candidate_collision = _single_sequence_evaluation(
-        model, x_current, candidate, obstacle_circles, goal, cfg
+        model, x_current, candidate, obstacle_circles, goal, cfg, packed_obstacles
     )
     improves = (
         not candidate_collision
@@ -1483,11 +1874,8 @@ def _accept_improving_candidate(
         and (not np.isfinite(current_cost) or candidate_cost < current_cost - 1e-9)
     )
     if improves:
-        return np.asarray(candidate, dtype=np.float64).copy(), float(candidate_cost), candidate_traj, True
-    current_cost_check, current_traj, _ = _single_sequence_evaluation(
-        model, x_current, current, obstacle_circles, goal, cfg
-    )
-    return np.asarray(current, dtype=np.float64).copy(), float(current_cost_check), current_traj, False
+        return np.asarray(candidate, dtype=np.float64), float(candidate_cost), candidate_traj, True
+    return np.asarray(current, dtype=np.float64), float(current_cost), np.asarray(current_traj), False
 
 
 def _standard_mppi_refinement_pass(
@@ -1499,53 +1887,53 @@ def _standard_mppi_refinement_pass(
     goal: Array,
     cfg: Any,
     rng: np.random.Generator,
-) -> Tuple[Array, Array, Array]:
+    packed_obstacles=None,
+) -> Tuple[Array, Array, Optional[Array]]:
     controls = sample_controls_around_nominal(model, center, rollout_count, cfg, rng)
-    states = model.rollout_batch(x_current, controls, cfg)
-    raw_costs = model.trajectory_costs(states, controls, obstacle_circles, goal, cfg)
-    costs = reject_colliding_rollouts(model, raw_costs, states, obstacle_circles, goal, cfg)
-    candidate = mppi_weighted_control_sequence(model, costs, controls, cfg)
-    return candidate, np.asarray(costs, dtype=np.float64), states
-
+    raw_costs, colliding, states = _rollout_costs_and_collisions(
+        model, x_current, controls, obstacle_circles, goal, cfg, packed_obstacles
+    )
+    raw_costs[colliding] = np.inf
+    candidate = mppi_weighted_control_sequence(model, raw_costs, controls, cfg)
+    return candidate, raw_costs, states
 
 def _run_additional_mppi_refinements(
     model: Any,
     x_current: Array,
     current: Array,
     current_cost: float,
+    current_traj: Optional[Array],
     additional_iterations: int,
     rollout_count: int,
     obstacle_circles: Sequence[Tuple[Array, float]],
     goal: Array,
     cfg: Any,
     rng: np.random.Generator,
+    packed_obstacles=None,
 ) -> Dict[str, object]:
-    current = np.asarray(current, dtype=np.float64).copy()
-    if not np.isfinite(current_cost):
+    current = np.asarray(current, dtype=np.float64)
+    if current_traj is None or not np.isfinite(current_cost):
         current_cost, current_traj, _ = _single_sequence_evaluation(
-            model, x_current, current, obstacle_circles, goal, cfg
-        )
-    else:
-        _, current_traj, _ = _single_sequence_evaluation(
-            model, x_current, current, obstacle_circles, goal, cfg
+            model, x_current, current, obstacle_circles, goal, cfg, packed_obstacles
         )
     history = [float(current_cost)]
     accepted = 0
     last_costs = np.asarray([current_cost], dtype=np.float64)
     for _ in range(max(0, int(additional_iterations))):
         candidate, costs, _ = _standard_mppi_refinement_pass(
-            model, x_current, current, rollout_count, obstacle_circles, goal, cfg, rng
+            model, x_current, current, rollout_count, obstacle_circles, goal, cfg, rng, packed_obstacles
         )
         last_costs = costs
         current, current_cost, current_traj, improved = _accept_improving_candidate(
-            model, x_current, current, current_cost, candidate, obstacle_circles, goal, cfg
+            model, x_current, current, current_cost, current_traj, candidate,
+            obstacle_circles, goal, cfg, packed_obstacles
         )
         accepted += int(improved)
         history.append(float(current_cost))
     return {
         "sequence": current,
         "cost": float(current_cost),
-        "trajectory": np.asarray(current_traj).copy(),
+        "trajectory": np.asarray(current_traj),
         "accepted": int(accepted),
         "history": history,
         "last_costs": last_costs,
@@ -1565,11 +1953,12 @@ def standard_mppi_step(
 ) -> Tuple[Array, Dict[str, object]]:
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
+    packed_obstacles = _prepare_model_obstacles(model, obstacle_circles)
     nominal = model.clip_control_batch(
         np.asarray(model.nominal_controls_to_goal(x_current, goal, cfg), dtype=np.float64)[None, :, :], cfg
     )[0]
     current_cost, current_traj, _ = _single_sequence_evaluation(
-        model, x_current, nominal, obstacle_circles, goal, cfg
+        model, x_current, nominal, obstacle_circles, goal, cfg, packed_obstacles
     )
     history = [float(current_cost)]
     accepted = 0
@@ -1578,11 +1967,11 @@ def standard_mppi_step(
     current = nominal
     for _ in range(max(1, int(cfg.mppi_iterations))):
         candidate, costs, _ = _standard_mppi_refinement_pass(
-            model, x_current, current, int(cfg.num_rollouts), obstacle_circles, goal, cfg, rng
+            model, x_current, current, int(cfg.num_rollouts), obstacle_circles, goal, cfg, rng, packed_obstacles
         )
         last_costs = costs
         current, current_cost, current_traj, improved = _accept_improving_candidate(
-            model, x_current, current, current_cost, candidate, obstacle_circles, goal, cfg
+            model, x_current, current, current_cost, current_traj, candidate, obstacle_circles, goal, cfg, packed_obstacles
         )
         accepted += int(improved)
         history.append(float(current_cost))
@@ -1612,6 +2001,8 @@ def planner_ilqr_step(
     progress_by_mode: Optional[Dict[str, int]] = None,
     state_history: Optional[Sequence[Array]] = None,
     record_optimal_traj: bool = True,
+    packed_mode_bank: Optional[PackedModeBank] = None,
+    packed_polygons: Optional[Tuple[Array, Array]] = None,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
     """Planner-prior + iLQR ablation with no MPPI sampling or weighting."""
     if not global_modes:
@@ -1631,6 +2022,8 @@ def planner_ilqr_step(
         cfg,
         progress,
         state_history=state_history,
+        packed_mode_bank=packed_mode_bank,
+        packed_polygons=packed_polygons,
     )
 
     fallback = None
@@ -1663,13 +2056,17 @@ def planner_ilqr_step(
         retained_indices = [int(index) for index in active_indices]
         retained_clearances = [float(value) for value in active_clearances]
 
-    nominal = model.nominal_controls_to_track_path(
-        x_current,
-        selected_local_mode.mean_path,
-        cfg,
-        selected_local_mode.cov_blocks,
+    # Recompute the localized-path iLQR nominal from its deterministic path-tracking
+    # initialization every control step. Shifted cached nominals alter the standalone
+    # iLQR closed-loop behavior, especially during terminal braking near the goal.
+    nominal, _ = nominal_controls_and_arc_positions(
+        model, x_current, selected_local_mode.mean_path, cfg, selected_local_mode.cov_blocks
     )
-    nominal = model.clip_control_batch(np.asarray(nominal, dtype=np.float64)[None, :, :], cfg)[0]
+    clip_sequence = getattr(model, "clip_control_sequence", None)
+    if clip_sequence is not None:
+        nominal = np.asarray(clip_sequence(nominal, cfg), dtype=np.float64)
+    else:
+        nominal = model.clip_control_batch(np.asarray(nominal, dtype=np.float64)[None, :, :], cfg)[0]
     nominal_states = model.rollout_single(x_current, nominal, cfg)
 
     info: Dict[str, object] = {
@@ -1717,6 +2114,8 @@ def stable_swarm_mppi_step(
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
     cached_mode_clearances: Optional[Array] = None,
     record_optimal_traj: Optional[bool] = None,
+    packed_mode_bank: Optional[PackedModeBank] = None,
+    packed_polygons: Optional[Tuple[Array, Array]] = None,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
     if rep_type not in {REP_GAUSSIAN, REP_CORRIDOR, REP_CONTROL_BANK, REP_SENSITIVITY_PROJECTED_GAUSSIAN}:
         raise ValueError(f"Unsupported pooled proposal representation: {rep_type}")
@@ -1724,13 +2123,16 @@ def stable_swarm_mppi_step(
     progress = {} if progress_by_mode is None else dict(progress_by_mode)
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
-
+    packed_obstacles = _prepare_model_obstacles(model, obstacle_circles)
+    # MPPI priors are intentionally recomputed from the localized path each step.
+    # Shifted iLQR warm starts changed closed-loop behavior for the quadrotor models.
     total_budget = max(1, int(cfg.num_rollouts))
     compressed_mean_rep = rep_type in {REP_GAUSSIAN, REP_CORRIDOR, REP_SENSITIVITY_PROJECTED_GAUSSIAN}
 
     if compressed_mean_rep:
         (active_global_indices, active_local_modes, active_clearances, all_local_clearances, new_progress) = localize_all_feasible_mean_modes(
-            global_modes, x_current, obstacles, cfg, progress, state_history=state_history
+            global_modes, x_current, obstacles, cfg, progress, state_history=state_history,
+            packed_mode_bank=packed_mode_bank, packed_polygons=packed_polygons
         )
         if not active_global_indices:
             control, info = standard_mppi_step(
@@ -1752,7 +2154,7 @@ def stable_swarm_mppi_step(
     else:
         if cached_mode_clearances is None:
             cached_mode_clearances = cached_mode_mean_clearances(model, global_modes, obstacle_circles, cfg)
-        nearby_indices = nearby_mode_indices(global_modes, x_current, cfg, cached_mode_clearances)
+        nearby_indices = nearby_mode_indices(global_modes, x_current, cfg, cached_mode_clearances, packed_mode_bank=packed_mode_bank)
         if not nearby_indices:
             control, info = standard_mppi_step(
                 model, x_current, obstacles, goal, cfg, rng,
@@ -1786,44 +2188,72 @@ def stable_swarm_mppi_step(
         selection_policy = "nearby_balanced_control_bank_iterative"
 
     active_count = len(active_global_modes)
-    mode_ids = np.concatenate([
-        np.full(count, mode_index, dtype=np.int64) for mode_index, count in enumerate(counts) if count > 0
-    ]) if any(count > 0 for count in counts) else np.zeros(0, dtype=np.int64)
-    if mode_ids.size != total_budget:
-        raise RuntimeError(f"Internal rollout allocation error: allocated {mode_ids.size} of {total_budget} rollouts.")
+    if sum(int(count) for count in counts) != total_budget:
+        raise RuntimeError(
+            f"Internal rollout allocation error: allocated {sum(int(count) for count in counts)} of {total_budget} rollouts."
+        )
 
-    all_costs = np.zeros(total_budget, dtype=np.float64)
-    all_controls = np.zeros((total_budget, cfg.horizon, 2), dtype=np.float64)
-    best_cost = 1e309
-    best_mode_global_index: Optional[int] = None
-    nominal_controls_by_mode: Dict[int, Array] = {}
+    all_controls = np.empty((total_budget, cfg.horizon, 2), dtype=np.float64)
+    nominal_controls_by_mode: List[Array] = [np.zeros((cfg.horizon, 2), dtype=np.float64) for _ in range(active_count)]
+
+    # A: cold iLQR mode priors are independent. Solve all of them concurrently,
+    # then draw proposal noise serially in the original mode order so RNG behavior
+    # remains deterministic. SPG-capable models also return the final A/B sequence.
+    nominal_solutions = parallel_mode_nominals(
+        model, x_current, active_local_modes, cfg,
+        need_jacobians=(rep_type == REP_SENSITIVITY_PROJECTED_GAUSSIAN),
+    )
+
+    offsets = np.empty(active_count + 1, dtype=np.int64)
+    offsets[0] = 0
+    for mode_index in range(active_count):
+        offsets[mode_index + 1] = offsets[mode_index] + int(counts[mode_index])
 
     for mode_index, local_mode in enumerate(active_local_modes):
-        ids = np.flatnonzero(mode_ids == mode_index); count = len(ids)
-        if count == 0: continue
+        start_id = int(offsets[mode_index])
+        end_id = int(offsets[mode_index + 1])
+        count = end_id - start_id
+        if count <= 0:
+            continue
         global_mode = active_global_modes[mode_index]
+        ilqr_nominal, control_positions, A, B = nominal_solutions[mode_index]
         if rep_type == REP_GAUSSIAN:
-            controls, ilqr_nominal = sample_gaussian_controls_with_nominal(
-                model, x_current, local_mode, count, cfg, rng, goal=goal
+            controls = _sample_gaussian_from_nominal(
+                model, local_mode, ilqr_nominal, control_positions, count, cfg, rng
             )
         elif rep_type == REP_SENSITIVITY_PROJECTED_GAUSSIAN:
-            controls, ilqr_nominal = sample_sensitivity_projected_gaussian_controls_with_nominal(
-                model, x_current, local_mode, count, cfg, rng, goal=goal
+            controls = _sample_spg_from_nominal(
+                model, x_current, local_mode, ilqr_nominal, control_positions, A, B, count, cfg, rng
             )
         elif rep_type == REP_CONTROL_BANK:
-            ilqr_nominal = model.nominal_controls_to_track_path(x_current, local_mode.mean_path, cfg, local_mode.cov_blocks)
-            controls = sample_exact_control_bank(model, x_current, global_mode, ilqr_nominal, count, cfg)
+            controls = sample_exact_control_bank(
+                model, x_current, global_mode, ilqr_nominal, count, cfg
+            )
         else:
-            ilqr_nominal = model.nominal_controls_to_track_path(x_current, local_mode.mean_path, cfg, local_mode.cov_blocks)
             controls = sample_controls_around_nominal(model, ilqr_nominal, count, cfg, rng)
-        nominal_controls_by_mode[mode_index] = np.asarray(ilqr_nominal, dtype=np.float64).copy()
-        states = model.rollout_batch(x_current, controls, cfg)
-        raw_costs = model.trajectory_costs(states, controls, obstacle_circles, goal, cfg)
-        costs = reject_colliding_rollouts(model, raw_costs, states, obstacle_circles, goal, cfg)
-        all_costs[ids] = costs; all_controls[ids] = controls
-        local_best = int(np.argmin(costs)); local_best_cost = float(costs[local_best])
+        nominal_controls_by_mode[mode_index] = np.asarray(ilqr_nominal, dtype=np.float64)
+        all_controls[start_id:end_id] = controls
+
+    # B: evaluate the complete rollout budget in one Numba call. This avoids one
+    # parallel-kernel launch per mode and gives prange the full batch to distribute.
+    all_costs, collision_mask, _ = _rollout_costs_and_collisions(
+        model, x_current, all_controls, obstacle_circles, goal, cfg, packed_obstacles
+    )
+    all_costs[collision_mask] = np.inf
+
+    best_cost = 1e309
+    best_mode_global_index: Optional[int] = None
+    for mode_index in range(active_count):
+        start_id = int(offsets[mode_index])
+        end_id = int(offsets[mode_index + 1])
+        if end_id <= start_id:
+            continue
+        costs = all_costs[start_id:end_id]
+        local_best = int(np.argmin(costs))
+        local_best_cost = float(costs[local_best])
         if np.isfinite(local_best_cost) and local_best_cost < best_cost:
-            best_cost = local_best_cost; best_mode_global_index = int(active_global_indices[mode_index])
+            best_cost = local_best_cost
+            best_mode_global_index = int(active_global_indices[mode_index])
 
     first_candidate = mppi_weighted_control_sequence(model, all_costs, all_controls, cfg)
     if best_mode_global_index is None:
@@ -1835,17 +2265,17 @@ def stable_swarm_mppi_step(
         )
     baseline = np.asarray(nominal_controls_by_mode[baseline_local_index], dtype=np.float64)
     baseline_cost, baseline_traj, _ = _single_sequence_evaluation(
-        model, x_current, baseline, obstacle_circles, goal, cfg
+        model, x_current, baseline, obstacle_circles, goal, cfg, packed_obstacles
     )
     current, current_cost, current_traj, first_improved = _accept_improving_candidate(
-        model, x_current, baseline, baseline_cost, first_candidate, obstacle_circles, goal, cfg
+        model, x_current, baseline, baseline_cost, baseline_traj, first_candidate, obstacle_circles, goal, cfg, packed_obstacles
     )
     history = [float(baseline_cost), float(current_cost)]
     accepted = int(first_improved)
 
     extra = _run_additional_mppi_refinements(
-        model, x_current, current, current_cost, max(0, int(cfg.mppi_iterations)-1), total_budget,
-        obstacle_circles, goal, cfg, rng
+        model, x_current, current, current_cost, current_traj, max(0, int(cfg.mppi_iterations)-1), total_budget,
+        obstacle_circles, goal, cfg, rng, packed_obstacles
     )
     if len(extra["history"]) > 1:
         history.extend(list(extra["history"])[1:])
@@ -1856,8 +2286,7 @@ def stable_swarm_mppi_step(
 
     nominal_ilqr_traj = None
     if record_optimal_traj:
-        nominal_states = model.rollout_batch(x_current, baseline[None, :, :], cfg)
-        if nominal_states.shape[0] > 0: nominal_ilqr_traj = np.asarray(nominal_states[0]).copy()
+        nominal_ilqr_traj = np.asarray(baseline_traj).copy()
 
     info = {
         "cost_min": float(np.min(all_costs)), "cost_mean": _finite_cost_mean(all_costs),
@@ -1894,6 +2323,8 @@ def mode_selecting_stable_mppi_step(
     state_history: Optional[Sequence[Array]] = None,
     obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
     record_optimal_traj: bool = True,
+    packed_mode_bank: Optional[PackedModeBank] = None,
+    packed_polygons: Optional[Tuple[Array, Array]] = None,
 ) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
     if rep_type not in {REP_GAUSSIAN, REP_CORRIDOR}:
         raise ValueError("Mode-selecting MPPI supports only Gaussian or corridor proposals.")
@@ -1901,7 +2332,7 @@ def mode_selecting_stable_mppi_step(
     progress = {} if progress_by_mode is None else dict(progress_by_mode)
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
-
+    packed_obstacles = _prepare_model_obstacles(model, obstacle_circles)
     (
         active_indices,
         local_modes,
@@ -1915,6 +2346,8 @@ def mode_selecting_stable_mppi_step(
         cfg,
         progress,
         state_history=state_history,
+        packed_mode_bank=packed_mode_bank,
+        packed_polygons=packed_polygons,
     )
 
     if not active_indices:
@@ -1950,39 +2383,40 @@ def mode_selecting_stable_mppi_step(
     configured = int(cfg.mode_select_rollouts_per_mode)
     rollouts_per_mode = configured if configured > 0 else max(1, int(cfg.num_rollouts))
     completed: List[dict[str, Any]] = []
+    mode_count = len(local_modes)
+    nominal_solutions = parallel_mode_nominals(model, x_current, local_modes, cfg)
+    pooled_controls = np.empty((mode_count * rollouts_per_mode, cfg.horizon, 2), dtype=np.float64)
 
-    for original_index, local_mode in zip(active_indices, local_modes):
+    # Generate noise in mode order to preserve deterministic RNG semantics.
+    for local_index, (original_index, local_mode) in enumerate(zip(active_indices, local_modes)):
+        ilqr_nominal, control_positions, _, _ = nominal_solutions[local_index]
+        start_id = local_index * rollouts_per_mode
+        end_id = start_id + rollouts_per_mode
         if rep_type == REP_GAUSSIAN:
-            controls, ilqr_nominal = sample_gaussian_controls_with_nominal(
-                model, x_current, local_mode, rollouts_per_mode, cfg, rng, goal=goal
+            controls = _sample_gaussian_from_nominal(
+                model, local_mode, ilqr_nominal, control_positions, rollouts_per_mode, cfg, rng
             )
         else:
-            ilqr_nominal = model.clip_control_batch(
-                np.asarray(
-                    model.nominal_controls_to_track_path(
-                        x_current, local_mode.mean_path, cfg, local_mode.cov_blocks
-                    ),
-                    dtype=np.float64,
-                )[None, :, :],
-                cfg,
-            )[0]
             controls = sample_controls_around_nominal(
                 model, ilqr_nominal, rollouts_per_mode, cfg, rng
             )
+        pooled_controls[start_id:end_id] = controls
 
-        states = model.rollout_batch(x_current, controls, cfg)
-        raw_costs = model.trajectory_costs(states, controls, obstacle_circles, goal, cfg)
-        collision_mask = (
-            model.collision_mask(states, obstacle_circles, goal, cfg)
-            if obstacle_circles
-            else np.zeros(len(controls), dtype=bool)
-        )
-        feasible_count = int(np.count_nonzero(~collision_mask))
-        costs = reject_colliding_rollouts(
-            model, raw_costs, states, obstacle_circles, goal, cfg
-        )
-        first_candidate = mppi_weighted_control_sequence(model, costs, controls, cfg)
+    pooled_costs, pooled_collision, _ = _rollout_costs_and_collisions(
+        model, x_current, pooled_controls, obstacle_circles, goal, cfg, packed_obstacles
+    )
+    pooled_costs[pooled_collision] = np.inf
+
+    for local_index, original_index in enumerate(active_indices):
         global_mode = global_modes[int(original_index)]
+        ilqr_nominal = nominal_solutions[local_index][0]
+        start_id = local_index * rollouts_per_mode
+        end_id = start_id + rollouts_per_mode
+        controls = pooled_controls[start_id:end_id]
+        costs = pooled_costs[start_id:end_id]
+        collisions = pooled_collision[start_id:end_id]
+        feasible_count = int(np.count_nonzero(~collisions))
+        first_candidate = mppi_weighted_control_sequence(model, costs, controls, cfg)
         completed.append(
             {
                 "score": float(softmin_score(costs, cfg)),
@@ -1993,7 +2427,7 @@ def mode_selecting_stable_mppi_step(
                 "cost_min": float(np.min(costs)),
                 "cost_mean": _finite_cost_mean(costs),
                 "first_candidate": np.asarray(first_candidate, dtype=np.float64).copy(),
-                "nominal_controls": np.asarray(ilqr_nominal, dtype=np.float64).copy(),
+                "nominal_controls": np.asarray(ilqr_nominal, dtype=np.float64),
             }
         )
 
@@ -2002,17 +2436,19 @@ def mode_selecting_stable_mppi_step(
 
     baseline = np.asarray(best["nominal_controls"], dtype=np.float64)
     baseline_cost, baseline_traj, _ = _single_sequence_evaluation(
-        model, x_current, baseline, obstacle_circles, goal, cfg
+        model, x_current, baseline, obstacle_circles, goal, cfg, packed_obstacles
     )
     current, current_cost, current_traj, first_improved = _accept_improving_candidate(
         model,
         x_current,
         baseline,
         baseline_cost,
+        baseline_traj,
         np.asarray(best["first_candidate"], dtype=np.float64),
         obstacle_circles,
         goal,
         cfg,
+        packed_obstacles,
     )
     history = [float(baseline_cost), float(current_cost)]
     accepted = int(first_improved)
@@ -2022,12 +2458,14 @@ def mode_selecting_stable_mppi_step(
         x_current,
         current,
         current_cost,
+        current_traj,
         max(0, int(cfg.mppi_iterations) - 1),
         rollouts_per_mode,
         obstacle_circles,
         goal,
         cfg,
         rng,
+        packed_obstacles,
     )
     if len(extra["history"]) > 1:
         history.extend(list(extra["history"])[1:])
@@ -2038,9 +2476,7 @@ def mode_selecting_stable_mppi_step(
 
     nominal_ilqr_traj: Optional[Array] = None
     if record_optimal_traj:
-        nominal_states = model.rollout_batch(x_current, baseline[None, :, :], cfg)
-        if nominal_states.shape[0] > 0:
-            nominal_ilqr_traj = np.asarray(nominal_states[0], dtype=np.float64).copy()
+        nominal_ilqr_traj = np.asarray(baseline_traj, dtype=np.float64).copy()
 
     info = {
         "cost_min": best["cost_min"],
@@ -2124,6 +2560,9 @@ def run_controller(
     base_circles = obstacle_bounding_circles(base_obstacles)
     blocked_obstacles = list(base_obstacles) + blockers
     blocked_circles = obstacle_bounding_circles(blocked_obstacles) if blockers else base_circles
+    packed_mode_bank = pack_mode_bank(modes)
+    base_polygons_packed = obstacle_polygons_to_padded_arrays(base_obstacles)
+    blocked_polygons_packed = obstacle_polygons_to_padded_arrays(blocked_obstacles) if blockers else base_polygons_packed
     control_bank_clearance_cache: Dict[Tuple[Tuple[float, float, float], ...], Array] = {}
 
     started = time.perf_counter()
@@ -2138,6 +2577,7 @@ def run_controller(
         wall_active = activation_step is not None and step >= activation_step
         active_obstacles = blocked_obstacles if wall_active else list(base_obstacles)
         active_circles = blocked_circles if wall_active else base_circles
+        active_packed_polygons = blocked_polygons_packed if wall_active else base_polygons_packed
 
         if record:
             obstacle_history.append(list(active_obstacles))
@@ -2153,6 +2593,8 @@ def run_controller(
                 progress_by_mode=progress_by_mode,
                 state_history=states,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant == ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
             control, info, progress_by_mode = stable_swarm_mppi_step(
@@ -2168,6 +2610,8 @@ def run_controller(
                 state_history=states,
                 obstacle_circles=active_circles,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant == ControllerVariant.GAUSSIAN_PRIOR_MPPI:
             control, info, progress_by_mode = stable_swarm_mppi_step(
@@ -2183,6 +2627,8 @@ def run_controller(
                 state_history=states,
                 obstacle_circles=active_circles,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant == ControllerVariant.CORRIDOR_PRIOR_MPPI:
             control, info, progress_by_mode = stable_swarm_mppi_step(
@@ -2198,6 +2644,8 @@ def run_controller(
                 state_history=states,
                 obstacle_circles=active_circles,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant == ControllerVariant.CONTROL_BANK_MPPI:
             obstacle_key = obstacle_configuration_key(active_circles)
@@ -2220,6 +2668,8 @@ def run_controller(
                 obstacle_circles=active_circles,
                 cached_mode_clearances=mode_clearances,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant == ControllerVariant.MODE_SELECTING_GAUSSIAN_MPPI:
             control, info, progress_by_mode = mode_selecting_stable_mppi_step(
@@ -2235,6 +2685,8 @@ def run_controller(
                 state_history=states,
                 obstacle_circles=active_circles,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant == ControllerVariant.MODE_SELECTING_CORRIDOR_MPPI:
             control, info, progress_by_mode = mode_selecting_stable_mppi_step(
@@ -2250,6 +2702,8 @@ def run_controller(
                 state_history=states,
                 obstacle_circles=active_circles,
                 record_optimal_traj=record,
+                packed_mode_bank=packed_mode_bank,
+                packed_polygons=active_packed_polygons,
             )
         elif variant in (ControllerVariant.STANDARD_MPPI):
             control, info = standard_mppi_step(

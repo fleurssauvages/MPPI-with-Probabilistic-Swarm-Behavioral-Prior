@@ -48,8 +48,6 @@ class MPPIConfig(ctrl.ControllerConfig):
 
     max_delta_v: float = 0.7
     max_delta_omega: float = 1.4
-    enforce_one_step_safety: bool = False
-    one_step_safety_clearance: float = 0.0
 
 
     def __post_init__(self) -> None:
@@ -86,12 +84,17 @@ def _softplus_scalar_nb(z):
 
 
 @njit(cache=True)
-def unicycle_step_nb(x, u, dt):
-    out = np.empty(3, dtype=np.float64)
+def _unicycle_step_fill_nb(x, u, out, dt):
     theta = x[2]
     out[0] = x[0] + u[0] * math.cos(theta) * dt
     out[1] = x[1] + u[0] * math.sin(theta) * dt
     out[2] = _wrap_angle_nb(theta + u[1] * dt)
+
+
+@njit(cache=True)
+def unicycle_step_nb(x, u, dt):
+    out = np.empty(3, dtype=np.float64)
+    _unicycle_step_fill_nb(x, u, out, dt)
     return out
 
 
@@ -105,7 +108,7 @@ def rollout_unicycle_batch_nb(x0, U, dt):
         X[n, 0, 1] = x0[1]
         X[n, 0, 2] = x0[2]
         for t in range(H):
-            X[n, t + 1] = unicycle_step_nb(X[n, t], U[n, t], dt)
+            _unicycle_step_fill_nb(X[n, t], U[n, t], X[n, t + 1], dt)
     return X
 
 @njit(cache=True)
@@ -114,7 +117,7 @@ def rollout_unicycle_single_nb(x0, U, dt):
     X = np.zeros((H + 1, 3), dtype=np.float64)
     X[0] = x0
     for t in range(H):
-        X[t + 1] = unicycle_step_nb(X[t], U[t], dt)
+        _unicycle_step_fill_nb(X[t], U[t], X[t + 1], dt)
     return X
 
 @njit(cache=True)
@@ -353,6 +356,79 @@ def _invert_regularized_2x2_ilqr_nb(a00, a01, a11, regularization):
 
 
 @njit(cache=True)
+def _ilqr_backward_update_fill_nb(A, B, lx, lxx, lu, luu, Vx, Vxx, regularization,
+                                  krow, Krow, Qx, Qu, Qxx, Quu, Qux,
+                                  VxxA, VxxB, Vx_new, Vxx_new):
+    nx = Vx.shape[0]
+    for r in range(nx):
+        for j in range(nx):
+            value = 0.0
+            for q in range(nx):
+                value += Vxx[r, q] * A[q, j]
+            VxxA[r, j] = value
+        for a in range(2):
+            value = 0.0
+            for q in range(nx):
+                value += Vxx[r, q] * B[q, a]
+            VxxB[r, a] = value
+    for i in range(nx):
+        value = lx[i]
+        for r in range(nx):
+            value += A[r, i] * Vx[r]
+        Qx[i] = value
+    for a in range(2):
+        value = lu[a]
+        for r in range(nx):
+            value += B[r, a] * Vx[r]
+        Qu[a] = value
+    for i in range(nx):
+        for j in range(nx):
+            value = lxx[i, j]
+            for r in range(nx):
+                value += A[r, i] * VxxA[r, j]
+            Qxx[i, j] = value
+    for a in range(2):
+        for b in range(2):
+            value = luu[a, b]
+            for r in range(nx):
+                value += B[r, a] * VxxB[r, b]
+            Quu[a, b] = value
+    for a in range(2):
+        for j in range(nx):
+            value = 0.0
+            for r in range(nx):
+                value += B[r, a] * VxxA[r, j]
+            Qux[a, j] = value
+    inv00, inv01, inv11 = _invert_regularized_2x2_ilqr_nb(
+        Quu[0, 0], 0.5 * (Quu[0, 1] + Quu[1, 0]), Quu[1, 1], regularization
+    )
+    krow[0] = -(inv00 * Qu[0] + inv01 * Qu[1])
+    krow[1] = -(inv01 * Qu[0] + inv11 * Qu[1])
+    for j in range(nx):
+        Krow[0, j] = -(inv00 * Qux[0, j] + inv01 * Qux[1, j])
+        Krow[1, j] = -(inv01 * Qux[0, j] + inv11 * Qux[1, j])
+    for i in range(nx):
+        value = Qx[i]
+        for a in range(2):
+            value += Krow[a, i] * Qu[a] + Qux[a, i] * krow[a]
+            for b in range(2):
+                value += Krow[a, i] * Quu[a, b] * krow[b]
+        Vx_new[i] = value
+    for i in range(nx):
+        for j in range(nx):
+            value = Qxx[i, j]
+            for a in range(2):
+                value += Krow[a, i] * Qux[a, j] + Qux[a, i] * Krow[a, j]
+                for b in range(2):
+                    value += Krow[a, i] * Quu[a, b] * Krow[b, j]
+            Vxx_new[i, j] = value
+    for i in range(nx):
+        Vx[i] = Vx_new[i]
+        for j in range(nx):
+            Vxx[i, j] = 0.5 * (Vxx_new[i, j] + Vxx_new[j, i])
+
+
+@njit(cache=True)
 def _unicycle_ilqr_backward_nb(
     X, U, ref, arc, cov_blocks, covariance_floor, dt,
     mahalanobis_weight, heading_weight, progress_weight,
@@ -367,6 +443,14 @@ def _unicycle_ilqr_backward_nb(
 
     Vx = np.zeros(3, dtype=np.float64)
     Vxx = np.zeros((3, 3), dtype=np.float64)
+    A = np.empty((3, 3), dtype=np.float64); B = np.empty((3, 2), dtype=np.float64)
+    lx = np.empty(3, dtype=np.float64); lxx = np.empty((3, 3), dtype=np.float64)
+    lu = np.empty(2, dtype=np.float64); luu = np.empty((2, 2), dtype=np.float64)
+    Qx = np.empty(3, dtype=np.float64); Qu = np.empty(2, dtype=np.float64)
+    Qxx = np.empty((3, 3), dtype=np.float64); Quu = np.empty((2, 2), dtype=np.float64)
+    Qux = np.empty((2, 3), dtype=np.float64); VxxA = np.empty((3, 3), dtype=np.float64)
+    VxxB = np.empty((3, 2), dtype=np.float64); Vx_new = np.empty(3, dtype=np.float64)
+    Vxx_new = np.empty((3, 3), dtype=np.float64)
     exT = X[H, 0] - ref[ref.shape[0] - 1, 0]
     eyT = X[H, 1] - ref[ref.shape[0] - 1, 1]
     Vx[0] = 2.0 * terminal_position_weight * exT
@@ -375,63 +459,44 @@ def _unicycle_ilqr_backward_nb(
     Vxx[1, 1] = 2.0 * terminal_position_weight
 
     for t in range(H - 1, -1, -1):
+        for i in range(3):
+            lx[i] = 0.0
+            for j in range(3):
+                A[i, j] = 1.0 if i == j else 0.0
+                lxx[i, j] = 0.0
+            B[i, 0] = 0.0; B[i, 1] = 0.0
+        lu[0] = 2.0 * control_v_weight * U[t, 0]
+        lu[1] = 2.0 * control_omega_weight * U[t, 1]
+        luu[0, 0] = 2.0 * control_v_weight; luu[0, 1] = 0.0
+        luu[1, 0] = 0.0; luu[1, 1] = 2.0 * control_omega_weight
+
         theta = X[t, 2]
         v = U[t, 0]
-        c = math.cos(theta)
-        sn = math.sin(theta)
-        A = np.eye(3, dtype=np.float64)
+        c = math.cos(theta); sn = math.sin(theta)
         A[0, 2] = -v * sn * dt
         A[1, 2] = v * c * dt
-        B = np.zeros((3, 2), dtype=np.float64)
         B[0, 0] = c * dt
         B[1, 0] = sn * dt
         B[2, 1] = dt
-
-        dx = X[t, 0] - qx[t]
-        dy = X[t, 1] - qy[t]
+        dx = X[t, 0] - qx[t]; dy = X[t, 1] - qy[t]
         mx = p00[t] * dx + p01[t] * dy
         my = p01[t] * dx + p11[t] * dy
         eh = _wrap_angle_nb(X[t, 2] - heading[t])
-        lx = np.zeros(3, dtype=np.float64)
         lx[0] = 2.0 * mahalanobis_weight * mx - progress_weight * tx[t]
         lx[1] = 2.0 * mahalanobis_weight * my - progress_weight * ty[t]
         lx[2] = 2.0 * heading_weight * eh
-        lxx = np.zeros((3, 3), dtype=np.float64)
         lxx[0, 0] = 2.0 * mahalanobis_weight * p00[t]
         lxx[0, 1] = 2.0 * mahalanobis_weight * p01[t]
         lxx[1, 0] = lxx[0, 1]
         lxx[1, 1] = 2.0 * mahalanobis_weight * p11[t]
         lxx[2, 2] = 2.0 * heading_weight
-        lu = np.array((2.0 * control_v_weight * U[t, 0], 2.0 * control_omega_weight * U[t, 1]), dtype=np.float64)
-        luu = np.zeros((2, 2), dtype=np.float64)
-        luu[0, 0] = 2.0 * control_v_weight
-        luu[1, 1] = 2.0 * control_omega_weight
         if t == H - 1:
             lu[0] += 2.0 * terminal_velocity_weight * U[t, 0]
             luu[0, 0] += 2.0 * terminal_velocity_weight
-
-        Qx = lx + A.T @ Vx
-        Qu = lu + B.T @ Vx
-        Qxx = lxx + A.T @ Vxx @ A
-        Quu = luu + B.T @ Vxx @ B
-        Qux = B.T @ Vxx @ A
-
-        inv00, inv01, inv11 = _invert_regularized_2x2_ilqr_nb(
-            Quu[0, 0], 0.5 * (Quu[0, 1] + Quu[1, 0]), Quu[1, 1], regularization
+        _ilqr_backward_update_fill_nb(
+            A, B, lx, lxx, lu, luu, Vx, Vxx, regularization, kff[t], Kfb[t],
+            Qx, Qu, Qxx, Quu, Qux, VxxA, VxxB, Vx_new, Vxx_new,
         )
-        k0 = -(inv00 * Qu[0] + inv01 * Qu[1])
-        k1 = -(inv01 * Qu[0] + inv11 * Qu[1])
-        kff[t, 0] = k0
-        kff[t, 1] = k1
-        for j in range(3):
-            Kfb[t, 0, j] = -(inv00 * Qux[0, j] + inv01 * Qux[1, j])
-            Kfb[t, 1, j] = -(inv01 * Qux[0, j] + inv11 * Qux[1, j])
-
-        K = Kfb[t]
-        kval = kff[t]
-        Vx = Qx + K.T @ Quu @ kval + K.T @ Qu + Qux.T @ kval
-        Vxx = Qxx + K.T @ Quu @ K + K.T @ Qux + Qux.T @ K
-        Vxx = 0.5 * (Vxx + Vxx.T)
     return kff, Kfb
 
 @njit(cache=True)
@@ -457,7 +522,7 @@ def _unicycle_ilqr_forward_update_nb(x0, U, X, kff, Kfb, alpha, dt, v_min, v_max
     return Unew, Xnew
 
 
-@njit(cache=True)
+@njit(cache=True, nogil=True)
 def _unicycle_ilqr_nominal_and_positions_nb(
     x0, ref, cov_blocks, horizon, dt, v_min, v_max, omega_min, omega_max,
     iterations, line_search_steps,
@@ -546,7 +611,7 @@ def nominal_controls_to_goal_nb(x0, goal, horizon, dt, v_min, v_max, omega_min, 
         return U
 
 @njit(cache=True, parallel=True)
-def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_control, w_control_smooth, w_terminal_position, w_terminal_velocity):
+def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horizon, robot_radius, w_goal, w_obstacle, w_terminal_position, w_terminal_velocity):
         N = U.shape[0]
         H = horizon
         M = circle_radii.shape[0]
@@ -566,18 +631,6 @@ def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horiz
                     margin = robot_radius
                     sp = _softplus_scalar_nb(8.0 * (margin - d))
                     cost += w_obstacle * sp * sp
-            ctrl_cost = 0.0
-            for t in range(H):
-                v = U[n, t, 0]
-                om = U[n, t, 1]
-                ctrl_cost += v * v + 0.15 * om * om
-            cost += w_control * ctrl_cost
-            smooth_cost = 0.0
-            for t in range(H - 1):
-                dv = U[n, t + 1, 0] - U[n, t, 0]
-                dom = U[n, t + 1, 1] - U[n, t, 1]
-                smooth_cost += dv * dv + 0.2 * dom * dom
-            cost += w_control_smooth * smooth_cost
             gxT = X[n, H, 0] - goal[0]
             gyT = X[n, H, 1] - goal[1]
             cost += w_terminal_position * (gxT * gxT + gyT * gyT)
@@ -585,6 +638,61 @@ def standard_mppi_costs_batch_nb(X, U, circle_centers, circle_radii, goal, horiz
                 cost += w_terminal_velocity * U[n, H - 1, 0] * U[n, H - 1, 0]
             costs[n] = cost
         return costs
+
+
+@njit(cache=True, parallel=True)
+def rollout_costs_and_collisions_unicycle_nb(
+    x0, U, circle_centers, circle_radii, goal, robot_radius, hard_collision_clearance,
+    w_goal, w_obstacle, w_terminal_position, w_terminal_velocity, dt,
+):
+    N = U.shape[0]
+    H = U.shape[1]
+    M = circle_radii.shape[0]
+    inv_h = 1.0 / max(1, H)
+    costs = np.empty(N, dtype=np.float64)
+    collisions = np.zeros(N, dtype=np.bool_)
+    for n in prange(N):
+        state = np.empty(3, dtype=np.float64)
+        nxt = np.empty(3, dtype=np.float64)
+        state[0] = x0[0]; state[1] = x0[1]; state[2] = x0[2]
+        cost = 0.0
+        hit = False
+        for t in range(H):
+            _unicycle_step_fill_nb(state, U[n, t], nxt, dt)
+            px = nxt[0]; py = nxt[1]
+            gx = px - goal[0]; gy = py - goal[1]
+            cost += w_goal * inv_h * (gx * gx + gy * gy)
+            for j in range(M):
+                dx = px - circle_centers[j, 0]
+                dy = py - circle_centers[j, 1]
+                dist = math.sqrt(dx * dx + dy * dy)
+                d = dist - circle_radii[j]
+                sp = _softplus_scalar_nb(8.0 * (robot_radius - d))
+                cost += w_obstacle * sp * sp
+                if dist - circle_radii[j] - robot_radius < hard_collision_clearance:
+                    hit = True
+                    break
+            tmp = state; state = nxt; nxt = tmp
+            if hit:
+                break
+        if not hit:
+            gx = state[0] - goal[0]; gy = state[1] - goal[1]
+            cost += w_terminal_position * (gx * gx + gy * gy)
+            if H > 0:
+                cost += w_terminal_velocity * U[n, H - 1, 0] * U[n, H - 1, 0]
+        costs[n] = cost
+        collisions[n] = hit
+    return costs, collisions
+
+
+@njit(cache=True, parallel=True)
+def clip_unicycle_controls_inplace_nb(U, v_min, v_max, omega_min, omega_max):
+    flat = U.reshape((-1, 2))
+    for i in prange(flat.shape[0]):
+        flat[i, 0] = min(max(flat[i, 0], v_min), v_max)
+        flat[i, 1] = min(max(flat[i, 1], omega_min), omega_max)
+    return U
+
 
 @njit(cache=True)
 def point_in_poly_nb(px, py, poly):
@@ -768,6 +876,7 @@ def obstacle_circles_to_arrays(obstacle_circles: List[Tuple[Array, float]]) -> T
     return (centers, radii)
 
 def apply_smooth_safe_control(x_current: Array, u: Array, previous_control: Optional[Array], obstacle_circles: List[Tuple[Array, float]], cfg: MPPIConfig) -> Array:
+    del x_current, obstacle_circles
     cmd = np.asarray(u, dtype=np.float64).copy()
     if previous_control is not None:
         dv = float(np.clip(cmd[0] - previous_control[0], -cfg.max_delta_v, cfg.max_delta_v))
@@ -776,15 +885,6 @@ def apply_smooth_safe_control(x_current: Array, u: Array, previous_control: Opti
         cmd[1] = previous_control[1] + domega
     cmd[0] = np.clip(cmd[0], cfg.v_min, cfg.v_max)
     cmd[1] = np.clip(cmd[1], cfg.omega_min, cfg.omega_max)
-    if cfg.enforce_one_step_safety and obstacle_circles:
-        x_next = unicycle_step(x_current, cmd, cfg.dt)
-        centers, radii = obstacle_circles_to_arrays(obstacle_circles)
-        current_clearance = float(np.min(np.linalg.norm(x_current[None, :2] - centers, axis=1) - radii - cfg.robot_radius))
-        next_clearance = float(np.min(np.linalg.norm(x_next[None, :2] - centers, axis=1) - radii - cfg.robot_radius))
-        moving_deeper = next_clearance < current_clearance - 0.0001
-        below_required_clearance = next_clearance < cfg.one_step_safety_clearance
-        if below_required_clearance and moving_deeper:
-            cmd[0] = 0.0
     return cmd
 
 def path_min_clearance_to_circles(path: Array, obstacle_circles: List[Tuple[Array, float]], robot_radius: float, substeps: int=2) -> float:
@@ -870,7 +970,7 @@ def standard_mppi_costs_batch(X: Array, U: Array, obstacle_circles: List[Tuple[A
     return standard_mppi_costs_batch_nb(
         np.asarray(X, dtype=np.float64), np.asarray(U, dtype=np.float64), centers, radii,
         np.asarray(goal, dtype=np.float64), int(cfg.horizon), float(cfg.robot_radius),
-        float(cfg.w_goal), float(cfg.w_obstacle), float(cfg.w_control), float(cfg.w_control_smooth),
+        float(cfg.w_goal), float(cfg.w_obstacle),
         float(cfg.w_terminal_position), float(cfg.w_terminal_velocity),
     )
 
@@ -958,8 +1058,38 @@ def control_noise_scale(cfg: MPPIConfig) -> Array:
     return np.asarray([cfg.noise_v, cfg.noise_omega], dtype=np.float64)
 
 
+def clip_control_batch_inplace(controls: Array, cfg: MPPIConfig) -> Array:
+    U = np.ascontiguousarray(np.asarray(controls, dtype=np.float64))
+    if U.size == 0:
+        return U
+    return clip_unicycle_controls_inplace_nb(
+        U, float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max)
+    )
+
+
 def clip_control_batch(controls: Array, cfg: MPPIConfig) -> Array:
-    return enforce_forward_curve_proposals(np.asarray(controls, dtype=np.float64), cfg)
+    return clip_control_batch_inplace(np.ascontiguousarray(np.asarray(controls, dtype=np.float64)), cfg)
+
+
+def pack_obstacle_circles(obstacle_circles) -> Tuple[Array, Array]:
+    return obstacle_circles_to_arrays(list(obstacle_circles))
+
+
+def rollout_costs_and_collisions(x_current: Array, controls: Array, obstacle_circles, goal: Array,
+                                 cfg: MPPIConfig, packed_obstacles=None) -> Tuple[Array, Array]:
+    if packed_obstacles is None:
+        centers, radii = obstacle_circles_to_arrays(list(obstacle_circles))
+    else:
+        centers, radii = packed_obstacles
+    return rollout_costs_and_collisions_unicycle_nb(
+        np.asarray(x_current, dtype=np.float64),
+        np.ascontiguousarray(np.asarray(controls, dtype=np.float64)),
+        np.ascontiguousarray(np.asarray(centers, dtype=np.float64)),
+        np.ascontiguousarray(np.asarray(radii, dtype=np.float64)),
+        np.asarray(goal, dtype=np.float64), float(cfg.robot_radius),
+        float(cfg.hard_collision_clearance), float(cfg.w_goal), float(cfg.w_obstacle),
+        float(cfg.w_terminal_position), float(cfg.w_terminal_velocity), float(cfg.dt),
+    )
 
 
 def rollout_batch(x_current: Array, controls: Array, cfg: MPPIConfig) -> Array:
