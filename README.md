@@ -85,50 +85,67 @@ The geometric prior changes **where MPPI samples**. It does not replace the syst
   </tr>
 </table>
 
-# Animations
-The animations below compare **Standard MPPI** with **Sensitivity-Projected-Gaussian-prior MPPI** under the same system and scenario.
-
-### Unicycle
-
-#### No wall
-
-| Standard MPPI | Sensitivity-Projected-prior MPPI |
-|:---:|:---:|
-| ![Unicycle standard MPPI, no wall](gifs/unicycle/no_wall/standard_mppi/animation.gif) | ![Unicycle Gaussian-prior MPPI, no wall](gifs/unicycle/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
-
-#### Static blockage
-
-| Standard MPPI | Sensitivity-Projected-prior MPPI |
-|:---:|:---:|
-| ![Unicycle standard MPPI, static two-wall scenario](gifs/unicycle/static/standard_mppi/animation.gif) | ![Unicycle Sensitivity-Projected-prior MPPI, static two-wall scenario](gifs/unicycle/static/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
-
-#### Dynamic blockage
-
-| Standard MPPI | Sensitivity-Projected-prior MPPI |
-|:---:|:---:|
-| ![Unicycle standard MPPI, dynamic two-wall scenario](gifs/unicycle/dynamic/standard_mppi/animation.gif) | ![Unicycle Sensitivity-Projected-prior MPPI, dynamic two-wall scenario](gifs/unicycle/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
-
 ### Ackermann vehicle
 
 #### No wall
 
-| Standard MPPI | Sensitivity-Projected-prior MPPI |
+| Standard MPPI | SPG-prior MPPI |
 |:---:|:---:|
-| ![Ackermann standard MPPI, no wall](gifs/ackerman/no_wall/standard_mppi/animation.gif) | ![Ackermann Sensitivity-Projected-prior MPPI, no wall](gifs/ackerman/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
+| <img src="gifs/ackerman/no_wall/standard_mppi/animation.gif" width="420"> | <img src="gifs/ackerman/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
 
-#### Static blockage — two walls
+#### Static blockage
 
-| Standard MPPI | Sensitivity-Projected-prior MPPI |
+| Standard MPPI | SPG-prior MPPI |
 |:---:|:---:|
-| ![Ackermann standard MPPI, static two-wall scenario](gifs/ackerman/static/standard_mppi/animation.gif) | ![Ackermann Sensitivity-Projected-prior MPPI, static two-wall scenario](gifs/ackerman/static/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
+| <img src="gifs/ackerman/static/standard_mppi/animation.gif" width="420"> | <img src="gifs/ackerman/static/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
 
-#### Dynamic blockage — two walls
+#### Dynamic blockage
 
-| Standard MPPI | Sensitivity-Projected-prior MPPI |
+| Standard MPPI | SPG-prior MPPI |
 |:---:|:---:|
-| ![Ackermann standard MPPI, dynamic two-wall scenario](gifs/ackerman/dynamic/standard_mppi/animation.gif) | ![Ackermann Sensitivity-Projected-prior MPPI, dynamic two-wall scenario](gifs/ackerman/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif) |
+| <img src="gifs/ackerman/dynamic/standard_mppi/animation.gif" width="420"> | <img src="gifs/ackerman/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
 
-All variants use the same task objective. The comparison therefore isolates the effect of proposal construction, covariance representation, rollout allocation, and explicit mode selection.
+### Planar quadrotor
+
+#### No wall
+
+| Standard MPPI | SPG-prior MPPI |
+|:---:|:---:|
+| <img src="gifs/planar_quadrotor/no_wall/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+
+#### Static blockage
+
+| Standard MPPI | SPG-prior MPPI |
+|:---:|:---:|
+| <img src="gifs/planar_quadrotor/static/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor/static/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+
+#### Dynamic blockage
+
+| Standard MPPI | SPG-prior MPPI |
+|:---:|:---:|
+| <img src="gifs/planar_quadrotor/dynamic/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+
+### Planar quadrotor with suspended payload
+
+#### No wall
+
+| Standard MPPI | SPG-prior MPPI |
+|:---:|:---:|
+| <img src="gifs/planar_quadrotor_payload/no_wall/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor_payload/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+
+#### Static blockage
+
+| Standard MPPI | SPG-prior MPPI |
+|:---:|:---:|
+| <img src="gifs/planar_quadrotor_payload/static/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor_payload/static/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+
+#### Dynamic blockage
+
+| Standard MPPI | SPG-prior MPPI |
+|:---:|:---:|
+| <img src="gifs/planar_quadrotor_payload/dynamic/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor_payload/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+
+Both controllers use the same predictive dynamics and task objective. The comparison isolates the effect of informing the MPPI proposal distribution with the trajectory prior and projecting its spatial covariance into the control space.
 
 # Methods
 ### Supported systems

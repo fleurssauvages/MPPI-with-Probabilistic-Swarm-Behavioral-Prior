@@ -513,7 +513,7 @@ def localize_path_for_state_with_index(
     nearest_idx = int(np.argmin(np.linalg.norm(p - np.asarray(x_current[:2]), axis=1)))
     index = min(nearest_idx, len(p) - 2)
 
-    ds = float(step_distance) if step_distance is not None else DEFAULT_PRIOR_REFERENCE_SPEED * 0.12
+    ds = float(step_distance)
     ds = max(ds, 1e-6)
     H = max(1, int(H))
     arc = np.zeros(len(p), dtype=np.float64)
