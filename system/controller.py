@@ -374,7 +374,7 @@ def fit_topological_trajectory_mixture(
         for path in raw_paths
     ]
     all_costs = np.asarray(
-        [trajectory_cost(path, costmap=costmap, bounds=bounds, w_len=1.0, w_smooth=0.05) for path in all_paths],
+        [trajectory_cost(path, costmap=costmap, bounds=bounds, w_len=1.0, w_smooth=0.0) for path in all_paths],
         dtype=np.float64,
     )
     all_weights = stable_softmax_from_cost(all_costs, beta=beta)
@@ -1161,30 +1161,27 @@ def sample_exact_control_bank(
     model: Any,
     x_current: Array,
     global_mode: MPPIHomotopyMode,
-    fallback_nominal: Array,
     n: int,
     cfg: Any,
 ) -> Array:
-    """Return controls from the closest empirical trajectories needed by this mode.
+    """Convert exactly ``n`` unique empirical trajectories from one mode.
 
-    At most ``n`` unique sample paths are converted. Closeness is the minimum
-    Euclidean distance from the current position to each complete empirical
-    trajectory. The selected paths are localized first and converted to
-    dynamically feasible iLQR controls.
+    The closest trajectories to the current position are selected, localized,
+    and independently mapped to dynamically feasible controls with iLQR.
+    No trajectories are repeated and no control perturbations are added.
     """
     if n <= 0:
         return np.zeros((0, cfg.horizon, 2), dtype=np.float64)
 
     paths = list(global_mode.sample_paths or [])
-    if not paths:
-        fallback = np.asarray(fallback_nominal, dtype=np.float64)[None, :, :]
-        return model.clip_control_batch(np.repeat(fallback, n, axis=0), cfg)
+    if len(paths) < int(n):
+        raise ValueError(
+            f"Control-bank mode {global_mode.signature!s} contains only "
+            f"{len(paths)} empirical trajectories but {int(n)} were requested."
+        )
 
     x_xy = np.asarray(x_current[:2], dtype=np.float64)
-    path_count = len(paths)
-    selected_count = min(int(n), path_count)
-    distances = np.empty(path_count, dtype=np.float64)
-
+    distances = np.empty(len(paths), dtype=np.float64)
     for sample_id, path in enumerate(paths):
         p = np.asarray(path, dtype=np.float64)
         if len(p) == 0:
@@ -1193,7 +1190,7 @@ def sample_exact_control_bank(
             delta = p[:, :2] - x_xy[None, :]
             distances[sample_id] = float(np.min(np.sum(delta * delta, axis=1)))
 
-    selected_ids = np.argsort(distances, kind="stable")[:selected_count]
+    selected_ids = np.argsort(distances, kind="stable")[: int(n)]
     localized: List[Array] = []
     for sample_id in selected_ids:
         local_path, _ = localize_path_for_state_with_index(
@@ -1205,7 +1202,7 @@ def sample_exact_control_bank(
         localized.append(local_path)
 
     if len(localized) <= 1 or _ILQR_MAX_WORKERS <= 1:
-        candidate_array = np.asarray(
+        controls = np.asarray(
             [model.nominal_controls_to_track_path(x_current, path, cfg) for path in localized],
             dtype=np.float64,
         )
@@ -1214,11 +1211,41 @@ def sample_exact_control_bank(
             _ILQR_EXECUTOR.submit(model.nominal_controls_to_track_path, x_current, path, cfg)
             for path in localized
         ]
-        candidate_array = np.asarray([future.result() for future in futures], dtype=np.float64)
+        controls = np.asarray([future.result() for future in futures], dtype=np.float64)
 
-    controls = candidate_array[np.arange(n, dtype=np.int64) % selected_count].copy()
     return model.clip_control_batch(controls, cfg)
 
+
+def balanced_unique_control_bank_counts(
+    total_budget: int,
+    modes: Sequence[MPPIHomotopyMode],
+) -> Array:
+    """Allocate an exact bank budget as evenly as possible without repeats."""
+    total_budget = int(total_budget)
+    capacities = np.asarray([len(mode.sample_paths or []) for mode in modes], dtype=np.int64)
+    if total_budget < 0:
+        raise ValueError("Control-bank rollout budget must be non-negative.")
+    if int(np.sum(capacities)) < total_budget:
+        raise ValueError(
+            f"Control bank contains {int(np.sum(capacities))} unique trajectories, "
+            f"but cfg.num_rollouts={total_budget}."
+        )
+
+    counts = np.zeros(len(modes), dtype=np.int64)
+    remaining = total_budget
+    active = [index for index, capacity in enumerate(capacities) if capacity > 0]
+    while remaining > 0:
+        progressed = False
+        for index in active:
+            if remaining <= 0:
+                break
+            if counts[index] < capacities[index]:
+                counts[index] += 1
+                remaining -= 1
+                progressed = True
+        if not progressed:
+            raise RuntimeError("Unable to allocate the requested unique control-bank budget.")
+    return counts
 
 def nominal_controls_and_arc_positions(
     model: Any,
@@ -2099,6 +2126,158 @@ def planner_ilqr_step(
     return nominal[0].copy(), info, new_progress
 
 
+
+def control_bank_step(
+    model: Any,
+    x_current: Array,
+    global_modes: List[MPPIHomotopyMode],
+    obstacles: Sequence[Any],
+    goal: Array,
+    cfg: Any,
+    *,
+    progress_by_mode: Optional[Dict[str, int]] = None,
+    state_history: Optional[Sequence[Array]] = None,
+    obstacle_circles: Optional[List[Tuple[Array, float]]] = None,
+    cached_mode_clearances: Optional[Array] = None,
+    record_optimal_traj: bool = True,
+    packed_mode_bank: Optional[PackedModeBank] = None,
+) -> Tuple[Array, Dict[str, object], Dict[str, int]]:
+    """Pure empirical control-bank ablation.
+
+    Up to ``cfg.num_rollouts`` unique empirical trajectories are converted to
+    controls with iLQR and evaluated once. If fewer unique trajectories are
+    available, all available trajectories are evaluated. The minimum-cost
+    collision-free sequence is executed directly. There is no MPPI weighting,
+    stochastic perturbation, or additional MPPI refinement.
+    """
+    progress = {} if progress_by_mode is None else dict(progress_by_mode)
+    if obstacle_circles is None:
+        obstacle_circles = obstacle_bounding_circles(obstacles)
+    packed_obstacles = _prepare_model_obstacles(model, obstacle_circles)
+    total_budget = max(1, int(cfg.num_rollouts))
+
+    if cached_mode_clearances is None:
+        cached_mode_clearances = cached_mode_mean_clearances(
+            model, global_modes, obstacle_circles, cfg
+        )
+    clearances = np.asarray(cached_mode_clearances, dtype=np.float64)
+
+    nearby = nearby_mode_indices(
+        global_modes, x_current, cfg, clearances, packed_mode_bank=packed_mode_bank
+    )
+    # Keep the usual local mode preference, but expand the bank if necessary.
+    # If fewer unique trajectories exist than the requested rollout budget, use
+    # every available empirical trajectory rather than repeating samples.
+    active_indices = [
+        int(index) for index in nearby if len(global_modes[int(index)].sample_paths or []) > 0
+    ]
+    available = sum(len(global_modes[index].sample_paths or []) for index in active_indices)
+    if available < total_budget:
+        for index, mode in enumerate(global_modes):
+            if index in active_indices or not (mode.sample_paths or []):
+                continue
+            active_indices.append(index)
+            available += len(mode.sample_paths or [])
+            if available >= total_budget:
+                break
+    if available <= 0:
+        raise ValueError("Control bank contains no empirical trajectories to evaluate.")
+
+    eval_budget = min(total_budget, available)
+
+    active_modes = [global_modes[index] for index in active_indices]
+    counts = balanced_unique_control_bank_counts(eval_budget, active_modes)
+
+    offsets = np.zeros(len(active_modes) + 1, dtype=np.int64)
+    for mode_index, count in enumerate(counts):
+        offsets[mode_index + 1] = offsets[mode_index] + int(count)
+
+    all_controls = np.empty((eval_budget, cfg.horizon, 2), dtype=np.float64)
+    for mode_index, mode in enumerate(active_modes):
+        count = int(counts[mode_index])
+        if count <= 0:
+            continue
+        start_id = int(offsets[mode_index])
+        end_id = int(offsets[mode_index + 1])
+        all_controls[start_id:end_id] = sample_exact_control_bank(
+            model, x_current, mode, count, cfg
+        )
+
+        # Progress is diagnostic for the bank, but keeping it updated preserves
+        # the same receding-horizon bookkeeping used by the other prior variants.
+        _, progress_index = localize_mode_for_state_with_index(
+            mode, x_current, cfg.horizon, step_distance=prior_preview_step_distance(cfg)
+        )
+        progress[str(mode.signature)] = int(progress_index)
+
+    raw_costs, colliding, _ = _rollout_costs_and_collisions(
+        model, x_current, all_controls, obstacle_circles, goal, cfg, packed_obstacles
+    )
+    costs = np.asarray(raw_costs, dtype=np.float64)
+    costs[np.asarray(colliding, dtype=bool)] = np.inf
+
+    finite_ids = np.flatnonzero(np.isfinite(costs))
+    selected_mode_global_index: Optional[int] = None
+    if finite_ids.size:
+        best_id = int(finite_ids[np.argmin(costs[finite_ids])])
+        planned_sequence = np.asarray(all_controls[best_id], dtype=np.float64)
+        best_cost, best_traj, _ = _single_sequence_evaluation(
+            model, x_current, planned_sequence, obstacle_circles, goal, cfg, packed_obstacles
+        )
+        local_mode_index = int(np.searchsorted(offsets[1:], best_id, side="right"))
+        selected_mode_global_index = int(active_indices[local_mode_index])
+        fallback = None
+    else:
+        # No bank member is feasible. Do not fall back to Standard MPPI, since
+        # that would contaminate the Control-bank ablation. Return a neutral
+        # sequence and let the trial fail naturally if the bank cannot recover.
+        planned_sequence = np.zeros((cfg.horizon, 2), dtype=np.float64)
+        clip_sequence = getattr(model, "clip_control_sequence", None)
+        if clip_sequence is not None:
+            planned_sequence = np.asarray(clip_sequence(planned_sequence, cfg), dtype=np.float64)
+        else:
+            planned_sequence = model.clip_control_batch(planned_sequence[None, :, :], cfg)[0]
+        best_cost, best_traj, _ = _single_sequence_evaluation(
+            model, x_current, planned_sequence, obstacle_circles, goal, cfg, packed_obstacles
+        )
+        fallback = "no_feasible_control_bank_candidate"
+
+    probabilities = renormalized_mode_probabilities(active_modes)
+    info = {
+        "cost_min": float(np.min(costs)),
+        "cost_mean": _finite_cost_mean(costs),
+        "soft_value": float(softmin_score(costs, cfg)),
+        "rep_type": int(REP_CONTROL_BANK),
+        "mode_selection": False,
+        "mode_selection_policy": "empirical_control_bank_minimum_cost",
+        "selected_mode_index": None,
+        "selected_rollout_mode_index": selected_mode_global_index,
+        "rollout_budget_requested": int(total_budget),
+        "rollout_budget_total": int(eval_budget),
+        "control_bank_available": int(available),
+        "rollouts_by_mode": [int(value) for value in counts],
+        "active_mode_count": int(len(active_modes)),
+        "suppressed_mode_count": int(len(global_modes) - len(active_modes)),
+        "candidate_mode_count": int(len(active_modes)),
+        "nearby_mode_count": int(len(nearby)),
+        "mode_clearances": clearances.tolist(),
+        "retained_mode_indices": [int(index) for index in active_indices],
+        "retained_mode_clearances": [float(clearances[index]) for index in active_indices],
+        "active_mode_probabilities": [float(global_modes[index].probability) for index in active_indices],
+        "renormalized_mode_probabilities": probabilities.tolist(),
+        "optimal_traj": np.asarray(best_traj).copy() if record_optimal_traj else None,
+        "nominal_ilqr_traj": None,
+        "planned_control_sequence": planned_sequence,
+        "mppi_iterations": 0,
+        "mppi_accepted_iterations": 0,
+        "mppi_cost_history": [float(best_cost)],
+        "mppi_initial_cost": float(best_cost),
+        "mppi_final_cost": float(best_cost),
+    }
+    if fallback is not None:
+        info["mode_filter_fallback"] = fallback
+    return planned_sequence[0].copy(), info, progress
+
 def stable_swarm_mppi_step(
     model: Any,
     x_current: Array,
@@ -2123,6 +2302,23 @@ def stable_swarm_mppi_step(
     progress = {} if progress_by_mode is None else dict(progress_by_mode)
     if obstacle_circles is None:
         obstacle_circles = obstacle_bounding_circles(obstacles)
+
+    if rep_type == REP_CONTROL_BANK:
+        return control_bank_step(
+            model,
+            x_current,
+            global_modes,
+            obstacles,
+            goal,
+            cfg,
+            progress_by_mode=progress,
+            state_history=state_history,
+            obstacle_circles=obstacle_circles,
+            cached_mode_clearances=cached_mode_clearances,
+            record_optimal_traj=bool(record_optimal_traj),
+            packed_mode_bank=packed_mode_bank,
+        )
+
     packed_obstacles = _prepare_model_obstacles(model, obstacle_circles)
     # MPPI priors are intentionally recomputed from the localized path each step.
     # Shifted iLQR warm starts changed closed-loop behavior for the quadrotor models.

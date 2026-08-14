@@ -18,17 +18,13 @@ from matplotlib.figure import Figure
 from matplotlib.lines import Line2D
 from matplotlib.path import Path as MplPath
 from matplotlib.patches import Circle, Ellipse, Polygon
-UNICYCLE_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi'), ('Mode-selecting Gaussian', 'mode_selecting_gaussian_mppi'), ('Mode-selecting corridor', 'mode_selecting_corridor_mppi')]
-ACKERMAN_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
-PLANAR_QUADROTOR_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
-PLANAR_QUADROTOR_PAYLOAD_VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 MODEL_OPTIONS = {
-    'Unicycle': ('unicycle', unicycle, UNICYCLE_VARIANTS),
-    'Ackermann': ('ackerman', ackermann, ACKERMAN_VARIANTS),
-    'Planar quadrotor': ('planar_quadrotor', planar_quadrotor, PLANAR_QUADROTOR_VARIANTS),
-    'Planar quadrotor + hanging package': ('planar_quadrotor_payload', planar_quadrotor_payload, PLANAR_QUADROTOR_PAYLOAD_VARIANTS),
+    'Unicycle': ('unicycle', unicycle, VARIANTS),
+    'Ackermann': ('ackerman', ackermann, VARIANTS),
+    'Planar quadrotor': ('planar_quadrotor', planar_quadrotor, VARIANTS),
+    'Planar quadrotor + hanging package': ('planar_quadrotor_payload', planar_quadrotor_payload, VARIANTS),
 }
-VARIANTS = list(ACKERMAN_VARIANTS)
 CONDITIONS = [('No wall', 'no_wall'), ('Static wall', 'static_wall'), ('Dynamic wall', 'dynamic_wall')]
 DEFAULT_WALL_SCENARIO = 'walls_0_1__1_2'
 DISPLAY_TO_VARIANT = dict(VARIANTS)
