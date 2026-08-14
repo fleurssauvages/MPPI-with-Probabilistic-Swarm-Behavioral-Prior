@@ -41,7 +41,7 @@ class ControllerVariant(str, Enum):
 
 @dataclass
 class ControllerConfig:
-    dt: float = 0.12
+    dt: float = 0.10
     horizon: int = 50
     num_rollouts: int = 64
     mppi_iterations: int = 3
@@ -167,7 +167,7 @@ class PackedModeBank:
 class DynamicWallScenario:
     scenario_id: str
     wall_pairs: tuple[tuple[int, int], ...]
-    trigger_progress: float = 0.28
+    trigger_progress: float = 0.3
     wall_width: float = 0.35
     wall_extension: float = 0.0
 
