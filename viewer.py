@@ -62,8 +62,17 @@ def normalized_bounds(bounds_xy: Any) -> tuple[float, float, float, float]:
         return (float(a[0]), float(b[0]), float(a[1]), float(b[1]))
     return (float(bounds_xy[0][0]), float(bounds_xy[0][1]), float(bounds_xy[1][0]), float(bounds_xy[1][1]))
 
-def make_protocol_config(module: Any, num_rollouts: int) -> Any:
-    return module.MPPIConfig(num_rollouts=int(num_rollouts))
+def make_protocol_config(
+    module: Any,
+    num_rollouts: int,
+    lbps_delta: float,
+) -> Any:
+    cfg = module.MPPIConfig(num_rollouts=int(num_rollouts))
+    if not hasattr(cfg, 'adaptive_temperature_lbps') or not hasattr(cfg, 'lbps_delta'):
+        raise RuntimeError('Selected controller does not support adaptive LBPS temperature.')
+    cfg.adaptive_temperature_lbps = True
+    cfg.lbps_delta = float(lbps_delta)
+    return cfg
 
 def obstacle_from_vertices(template: Any, vertices: np.ndarray) -> Any:
     """Rebuild an obstacle of the same type with edited polygon vertices."""
@@ -163,7 +172,8 @@ class InteractiveMPPIViewer:
         self.condition_var = tk.StringVar(value='No wall')
         self.seed_var = tk.StringVar(value='1')
         self.swarm_seed_var = tk.StringVar(value='1')
-        self.rollouts_var = tk.StringVar(value='1024')
+        self.rollouts_var = tk.StringVar(value='256')
+        self.lbps_delta_var = tk.StringVar(value='0.9')
         self.speed_var = tk.StringVar(value='4.0')
         self.show_collision_var = tk.BooleanVar(value=False)
         self.show_all_modes_var = tk.BooleanVar(value=False)
@@ -177,6 +187,7 @@ class InteractiveMPPIViewer:
         row = self._add_entry(controls, row, 'Controller seed', self.seed_var)
         row = self._add_entry(controls, row, 'Swarm seed', self.swarm_seed_var)
         row = self._add_entry(controls, row, 'Rollouts per step', self.rollouts_var)
+        row = self._add_entry(controls, row, 'LBPS delta', self.lbps_delta_var)
         row = self._add_combo(controls, row, 'Playback speed', self.speed_var, ['0.5', '1.0', '2.0', '4.0', '8.0'])
         ttk.Checkbutton(controls, text='Show collision representation', variable=self.show_collision_var, command=self._redraw_current).grid(row=row, column=0, sticky='w', pady=(8, 2))
         row += 1
@@ -481,8 +492,11 @@ class InteractiveMPPIViewer:
             seed = int(self.seed_var.get())
             swarm_seed = int(self.swarm_seed_var.get())
             rollouts = int(self.rollouts_var.get())
+            lbps_delta = float(self.lbps_delta_var.get())
             if rollouts < 32:
                 raise ValueError('Rollouts per step must be at least 32.')
+            if not math.isfinite(lbps_delta) or not (0.0 < lbps_delta < 1.0):
+                raise ValueError('LBPS delta must be strictly between 0 and 1.')
         except ValueError as exc:
             messagebox.showerror('Invalid settings', str(exc))
             return
@@ -506,6 +520,7 @@ class InteractiveMPPIViewer:
             'seed': seed,
             'swarm_seed': swarm_seed,
             'rollouts': rollouts,
+            'lbps_delta': lbps_delta,
             'obstacle_vertices': [vertices.copy() for vertices in self._editable_obstacle_vertices],
             'start': self._editable_start.copy(),
             'goal': self._editable_goal.copy(),
@@ -520,9 +535,14 @@ class InteractiveMPPIViewer:
         except Exception:
             self.worker_queue.put(('error', traceback.format_exc()))
 
-    def _prepare_and_run_trial(self, *, condition: str, scenario_id: str, variant_value: str, seed: int, swarm_seed: int, rollouts: int, obstacle_vertices: list[np.ndarray], start: np.ndarray, goal: np.ndarray) -> TrialBundle:
+    def _prepare_and_run_trial(
+        self, *, condition: str, scenario_id: str, variant_value: str, seed: int,
+        swarm_seed: int, rollouts: int, lbps_delta: float,
+        obstacle_vertices: list[np.ndarray], start: np.ndarray,
+        goal: np.ndarray,
+    ) -> TrialBundle:
         module = self._get_module()
-        cfg = make_protocol_config(module, rollouts)
+        cfg = make_protocol_config(module, rollouts, lbps_delta)
         scene = module.build_default_scene()
         templates = list(scene.obstacles)
         if len(obstacle_vertices) != len(templates):
@@ -653,7 +673,11 @@ class InteractiveMPPIViewer:
         outcome = 'success' if reached and (not collision) else 'collision' if collision else 'not reaching'
         runtime = float(bundle.result.runtime)
         per_step_ms = 1000.0 * runtime / max(1, len(states) - 1)
-        return f'Completed: {outcome}\nSteps: {len(states) - 1}\n'
+        return (
+            f'Completed: {outcome}\n'
+            f'Steps: {len(states) - 1}\n'
+            f'LBPS delta: {float(getattr(bundle.cfg, "lbps_delta", 0.5)):g}\n'
+        )
 
     def toggle_play(self) -> None:
         if self.bundle is None:
@@ -887,6 +911,10 @@ class InteractiveMPPIViewer:
                 extra.append(f"feasible rollouts={info['num_feasible_rollouts']}")
             if info.get('cost_min') is not None:
                 extra.append(f"min cost={float(info['cost_min']):.2f}")
+            if info.get('mppi_temperature') is not None:
+                extra.append(f"lambda={float(info['mppi_temperature']):.4g}")
+            if info.get('mppi_effective_sample_size') is not None:
+                extra.append(f"ESS={float(info['mppi_effective_sample_size']):.2f}")
             if info.get('retained_mode_clearances') is not None:
                 values = [float(value) for value in info.get('retained_mode_clearances', [])]
                 extra.append('retained clearances=[' + ', '.join(f'{value:.3f}' for value in values) + ']')

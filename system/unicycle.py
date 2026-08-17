@@ -522,6 +522,29 @@ def _unicycle_ilqr_forward_update_nb(x0, U, X, kff, Kfb, alpha, dt, v_min, v_max
     return Unew, Xnew
 
 
+
+@njit(cache=True)
+def _unicycle_linearize_trajectory_nb(X, U, dt):
+    """Return the analytic A/B sequence used by the unicycle iLQR backward pass."""
+    H = U.shape[0]
+    A = np.zeros((H, 3, 3), dtype=np.float64)
+    B = np.zeros((H, 3, 2), dtype=np.float64)
+    for t in range(H):
+        A[t, 0, 0] = 1.0
+        A[t, 1, 1] = 1.0
+        A[t, 2, 2] = 1.0
+        theta = X[t, 2]
+        v = U[t, 0]
+        c = math.cos(theta)
+        s = math.sin(theta)
+        A[t, 0, 2] = -v * s * dt
+        A[t, 1, 2] = v * c * dt
+        B[t, 0, 0] = c * dt
+        B[t, 1, 0] = s * dt
+        B[t, 2, 1] = dt
+    return A, B
+
+
 @njit(cache=True, nogil=True)
 def _unicycle_ilqr_nominal_and_positions_nb(
     x0, ref, cov_blocks, horizon, dt, v_min, v_max, omega_min, omega_max,
@@ -532,10 +555,10 @@ def _unicycle_ilqr_nominal_and_positions_nb(
     Uzero = np.zeros((horizon, 2), dtype=np.float64)
     positions = np.zeros(horizon, dtype=np.float64)
     if ref.shape[0] < 2:
-        return Uzero, positions
+        return Uzero, positions, np.zeros((horizon, 3, 3), dtype=np.float64), np.zeros((horizon, 3, 2), dtype=np.float64), np.zeros((horizon, 2), dtype=np.float64)
     arc = _path_arc_lengths_ilqr_nb(ref)
     if arc[arc.shape[0] - 1] <= 1e-10:
-        return Uzero, positions
+        return Uzero, positions, np.zeros((horizon, 3, 3), dtype=np.float64), np.zeros((horizon, 3, 2), dtype=np.float64), np.zeros((horizon, 2), dtype=np.float64)
 
     U = _unicycle_ilqr_initial_controls_nb(x0, ref, arc, horizon, dt, v_min, v_max, omega_min, omega_max)
     X = rollout_unicycle_single_nb(x0, U, dt)
@@ -577,7 +600,12 @@ def _unicycle_ilqr_nominal_and_positions_nb(
     )
     for t in range(horizon):
         positions[t] = final_progress[t]
-    return U, positions
+    A, B = _unicycle_linearize_trajectory_nb(X, U, dt)
+    ilqr_xy = np.empty((horizon, 2), dtype=np.float64)
+    for t in range(horizon):
+        ilqr_xy[t, 0] = X[t, 0]
+        ilqr_xy[t, 1] = X[t, 1]
+    return U, positions, A, B, ilqr_xy
 
 
 @njit(cache=True)
@@ -760,79 +788,71 @@ def min_clearance_nb(states, polys_padded, poly_lengths, robot_radius):
                     best = clearance
         return best
 
+
 @njit(cache=True, parallel=True)
-def sensitivity_projected_covariances_nb(x0, nominal_controls, position_covariances, lookahead_steps, fd_v, fd_omega, pseudoinverse_damping, covariance_jitter, dt, v_min, v_max, omega_min, omega_max):
-        """Project planar trajectory covariance into unicycle control space."""
-        horizon = nominal_controls.shape[0]
-        nominal_states = rollout_unicycle_single_nb(x0, nominal_controls, dt)
-        projected = np.zeros((horizon, 2, 2), dtype=np.float64)
-        damping_sq = pseudoinverse_damping * pseudoinverse_damping
-        for t in prange(horizon):
-            interval = min(max(1, int(lookahead_steps)), horizon - t)
-            jacobian = np.zeros((2, 2), dtype=np.float64)
-            for control_index in range(2):
-                delta = fd_v if control_index == 0 else fd_omega
-                lower = v_min if control_index == 0 else omega_min
-                upper = v_max if control_index == 0 else omega_max
-                center = nominal_controls[t, control_index]
-                plus_value = min(center + delta, upper)
-                minus_value = max(center - delta, lower)
-                denominator = plus_value - minus_value
-                if denominator <= 1e-12:
-                    continue
-                plus_state = nominal_states[t].copy()
-                minus_state = nominal_states[t].copy()
-                for k in range(interval):
-                    v_plus = nominal_controls[t + k, 0]
-                    omega_plus = nominal_controls[t + k, 1]
-                    v_minus = v_plus
-                    omega_minus = omega_plus
-                    if k == 0:
-                        if control_index == 0:
-                            v_plus = plus_value
-                            v_minus = minus_value
-                        else:
-                            omega_plus = plus_value
-                            omega_minus = minus_value
-                    plus_theta = plus_state[2]
-                    plus_state[0] += v_plus * math.cos(plus_theta) * dt
-                    plus_state[1] += v_plus * math.sin(plus_theta) * dt
-                    plus_state[2] = _wrap_angle_nb(plus_theta + omega_plus * dt)
-                    minus_theta = minus_state[2]
-                    minus_state[0] += v_minus * math.cos(minus_theta) * dt
-                    minus_state[1] += v_minus * math.sin(minus_theta) * dt
-                    minus_state[2] = _wrap_angle_nb(minus_theta + omega_minus * dt)
-                jacobian[0, control_index] = (plus_state[0] - minus_state[0]) / denominator
-                jacobian[1, control_index] = (plus_state[1] - minus_state[1]) / denominator
-            a00 = jacobian[0, 0] * jacobian[0, 0] + jacobian[0, 1] * jacobian[0, 1] + damping_sq
-            a01 = jacobian[0, 0] * jacobian[1, 0] + jacobian[0, 1] * jacobian[1, 1]
-            a11 = jacobian[1, 0] * jacobian[1, 0] + jacobian[1, 1] * jacobian[1, 1] + damping_sq
-            determinant = a00 * a11 - a01 * a01
-            if determinant < 1e-18:
-                determinant = 1e-18
-            inv00 = a11 / determinant
-            inv01 = -a01 / determinant
-            inv11 = a00 / determinant
-            pinv00 = jacobian[0, 0] * inv00 + jacobian[1, 0] * inv01
-            pinv01 = jacobian[0, 0] * inv01 + jacobian[1, 0] * inv11
-            pinv10 = jacobian[0, 1] * inv00 + jacobian[1, 1] * inv01
-            pinv11 = jacobian[0, 1] * inv01 + jacobian[1, 1] * inv11
-            s00 = position_covariances[t, 0, 0]
-            s01 = 0.5 * (position_covariances[t, 0, 1] + position_covariances[t, 1, 0])
-            s11 = position_covariances[t, 1, 1]
-            q00 = pinv00 * s00 + pinv01 * s01
-            q01 = pinv00 * s01 + pinv01 * s11
-            q10 = pinv10 * s00 + pinv11 * s01
-            q11 = pinv10 * s01 + pinv11 * s11
-            c00 = q00 * pinv00 + q01 * pinv01
-            c01 = q00 * pinv10 + q01 * pinv11
-            c10 = q10 * pinv00 + q11 * pinv01
-            c11 = q10 * pinv10 + q11 * pinv11
-            projected[t, 0, 0] = c00 + covariance_jitter
-            projected[t, 0, 1] = 0.5 * (c01 + c10)
-            projected[t, 1, 0] = projected[t, 0, 1]
-            projected[t, 1, 1] = c11 + covariance_jitter
-        return projected
+def _spg_from_jacobians_nb(A, B, cov, lookahead_steps, pseudoinverse_damping, covariance_jitter):
+    """Project planar trajectory covariance using the iLQR dynamics Jacobians."""
+    H = B.shape[0]
+    nx = B.shape[1]
+    out = np.empty((H, 2, 2), dtype=np.float64)
+    damp2 = pseudoinverse_damping * pseudoinverse_damping
+    for t in prange(H):
+        ell = min(max(1, int(lookahead_steps)), H - t)
+        S = np.empty((nx, 2), dtype=np.float64)
+        tmpS = np.empty((nx, 2), dtype=np.float64)
+        for r in range(nx):
+            S[r, 0] = B[t, r, 0]
+            S[r, 1] = B[t, r, 1]
+        for k in range(1, ell):
+            At = A[t + k]
+            for r in range(nx):
+                s0 = 0.0
+                s1 = 0.0
+                for c in range(nx):
+                    s0 += At[r, c] * S[c, 0]
+                    s1 += At[r, c] * S[c, 1]
+                tmpS[r, 0] = s0
+                tmpS[r, 1] = s1
+            swap = S
+            S = tmpS
+            tmpS = swap
+
+        j00 = S[0, 0]
+        j01 = S[0, 1]
+        j10 = S[1, 0]
+        j11 = S[1, 1]
+
+        m00 = j00 * j00 + j01 * j01 + damp2
+        m01 = j00 * j10 + j01 * j11
+        m11 = j10 * j10 + j11 * j11 + damp2
+        det = m00 * m11 - m01 * m01
+        if abs(det) < 1e-15:
+            det = 1e-15 if det >= 0.0 else -1e-15
+        im00 = m11 / det
+        im01 = -m01 / det
+        im11 = m00 / det
+
+        d00 = j00 * im00 + j10 * im01
+        d01 = j00 * im01 + j10 * im11
+        d10 = j01 * im00 + j11 * im01
+        d11 = j01 * im01 + j11 * im11
+
+        c00 = cov[t, 0, 0]
+        c01 = 0.5 * (cov[t, 0, 1] + cov[t, 1, 0])
+        c11 = cov[t, 1, 1]
+        q00 = d00 * c00 + d01 * c01
+        q01 = d00 * c01 + d01 * c11
+        q10 = d10 * c00 + d11 * c01
+        q11 = d10 * c01 + d11 * c11
+
+        out[t, 0, 0] = q00 * d00 + q01 * d01 + covariance_jitter
+        off01 = q00 * d10 + q01 * d11
+        off10 = q10 * d00 + q11 * d01
+        off = 0.5 * (off01 + off10)
+        out[t, 0, 1] = off
+        out[t, 1, 0] = off
+        out[t, 1, 1] = q10 * d10 + q11 * d11 + covariance_jitter
+    return out
 
 def _poly_vertices(obs) -> Array:
     if hasattr(obs, 'vertices'):
@@ -929,10 +949,11 @@ def _prepare_ilqr_covariance(ref: Array, cov_blocks: Optional[Array], cfg) -> Ar
     return np.ascontiguousarray(cov)
 
 
-def nominal_controls_and_arc_positions(
+
+def _nominal_controls_full(
     x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None
-) -> Tuple[Array, Array]:
-    path = np.asarray(ref, dtype=np.float64)
+):
+    path = np.ascontiguousarray(np.asarray(ref, dtype=np.float64))
     cov = _prepare_ilqr_covariance(path, cov_blocks, cfg)
     return _unicycle_ilqr_nominal_and_positions_nb(
         np.asarray(x0, dtype=np.float64), path, cov, int(cfg.horizon),
@@ -944,6 +965,34 @@ def nominal_controls_and_arc_positions(
         float(cfg.w_terminal_position), float(cfg.w_terminal_velocity), float(cfg.prior_ilqr_regularization),
     )
 
+
+def nominal_controls_and_arc_positions(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None
+) -> Tuple[Array, Array]:
+    controls, positions, _, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks)
+    return controls, positions
+
+
+def nominal_controls_and_arc_positions_with_jacobians(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
+):
+    del initial_controls
+    controls, positions, A, B, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks)
+    return controls, positions, A, B
+
+def nominal_controls_and_arc_positions_with_trajectory(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None,
+):
+    controls, positions, _, _, ilqr_xy = _nominal_controls_full(x0, ref, cfg, cov_blocks)
+    return controls, positions, ilqr_xy
+
+def nominal_controls_and_arc_positions_with_jacobians_and_trajectory(
+    x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
+):
+    del initial_controls
+    return _nominal_controls_full(x0, ref, cfg, cov_blocks)
 
 def prior_control_arc_positions(
     x0: Array, ref: Array, cfg, cov_blocks: Optional[Array] = None
@@ -985,21 +1034,29 @@ def enforce_forward_curve_proposals(U: Array, cfg: MPPIConfig) -> Array:
     U[:, :, 1] = np.clip(U[:, :, 1], cfg.omega_min, cfg.omega_max)
     return U
 
-def sensitivity_projected_control_covariances(x0: Array, nominal_controls: Array, position_covariances: Array, cfg: MPPIConfig) -> Array:
-    """Compute Eq. (26) using the Numba sensitivity-projection kernel."""
-    nominal = np.asarray(nominal_controls, dtype=np.float64)
-    covariances = np.asarray(position_covariances, dtype=np.float64)
-    horizon = int(nominal.shape[0])
-    if nominal.shape != (horizon, 2):
-        raise ValueError(f'nominal_controls must have shape (H,2), got {nominal.shape}')
-    if covariances.shape != (horizon, 2, 2):
-        raise ValueError(f'position_covariances must have shape (H,2,2), got {covariances.shape}')
-    return sensitivity_projected_covariances_nb(
-        np.asarray(x0, dtype=np.float64), nominal, covariances,
-        int(cfg.spg_lookahead_steps), float(cfg.spg_fd_accel), float(cfg.spg_fd_steering_rate),
-        float(cfg.spg_pseudoinverse_damping), float(cfg.spg_covariance_jitter),
-        float(cfg.dt), float(cfg.v_min), float(cfg.v_max), float(cfg.omega_min), float(cfg.omega_max),
+
+def project_control_covariances_from_jacobians(
+    A: Array, B: Array, covariances: Array, cfg: MPPIConfig
+) -> Array:
+    """Project trajectory covariance with the local A/B model returned by iLQR."""
+    return _spg_from_jacobians_nb(
+        np.ascontiguousarray(np.asarray(A, dtype=np.float64)),
+        np.ascontiguousarray(np.asarray(B, dtype=np.float64)),
+        np.ascontiguousarray(np.asarray(covariances, dtype=np.float64)),
+        int(cfg.spg_lookahead_steps),
+        float(cfg.spg_pseudoinverse_damping),
+        float(cfg.spg_covariance_jitter),
     )
+
+
+def sensitivity_projected_control_covariances(
+    x0: Array, nominal_controls: Array, position_covariances: Array, cfg: MPPIConfig
+) -> Array:
+    """Compatibility wrapper using the same analytic local model as unicycle iLQR."""
+    nominal = np.ascontiguousarray(np.asarray(nominal_controls, dtype=np.float64))
+    X = rollout_unicycle_single_nb(np.asarray(x0, dtype=np.float64), nominal, float(cfg.dt))
+    A, B = _unicycle_linearize_trajectory_nb(X, nominal, float(cfg.dt))
+    return project_control_covariances_from_jacobians(A, B, position_covariances, cfg)
 
 @njit(cache=True, parallel=True)
 def rollout_collision_mask_nb(X, circle_centers, circle_radii, robot_radius, hard_collision_clearance):

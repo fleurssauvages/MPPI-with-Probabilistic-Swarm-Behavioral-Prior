@@ -27,7 +27,6 @@ MPPIHomotopyMode = ctrl.MPPIHomotopyMode
 
 @dataclass
 class MPPIConfig(ctrl.ControllerConfig):
-    # Rigid-body parameters from Morbidi & Pisarski (ICRA 2021), Table I.
     mass: float = 1.0
     inertia: float = 0.081
     gravity: float = 9.8066
@@ -50,7 +49,6 @@ class MPPIConfig(ctrl.ControllerConfig):
 
     noise_thrust: float = 300.0
     noise_moment: float = 300.0
-
 
     prior_ilqr_iterations: int = 2
     prior_ilqr_line_search_steps: int = 2
@@ -183,7 +181,6 @@ def _bounded_rotor_accel_nb(w, u, rotor_speed_max, rotor_accel_max):
 @njit(cache=True, inline="always")
 def _quad_rhs_fill_nb(x, u0, u1, out, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
                       thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max):
-    # State: [x, y, vx, vy, theta, omega, omega_r, omega_l]
     wr = min(max(x[6], 0.0), rotor_speed_max)
     wl = min(max(x[7], 0.0), rotor_speed_max)
     ur = _bounded_rotor_accel_nb(wr, u0, rotor_speed_max, rotor_accel_max)
@@ -217,7 +214,6 @@ def _quad_rhs_fill_nb(x, u0, u1, out, mass, inertia, gravity, drag_x_coeff, drag
 def _planar_quadrotor_step_fill_nb(state, control, out, work, dt, mass, inertia, gravity,
                                    drag_x_coeff, drag_y_coeff, thrust_factor,
                                    rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
-    # work rows: x, k1, k2, k3, k4, temporary state. Reused across all RK4 substeps.
     x = work[0]
     k1 = work[1]
     k2 = work[2]
@@ -474,7 +470,6 @@ def _spg_from_jacobians_nb(A, B, cov, lookahead_steps, pseudoinverse_damping, co
     damp2 = pseudoinverse_damping * pseudoinverse_damping
     for t in prange(H):
         ell = min(max(1, int(lookahead_steps)), H - t)
-        # S = d x_{t+1} / d u_t, then propagate to the lookahead state.
         S = np.empty((8, 2), dtype=np.float64)
         tmpS = np.empty((8, 2), dtype=np.float64)
         for r in range(8):
@@ -498,7 +493,6 @@ def _spg_from_jacobians_nb(A, B, cov, lookahead_steps, pseudoinverse_damping, co
         if abs(det) < 1e-15:
             det = 1e-15 if det >= 0.0 else -1e-15
         im00 = m11/det; im01 = -m01/det; im11 = m00/det
-        # Jdag = J^T inv(J J^T + damping^2 I)
         d00 = j00*im00 + j10*im01
         d01 = j00*im01 + j10*im11
         d10 = j01*im00 + j11*im01
@@ -506,7 +500,6 @@ def _spg_from_jacobians_nb(A, B, cov, lookahead_steps, pseudoinverse_damping, co
         c00 = cov[t,0,0]
         c01 = 0.5*(cov[t,0,1] + cov[t,1,0])
         c11 = cov[t,1,1]
-        # D C D^T, expanded for fixed 2x2 matrices.
         q00 = d00*c00 + d01*c01; q01 = d00*c01 + d01*c11
         q10 = d10*c00 + d11*c01; q11 = d10*c01 + d11*c11
         out[t,0,0] = q00*d00 + q01*d01 + covariance_jitter
@@ -712,8 +705,15 @@ def _linearize_fill_nb(x, u, A, B, xp, xm, fp, fm, up, um, work,
     for j in range(2):
         up[0] = u[0]; up[1] = u[1]
         um[0] = u[0]; um[1] = u[1]
-        up[j] += 1.0
-        um[j] -= 1.0
+        plus = min(u[j] + 1.0, rotor_accel_max)
+        minus = max(u[j] - 1.0, -rotor_accel_max)
+        up[j] = plus
+        um[j] = minus
+        denom = plus - minus
+        if denom <= 1e-12:
+            for r in range(8):
+                B[r, j] = 0.0
+            continue
         _planar_quadrotor_step_fill_nb(x, up, fp, work, dt, mass, inertia, gravity,
                                        drag_x_coeff, drag_y_coeff, thrust_factor, rotor_arm,
                                        rotor_speed_max, rotor_accel_max, dynamics_substeps)
@@ -724,7 +724,7 @@ def _linearize_fill_nb(x, u, A, B, xp, xm, fp, fm, up, um, work,
             diff = fp[r] - fm[r]
             if r == 4:
                 diff = _wrap_angle_nb(diff)
-            B[r, j] = diff * 0.5
+            B[r, j] = diff / denom
 
 
 @njit(cache=True)
@@ -960,7 +960,8 @@ def _ilqr_nominal_nb(x0, path, cov, H, initial_U, iterations, line_search_steps,
                      thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps):
     if path.shape[0] < 2:
         return (np.zeros((H, 2), dtype=np.float64), np.zeros(H, dtype=np.float64),
-                np.zeros((H, 8, 8), dtype=np.float64), np.zeros((H, 8, 2), dtype=np.float64))
+                np.zeros((H, 8, 8), dtype=np.float64), np.zeros((H, 8, 2), dtype=np.float64),
+                np.zeros((H, 2), dtype=np.float64))
 
     arc = _path_arc_nb(path)
     if initial_U.shape[0] == H and initial_U.shape[1] == 2:
@@ -984,7 +985,6 @@ def _ilqr_nominal_nb(x0, path, cov, H, initial_U, iterations, line_search_steps,
         thrust_factor, rotor_arm, rotor_speed_max, dynamics_substeps,
     )
 
-    # Fixed workspaces reused across all iLQR iterations and line-search attempts.
     A = np.empty((H, 8, 8), dtype=np.float64)
     B = np.empty((H, 8, 2), dtype=np.float64)
     lx = np.empty((H, 8), dtype=np.float64)
@@ -1083,7 +1083,18 @@ def _ilqr_nominal_nb(x0, path, cov, H, initial_U, iterations, line_search_steps,
                 break
         if not improved:
             break
-    return U, positions, A, B
+
+    for t in range(H):
+        _linearize_fill_nb(
+            X[t], U[t], A[t], B[t], xp, xm, fp, fm, up, um, lin_work,
+            dt, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
+            thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max, dynamics_substeps,
+        )
+    ilqr_xy = np.empty((H, 2), dtype=np.float64)
+    for t in range(H):
+        ilqr_xy[t, 0] = X[t, 0]
+        ilqr_xy[t, 1] = X[t, 1]
+    return U, positions, A, B, ilqr_xy
 
 
 @njit(cache=True)
@@ -1155,7 +1166,6 @@ def _nominal_controls_full(x0: Array, ref: Array, cfg: MPPIConfig,
             seed = np.zeros((0, 2), dtype=np.float64)
             iterations = int(cfg.prior_ilqr_iterations)
         else:
-            # A shifted previous solution is already close; one correction pass is enough.
             iterations = 1
     return _ilqr_nominal_nb(
         np.asarray(x0, dtype=np.float64), path, cov,
@@ -1172,19 +1182,31 @@ def _nominal_controls_full(x0: Array, ref: Array, cfg: MPPIConfig,
 
 def nominal_controls_and_arc_positions(x0: Array, ref: Array, cfg: MPPIConfig,
                                        cov_blocks: Optional[Array] = None) -> Tuple[Array, Array]:
-    U, positions, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, None)
+    U, positions, _, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, None)
     return U, positions
 
 
 def nominal_controls_and_arc_positions_warm(x0: Array, ref: Array, cfg: MPPIConfig,
                                             cov_blocks: Optional[Array], initial_controls: Array) -> Tuple[Array, Array]:
-    U, positions, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
+    U, positions, _, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
     return U, positions
 
 
 def nominal_controls_and_arc_positions_with_jacobians(x0: Array, ref: Array, cfg: MPPIConfig,
                                                        cov_blocks: Optional[Array] = None,
                                                        initial_controls: Optional[Array] = None):
+    U, positions, A, B, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
+    return U, positions, A, B
+
+def nominal_controls_and_arc_positions_with_trajectory(x0: Array, ref: Array, cfg: MPPIConfig,
+                                                        cov_blocks: Optional[Array] = None):
+    U, positions, _, _, ilqr_xy = _nominal_controls_full(x0, ref, cfg, cov_blocks, None)
+    return U, positions, ilqr_xy
+
+def nominal_controls_and_arc_positions_with_jacobians_and_trajectory(
+    x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
+):
     return _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
 
 def prior_control_arc_positions(x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None) -> Array:
@@ -1355,6 +1377,32 @@ def mean_path_clearance(path: Array, obstacle_circles, cfg: MPPIConfig) -> float
         float(cfg.total_drone_radius),
     ))
 
+
+
+
+def exact_polygon_collision(states: Array, packed_polygons, cfg: MPPIConfig) -> bool:
+    """Exact disk-vs-polygon hard collision check using the Numba clearance kernel.
+
+    The previous implementation iterated over every state, obstacle and polygon
+    edge in Python. This wrapper reuses the model's compiled exact polygon
+    clearance routine and preserves the original convention of skipping state 0.
+    """
+    if packed_polygons is None:
+        return False
+    polygons_padded, polygon_lengths = packed_polygons
+    lengths = np.ascontiguousarray(np.asarray(polygon_lengths, dtype=np.int64))
+    if lengths.size == 0:
+        return False
+    X = np.ascontiguousarray(np.asarray(states, dtype=np.float64))
+    if X.ndim != 2 or X.shape[0] <= 1:
+        return False
+    clearance = _minimum_clearance_nb(
+        np.ascontiguousarray(X[1:]),
+        np.ascontiguousarray(np.asarray(polygons_padded, dtype=np.float64)),
+        lengths,
+        float(cfg.total_drone_radius) + float(cfg.hard_collision_clearance),
+    )
+    return bool(clearance < 0.0)
 
 def apply_final_output(x_current: Array, control: Array, previous_control: Optional[Array], obstacle_circles, goal: Array, cfg: MPPIConfig) -> Array:
     del x_current, previous_control, obstacle_circles, goal

@@ -28,7 +28,6 @@ MPPIHomotopyMode = ctrl.MPPIHomotopyMode
 
 @dataclass
 class MPPIConfig(ctrl.ControllerConfig):
-    # Rigid-body parameters from Morbidi & Pisarski (ICRA 2021), Table I.
     mass: float = 1.0
     inertia: float = 0.081
     gravity: float = 9.8066
@@ -49,7 +48,7 @@ class MPPIConfig(ctrl.ControllerConfig):
     cable_length: float = 0.6
     payload_mass: float = 0.25
     payload_radius: float = 0.08
-    payload_angular_damping: float = 6.0
+    payload_angular_damping: float = 2.0
     payload_terminal_swing_weight: float = 100.0
     payload_terminal_swing_rate_weight: float = 100.0
     payload_angle_tolerance: float = 0.12
@@ -60,7 +59,6 @@ class MPPIConfig(ctrl.ControllerConfig):
 
     noise_thrust: float = 300.0
     noise_moment: float = 300.0
-
 
     prior_ilqr_iterations: int = 2
     prior_ilqr_line_search_steps: int = 2
@@ -231,7 +229,6 @@ def _payload_position_nb(state, cable_length):
 def _quad_rhs_fill_nb(x, u0, u1, out, mass, inertia, gravity, drag_x_coeff, drag_y_coeff,
                       thrust_factor, rotor_arm, rotor_speed_max, rotor_accel_max,
                       cable_length, payload_mass, payload_angular_damping):
-    # State: [x, y, vx, vy, theta, omega, omega_r, omega_l, phi, phi_dot]
     wr = min(max(x[6], 0.0), rotor_speed_max)
     wl = min(max(x[7], 0.0), rotor_speed_max)
     ur = _bounded_rotor_accel_nb(wr, u0, rotor_speed_max, rotor_accel_max)
@@ -831,7 +828,13 @@ def _linearize_fill_nb(x, u, A, B, xp, xm, fp, fm, up, um, work,
             A[r, j] = diff / (2.0 * eps)
     for j in range(2):
         up[0]=u[0]; up[1]=u[1]; um[0]=u[0]; um[1]=u[1]
-        up[j] += 1.0; um[j] -= 1.0
+        plus=min(u[j]+1.0,rotor_accel_max); minus=max(u[j]-1.0,-rotor_accel_max)
+        up[j]=plus; um[j]=minus
+        denom=plus-minus
+        if denom <= 1e-12:
+            for r in range(STATE_DIM):
+                B[r,j]=0.0
+            continue
         _planar_quadrotor_step_fill_nb(x, up, fp, work, dt, mass, inertia, gravity,
                                        drag_x_coeff, drag_y_coeff, thrust_factor, rotor_arm,
                                        rotor_speed_max, rotor_accel_max, cable_length, payload_mass,
@@ -844,7 +847,7 @@ def _linearize_fill_nb(x, u, A, B, xp, xm, fp, fm, up, um, work,
             diff = fp[r] - fm[r]
             if r == 4 or r == 8:
                 diff = _wrap_angle_nb(diff)
-            B[r, j] = diff * 0.5
+            B[r,j] = diff/denom
 
 
 @njit(cache=True)
@@ -873,8 +876,7 @@ def _guidance_control_nb(x, qx, qy, tx, ty, max_translational_speed,
     desired_ay = 2.2 * (target_vy - x[3]) + 1.2 * (qy - x[1])
     thrust_x = desired_ax
     thrust_y = desired_ay + gravity
-    # Use the combined supported mass. The iLQR refinement then handles the
-    # pendulum coupling and swing explicitly through the full 10-state dynamics.
+
     f = (mass + payload_mass) * math.sqrt(thrust_x * thrust_x + thrust_y * thrust_y)
     theta_des = math.atan2(-thrust_x, thrust_y)
     theta_error = _wrap_angle_nb(theta_des - x[4])
@@ -1085,7 +1087,8 @@ def _ilqr_nominal_nb(x0, path, cov, H, initial_U, iterations, line_search_steps,
                      cable_length, payload_mass, payload_angular_damping, dynamics_substeps):
     if path.shape[0] < 2:
         return (np.zeros((H,2),dtype=np.float64),np.zeros(H,dtype=np.float64),
-                np.zeros((H,STATE_DIM,STATE_DIM),dtype=np.float64),np.zeros((H,STATE_DIM,2),dtype=np.float64))
+                np.zeros((H,STATE_DIM,STATE_DIM),dtype=np.float64),np.zeros((H,STATE_DIM,2),dtype=np.float64),
+                np.zeros((H,2),dtype=np.float64))
     arc=_path_arc_nb(path)
     if initial_U.shape[0]==H and initial_U.shape[1]==2:
         U=np.empty((H,2),dtype=np.float64)
@@ -1169,7 +1172,15 @@ def _ilqr_nominal_nb(x0, path, cov, H, initial_U, iterations, line_search_steps,
                 oldP=positions; positions=candidate_pos; candidate_pos=oldP
                 best_cost=candidate_cost; improved=True; break
         if not improved: break
-    return U,positions,A,B
+
+    for t in range(H):
+        _linearize_fill_nb(X[t],U[t],A[t],B[t],xp,xm,fp,fm,up,um,lin_work,
+                           dt,mass,inertia,gravity,drag_x_coeff,drag_y_coeff,thrust_factor,rotor_arm,
+                           rotor_speed_max,rotor_accel_max,cable_length,payload_mass,payload_angular_damping,dynamics_substeps)
+    ilqr_xy=np.empty((H,2),dtype=np.float64)
+    for t in range(H):
+        ilqr_xy[t,0]=X[t,0]; ilqr_xy[t,1]=X[t,1]
+    return U,positions,A,B,ilqr_xy
 
 
 @njit(cache=True)
@@ -1260,19 +1271,31 @@ def _nominal_controls_full(x0: Array, ref: Array, cfg: MPPIConfig,
 
 def nominal_controls_and_arc_positions(x0: Array, ref: Array, cfg: MPPIConfig,
                                        cov_blocks: Optional[Array] = None) -> Tuple[Array, Array]:
-    U, positions, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, None)
+    U, positions, _, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, None)
     return U, positions
 
 
 def nominal_controls_and_arc_positions_warm(x0: Array, ref: Array, cfg: MPPIConfig,
                                             cov_blocks: Optional[Array], initial_controls: Array) -> Tuple[Array, Array]:
-    U, positions, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
+    U, positions, _, _, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
     return U, positions
 
 
 def nominal_controls_and_arc_positions_with_jacobians(x0: Array, ref: Array, cfg: MPPIConfig,
                                                        cov_blocks: Optional[Array] = None,
                                                        initial_controls: Optional[Array] = None):
+    U, positions, A, B, _ = _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
+    return U, positions, A, B
+
+def nominal_controls_and_arc_positions_with_trajectory(x0: Array, ref: Array, cfg: MPPIConfig,
+                                                        cov_blocks: Optional[Array] = None):
+    U, positions, _, _, ilqr_xy = _nominal_controls_full(x0, ref, cfg, cov_blocks, None)
+    return U, positions, ilqr_xy
+
+def nominal_controls_and_arc_positions_with_jacobians_and_trajectory(
+    x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
+):
     return _nominal_controls_full(x0, ref, cfg, cov_blocks, initial_controls)
 
 def prior_control_arc_positions(x0: Array, ref: Array, cfg: MPPIConfig, cov_blocks: Optional[Array] = None) -> Array:
@@ -1465,6 +1488,29 @@ def mean_path_clearance(path: Array, obstacle_circles, cfg: MPPIConfig) -> float
         float(cfg.cable_length),
     ))
 
+
+
+
+def exact_polygon_collision(states: Array, packed_polygons, cfg: MPPIConfig) -> bool:
+    """Exact quadrotor/payload disk collision check via the Numba clearance kernel."""
+    if packed_polygons is None:
+        return False
+    polygons_padded, polygon_lengths = packed_polygons
+    lengths = np.ascontiguousarray(np.asarray(polygon_lengths, dtype=np.int64))
+    if lengths.size == 0:
+        return False
+    X = np.ascontiguousarray(np.asarray(states, dtype=np.float64))
+    if X.ndim != 2 or X.shape[0] <= 1:
+        return False
+    clearance = _minimum_clearance_nb(
+        np.ascontiguousarray(X[1:]),
+        np.ascontiguousarray(np.asarray(polygons_padded, dtype=np.float64)),
+        lengths,
+        float(cfg.total_drone_radius) + float(cfg.hard_collision_clearance),
+        float(cfg.payload_radius) + float(cfg.hard_collision_clearance),
+        float(cfg.cable_length),
+    )
+    return bool(clearance < 0.0)
 
 def apply_final_output(x_current: Array, control: Array, previous_control: Optional[Array], obstacle_circles, goal: Array, cfg: MPPIConfig) -> Array:
     del x_current, previous_control, obstacle_circles, goal
