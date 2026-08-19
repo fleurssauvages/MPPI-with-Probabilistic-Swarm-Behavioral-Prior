@@ -5,7 +5,7 @@
 </h1>
 
 <h2 style="font-size: 1.5rem; font-weight: 400; margin-top: 0;">
-  Bridging Geometric Planning and Dynamics-Aware Control
+  Racing with Dynamic Ackermann and Four-Wheel Vehicle Models
 </h2>
 
 <br>
@@ -25,199 +25,246 @@
 </div>
 
 <p align="center">
-  <img src="figures/trajectory_prior_comparison.png" alt="Priors used to inititialize the MPPI controller: on the left, the empirical trajectories, on the right the extracted gaussian representation" width="100%">
+  <img src="gifs/racing_spg_four_wheel.gif" alt="SPG racing with the four-wheel vehicle on the obstacle-free track" width="100%">
 </p>
 
 <p align="center">
-  <em>Priors used to inititialize the MPPI controller: on the left, the empirical trajectories, on the right the extracted gaussian representation.</em>
-</p>
-
-<p align="center">
-  <img src="figures/ackermann_all_variants.png" alt="Controller trajectories across no-wall, static-wall, and dynamic two-wall scenarios with every MPPI variant" width="100%">
-</p>
-
-<p align="center">
-  <em>Controller trajectories across the no-wall, static-blockage, and dynamic two-wall experimental conditions with every MPPI variant (priors).</em>
+  <em>SPG-prior MPPI on the obstacle-free racing track using the four-wheel model with individual wheel dynamics and chassis roll.</em>
 </p>
 
 ---
 
 ## Overview
 
-Model Predictive Path Integral (MPPI) control is a sampling-based, receding-horizon method for nonlinear systems. Its performance depends heavily on the proposal distribution: proposals that are too narrow can miss feasible routes, while overly broad proposals waste a limited rollout budget.
+This project studies trajectory-prior-conditioned Model Predictive Path Integral (MPPI) control in a racing setting with nonlinear ground-vehicle dynamics.
 
-This project improves MPPI by conditioning its proposals on geometric trajectories grouped by homotopy class. A topology-aware fish-school planner discovers collision-free routes around obstacles, and the resulting trajectory priors guide MPPI toward distinct topological alternatives.
+Two vehicle models are supported in the same controller and visualization stack:
 
-The geometric prior changes **where MPPI samples**. It does not replace the system model or modify the shared rollout objective. Dynamic feasibility is still evaluated through the predictive dynamics at every control step.
+- a 7-state dynamic Ackermann model with lateral dynamics, tire-force saturation, aerodynamic drag, rolling resistance, and steering dynamics;
+- a 13-state four-wheel model with independent wheel angular velocities, longitudinal and lateral slip, combined tire-force saturation, longitudinal and lateral load transfer, chassis roll, suspension stiffness and damping, and coupled yaw/lateral/roll dynamics.
+
+Both models use the same two control inputs: longitudinal acceleration and steering rate. This keeps the controller interface fixed while increasing the dynamic complexity of the plant.
+
+The project contains two racing environments:
+
+1. `racing_viewer.py` — a clean closed oval used to compare controller behavior without obstacles.
+2. `racing_viewer_obstacles.py` — a larger oval with Fish-generated multimodal trajectory priors, fixed obstacles, optional dynamic walls, exact executed-vehicle collision checking, and conservative rollout collision checks.
+
+The central idea is to use geometric trajectory priors to decide where a finite MPPI rollout budget should be placed. The prior guides the proposal distribution; all sampled controls are still propagated through the selected vehicle dynamics and evaluated by the same racing objective.
 
 ### Key ideas
 
 <table>
   <tr>
     <td width="50%" valign="top">
-      <strong>1. Discover diverse routes</strong><br>
-      Generate collision-free paths using a topology-aware stochastic planner.
+      <strong>1. Shared controller interface</strong><br>
+      Ackermann and four-wheel vehicles use the same MPPI variants, control inputs, racing objective, and visualization pipeline.
     </td>
     <td width="50%" valign="top">
-      <strong>2. Separate homotopy classes</strong><br>
-      Group trajectories by homotopy signature.
-    </td>
-  </tr>
-  <tr>
-    <td width="50%" valign="top">
-      <strong>3. Build trajectory priors</strong><br>
-      Represent each route class with empirical paths, mean trajectories, and covariance information.
-    </td>
-    <td width="50%" valign="top">
-      <strong>4. Convert geometry into controls</strong><br>
-      Localize each path and convert it into model-specific nominal controls.
+      <strong>2. Multimodal geometric priors</strong><br>
+      The obstacle viewer builds homotopy-conditioned Fish priors on the two straights and joins them into complete racing modes.
     </td>
   </tr>
   <tr>
     <td width="50%" valign="top">
-      <strong>5. Condition MPPI sampling</strong><br>
-      Allocate rollouts around multiple route-conditioned proposals.
+      <strong>3. Dynamics-aware nominal controls</strong><br>
+      Geometric prior means are converted into dynamically feasible model-specific nominal trajectories using iLQR-style refinement.
     </td>
     <td width="50%" valign="top">
-      <strong>6. Preserve fair comparisons</strong><br>
-      Evaluate every controller with the same dynamics and objective.
+      <strong>4. Probability-aware sampling</strong><br>
+      Active prior probabilities π<sub>h</sub> allocate the rollout budget across feasible homotopy modes.
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" valign="top">
+      <strong>5. Global MPPI update</strong><br>
+      Rollouts from all active modes are pooled and evaluated with one common racing cost before the global exponential MPPI update.
+    </td>
+    <td width="50%" valign="top">
+      <strong>6. Efficient implementation</strong><br>
+      Numba kernels, fused rollout-cost evaluation, packed priors, cached collision sectors, and persistent Matplotlib artists reduce runtime overhead.
     </td>
   </tr>
 </table>
 
-### Ackermann vehicle
+---
 
-#### No wall
+## Animations
 
-| Standard MPPI | SPG-prior MPPI |
+The GIF exporter runs only the SPG-prior MPPI variant with the default parameters of both viewers. The exported frames contain only the visualization: no axes, legend, title, GUI controls, or diagnostic text.
+
+### Obstacle-free racing
+
+| Ackermann | Four-wheel |
 |:---:|:---:|
-| <img src="gifs/ackerman/no_wall/standard_mppi/animation.gif" width="420"> | <img src="gifs/ackerman/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+| <img src="gifs/racing_spg_ackermann.gif" width="460" alt="Ackermann SPG racing on the obstacle-free track"> | <img src="gifs/racing_spg_four_wheel.gif" width="460" alt="Four-wheel SPG racing on the obstacle-free track"> |
 
-#### Static blockage
+### Racing with obstacles
 
-| Standard MPPI | SPG-prior MPPI |
+| Ackermann | Four-wheel |
 |:---:|:---:|
-| <img src="gifs/ackerman/static/standard_mppi/animation.gif" width="420"> | <img src="gifs/ackerman/static/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+| <img src="gifs/racing_obstacles_spg_ackermann.gif" width="460" alt="Ackermann SPG racing with obstacles"> | <img src="gifs/racing_obstacles_spg_four_wheel.gif" width="460" alt="Four-wheel SPG racing with obstacles"> |
 
-#### Dynamic blockage
+The four-wheel vehicle uses a distinct magenta body color, while the Ackermann vehicle uses cyan. Both use the same body footprint and track rendering so that differences in behavior come from the dynamics rather than from geometry or visualization scale.
 
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/ackerman/dynamic/standard_mppi/animation.gif" width="420"> | <img src="gifs/ackerman/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
+---
 
-### Planar quadrotor
+## Methods
 
-#### No wall
-
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/planar_quadrotor/no_wall/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
-
-#### Static blockage
-
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/planar_quadrotor/static/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor/static/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
-
-#### Dynamic blockage
-
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/planar_quadrotor/dynamic/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
-
-### Planar quadrotor with suspended payload
-
-#### No wall
-
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/planar_quadrotor_payload/no_wall/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor_payload/no_wall/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
-
-#### Static blockage
-
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/planar_quadrotor_payload/static/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor_payload/static/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
-
-#### Dynamic blockage
-
-| Standard MPPI | SPG-prior MPPI |
-|:---:|:---:|
-| <img src="gifs/planar_quadrotor_payload/dynamic/standard_mppi/animation.gif" width="420"> | <img src="gifs/planar_quadrotor_payload/dynamic/sensitivity_projected_gaussian_prior_mppi/animation.gif" width="420"> |
-
-Both controllers use the same predictive dynamics and task objective. The comparison isolates the effect of informing the MPPI proposal distribution with the trajectory prior and projecting its spatial covariance into the control space.
-
-# Methods
-### Supported systems
-
-The same homotopy-conditioned proposal mechanism is evaluated across two vehicle models with different levels of dynamic complexity.
+### Supported vehicle models
 
 <table>
   <tr>
     <td width="50%" valign="top">
-      <h3>Unicycle</h3>
+      <h3>Dynamic Ackermann</h3>
       <p>
-        A compact model used for controlled ablations and rapid experimentation.
+        A 7-state nonlinear bicycle-style model with body-frame longitudinal and lateral velocity, yaw dynamics, steering dynamics, and saturated front/rear tire forces.
       </p>
       <p>
         <strong>State</strong><br>
-        Planar position and heading
+        x = [p<sub>x</sub>, p<sub>y</sub>, ψ, v<sub>x</sub>, v<sub>y</sub>, r, δ]
       </p>
       <p>
         <strong>Control</strong><br>
-        Translational velocity and angular velocity
+        u = [a, δ̇]
       </p>
       <p>
-        The unicycle model isolates the effect of the proposal distribution while keeping the system dynamics simple and interpretable.
+        The model includes friction-limited lateral tire forces, aerodynamic drag, rolling resistance, low-speed slip regularization, and state/input saturation.
       </p>
     </td>
     <td width="50%" valign="top">
-      <h3>Ackermann</h3>
+      <h3>Four-wheel + chassis dynamics</h3>
       <p>
-        A bicycle model used to test whether the same proposal strategy transfers to richer vehicle dynamics.
+        A 13-state extension with one rotational state for every wheel and explicit chassis roll dynamics.
       </p>
       <p>
         <strong>State</strong><br>
-        Planar position, heading, speed, and steering angle
+        x = [p<sub>x</sub>, p<sub>y</sub>, ψ, v<sub>x</sub>, v<sub>y</sub>, r, δ, φ, φ̇, ω<sub>FL</sub>, ω<sub>FR</sub>, ω<sub>RL</sub>, ω<sub>RR</sub>]
       </p>
       <p>
         <strong>Control</strong><br>
-        Acceleration and steering-rate commands
+        u = [a, δ̇]
       </p>
       <p>
-        This model introduces nonholonomic steering behavior and additional dynamic constraints.
+        Each wheel has its own local velocity, slip ratio, slip angle, longitudinal/lateral tire force, normal load, and rotational dynamics. The model adds combined-slip saturation, front/rear torque distribution, longitudinal and lateral load transfer, roll inertia, suspension stiffness and damping, and strong coupling between tire, yaw, lateral, and roll dynamics.
       </p>
     </td>
   </tr>
 </table>
 
-> The interactive viewer supports both systems in a single application. The active vehicle model and controller variant can be changed directly from the interface.
+The active vehicle is selected from the `Vehicle model` control in either viewer. Ackermann is the default.
+
+### Controller variants
+
+Both viewers expose the same controller family:
+
+| Variant | Description |
+|:--|:--|
+| **Planner / Centerline iLQR** | Deterministic model-specific nominal trajectory produced from the geometric reference. |
+| **Standard MPPI** | Samples around the baseline nominal without using trajectory-prior covariance. |
+| **Control bank** | Builds candidate controls from empirical planner paths and evaluates them with the selected vehicle dynamics. |
+| **Corridor prior** | Uses the prior mean trajectory as the geometric corridor but retains baseline MPPI control perturbations. |
+| **Gaussian prior** | Uses trajectory covariance to shape sampling around the local dynamically feasible nominal. |
+| **SPG prior** | Projects spatial trajectory covariance through the local predictive dynamics to obtain dynamics-aware control-space sampling covariance. |
+
+For MPPI variants, sampled control sequences are evaluated together and combined using one exponential weighted update. The deterministic iLQR variant does not perform the MPPI sampling step.
+
+### Multimodal obstacle prior
+
+The obstacle viewer generates Fish trajectories in a canonical scene and maps them rigidly onto the lower and upper racing straights. Homotopy modes from both straights are paired to form complete racing-loop modes. Fixed U-turn segments connect the two Fish-planned straights.
+
+At every control step:
+
+1. modes blocked by the current obstacle configuration are removed;
+2. the remaining mode probabilities are renormalized;
+3. the total rollout budget is divided according to the active probabilities π<sub>h</sub>;
+4. every active mode generates samples using its own Corridor, Gaussian, or SPG proposal;
+5. all rollouts are merged into one pool;
+6. one common racing objective and one global MPPI weighted update produce the applied control sequence.
+
+The obstacle viewer can display the active prior in purple. Prior mean opacity and line width follow π<sub>h</sub>. Gaussian and SPG variants additionally show a sparse set of partially transparent covariance ellipses. Covariance visualization is suppressed on the fixed U-turns to keep the plot readable.
+
+### Collision handling
+
+The obstacle viewer separates fast predictive collision checking from the final executed-state check:
+
+- MPPI rollouts use conservative circular obstacle covers and swept vehicle checks for speed;
+- the accepted executed transition is checked against the exact obstacle polygons;
+- when a collision occurs, the terminal frame is refined to the first contact state.
+
+The `hard_collision_clearance` parameter is available from both viewer interfaces.
 
 ---
 
-# Experiments
+## Experiments
 
-Each controller is evaluated under three environmental conditions.
+### 1. Obstacle-free oval
 
-| Condition | Prior generation | Execution environment | Purpose |
-|:--|:--|:--|:--|
-| **No wall** | Original environment | Original environment | Measures nominal navigation performance in the base cluttered scene. |
-| **Static blockage** | Additional walls are present | Same blocked environment | Tests planning and control when the obstruction is known in advance. |
-| **Dynamic blockage** | Additional walls are absent | Walls are introduced during execution | Tests adaptation when a previously feasible route becomes blocked. |
+`racing_viewer.py` evaluates the controller on a closed racing oval without obstacle interactions. This environment isolates the effect of the vehicle dynamics and proposal distribution.
 
-# Usage
-## Repository organization
+The default GUI configuration uses:
+
+| Parameter | Default |
+|:--|--:|
+| Vehicle | Ackermann |
+| Controller | SPG prior |
+| Laps | 10 |
+| Rollouts | 4096 |
+| Horizon | 10 |
+| Maximum speed | 8.0 m/s |
+| Playback speed | 1× |
+
+### 2. Obstacle racing
+
+`racing_viewer_obstacles.py` uses the multimodal Fish prior together with fixed track obstacles and optional dynamic walls.
+
+Three wall modes are available:
+
+| Mode | Behavior |
+|:--|:--|
+| **No wall** | Uses the fixed obstacle layout only. |
+| **Dynamic 1** | Introduces one path-cutting dynamic wall after each completed half-lap; each wall persists for one lap. |
+| **Dynamic 2** | Uses the same generation rule, but each dynamic wall persists for two laps, allowing multiple simultaneous active walls. |
+
+The default GUI configuration uses:
+
+| Parameter | Default |
+|:--|--:|
+| Vehicle | Ackermann |
+| Controller | SPG prior |
+| Wall mode | No wall |
+| Laps | 10 |
+| Rollouts | 4096 |
+| Horizon | 25 |
+| Maximum speed | 6.0 m/s |
+| Hard collision clearance | 0.02 m |
+| Playback speed | 4× |
+
+---
+
+## Usage
+
+### Repository organization
 
 ```text
-├── geometry/                 Geometric and collision-checking utilities
-├── graph/                    Graph construction and topology components
-├── planner/                  Fish-school trajectory generation
-├── system/                   Implements the MPPI for the unicycle and ackermann vehicles
-├── viewer.py                 Interactive visualization interface
-├── requirements.txt          Project dependencies
+├── racing_viewer.py             Obstacle-free racing viewer
+├── racing_viewer_obstacles.py   Racing viewer with Fish priors, obstacles, and dynamic walls
+├── export_spg_gifs.py           Clean SPG GIF exporter for both vehicle models and both viewers
+└── system/
+    ├── __init__.py
+    ├── controller.py            Shared MPPI, prior, Fish-planner, and controller utilities
+    ├── ackermann.py             7-state dynamic Ackermann model
+    └── four_wheel.py            13-state four-wheel and chassis-roll model
 ```
 
-## Getting started
+The obstacle viewer also expects the Fish-planner project resources to be available from the repository root:
+
+```text
+geometry/
+graph/
+planner/
+save/policy.pkl
+```
 
 ### 1. Create a virtual environment
 
@@ -225,43 +272,47 @@ Each controller is evaluated under three environmental conditions.
 python -m venv .venv
 ```
 
-Activate it according to your operating system.
-
-### 2. Install the dependencies
+Activate it for your operating system, then install the Python packages used by the racing code:
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt
+python -m pip install numpy numba matplotlib pillow
 ```
 
-### 3. Launch the interactive viewer
+Tkinter is required for the interactive viewers and is commonly provided by the system Python installation. The obstacle viewer additionally requires the dependencies of the Fish planner used by `geometry/`, `graph/`, and `planner/`.
+
+### 2. Run the obstacle-free viewer
 
 ```bash
-python viewer.py
+python racing_viewer.py
 ```
 
-The viewer provides a unified interface for both supported vehicle models. From the control panel you can:
+From the control panel you can:
 
-- Switch between the **Unicycle** and **Ackermann** systems.
-- Select any available controller variant.
-- Run all experimental scenarios.
-- Inspect sampled trajectories, covariance ellipses, obstacle predictions, and control rollouts.
+- switch between **Ackermann** and **Four-wheel** dynamics;
+- select any controller variant;
+- change rollout count, horizon, speed, temporal noise, Σ₀ scale, LBPS parameter, and hard collision clearance;
+- show or hide the prior;
+- play, pause, and inspect the completed simulation.
 
-Changing the active system automatically reloads the corresponding simulation module and updates the visualization.
-
-### 4. Reproduce the experiments
-
-To regenerate all experiment results, run the simulation scripts for each vehicle model.
+### 3. Run the obstacle viewer
 
 ```bash
-# Unicycle experiments
-python runs_unicycle.py
-
-# Ackermann experiments
-python runs_ackerman.py
+python racing_viewer_obstacles.py
 ```
 
-Each script evaluates every controller variant across all experimental conditions and saves the resulting trajectories, controls, covariance estimates, and execution statistics.
+This viewer adds:
+
+- multimodal Fish priors;
+- active-mode probability visualization;
+- fixed obstacles and barriers;
+- `No wall`, `Dynamic 1`, and `Dynamic 2` wall modes;
+- exact terminal collision visualization.
 
 ---
 
+## Notes on comparison
+
+Within a given environment and vehicle model, controller variants share the same predictive dynamics and racing objective. This is intentional: the comparison is designed to isolate the effect of how the finite rollout budget is initialized and distributed in control space.
+
+Switching from Ackermann to the four-wheel model changes the plant, not the controller family. The four-wheel benchmark therefore tests whether the same homotopy-conditioned MPPI machinery remains effective when wheel slip, load transfer, wheel rotational dynamics, chassis roll, and tire-force coupling make the predictive dynamics substantially more nonlinear.
