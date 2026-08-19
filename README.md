@@ -105,6 +105,12 @@ The GIF exporter runs only the SPG-prior MPPI variant with the default parameter
 |:---:|:---:|
 | <img src="gifs/racing_obstacles_spg_ackermann.gif" width="460" alt="Ackermann SPG racing with obstacles"> | <img src="gifs/racing_obstacles_spg_four_wheel.gif" width="460" alt="Four-wheel SPG racing with obstacles"> |
 
+### Racing with obstacles and dynamic walls
+
+| Ackermann | Four-wheel |
+|:---:|:---:|
+| <img src="gifs/racing_obstacles_dynamic_2_spg_ackermann.gif" width="460" alt="Ackermann SPG racing with obstacles"> | <img src="gifs/racing_obstacles_dynamic_2_spg_four_wheel.gif" width="460" alt="Four-wheel SPG racing with obstacles"> |
+
 ---
 
 ## Methods
