@@ -48,7 +48,7 @@ Both models use the same two control inputs: longitudinal acceleration and steer
 The project contains two racing environments:
 
 1. `racing_viewer.py` — a clean closed oval used to compare controller behavior without obstacles.
-2. `racing_viewer_obstacles.py` — a larger oval with Fish-generated multimodal trajectory priors, fixed obstacles, optional dynamic walls, exact executed-vehicle collision checking, and conservative rollout collision checks.
+2. `racing_viewer_obstacles.py` — a larger oval with multimodal trajectory priors, fixed obstacles, optional dynamic walls
 
 The central idea is to use geometric trajectory priors to decide where a finite MPPI rollout budget should be placed. The prior guides the proposal distribution; all sampled controls are still propagated through the selected vehicle dynamics and evaluated by the same racing objective.
 
@@ -105,8 +105,6 @@ The GIF exporter runs only the SPG-prior MPPI variant with the default parameter
 |:---:|:---:|
 | <img src="gifs/racing_obstacles_spg_ackermann.gif" width="460" alt="Ackermann SPG racing with obstacles"> | <img src="gifs/racing_obstacles_spg_four_wheel.gif" width="460" alt="Four-wheel SPG racing with obstacles"> |
 
-The four-wheel vehicle uses a distinct magenta body color, while the Ackermann vehicle uses cyan. Both use the same body footprint and track rendering so that differences in behavior come from the dynamics rather than from geometry or visualization scale.
-
 ---
 
 ## Methods
@@ -162,7 +160,7 @@ Both viewers expose the same controller family:
 |:--|:--|
 | **Planner / Centerline iLQR** | Deterministic model-specific nominal trajectory produced from the geometric reference. |
 | **Standard MPPI** | Samples around the baseline nominal without using trajectory-prior covariance. |
-| **Control bank** | Builds candidate controls from empirical planner paths and evaluates them with the selected vehicle dynamics. |
+| **Control bank** | Builds candidate controls from empirical planner paths and evaluates them with the selected vehicle dynamics. Do not run except if you are ready to wait. |
 | **Corridor prior** | Uses the prior mean trajectory as the geometric corridor but retains baseline MPPI control perturbations. |
 | **Gaussian prior** | Uses trajectory covariance to shape sampling around the local dynamically feasible nominal. |
 | **SPG prior** | Projects spatial trajectory covariance through the local predictive dynamics to obtain dynamics-aware control-space sampling covariance. |
@@ -171,7 +169,7 @@ For MPPI variants, sampled control sequences are evaluated together and combined
 
 ### Multimodal obstacle prior
 
-The obstacle viewer generates Fish trajectories in a canonical scene and maps them rigidly onto the lower and upper racing straights. Homotopy modes from both straights are paired to form complete racing-loop modes. Fixed U-turn segments connect the two Fish-planned straights.
+The obstacle viewer generates trajectories in a canonical scene and maps them rigidly onto the lower and upper racing straights. Homotopy modes from both straights are paired to form complete racing-loop modes. Fixed U-turn segments connect the two Fish-planned straights.
 
 At every control step:
 
@@ -248,8 +246,7 @@ The default GUI configuration uses:
 
 ```text
 ├── racing_viewer.py             Obstacle-free racing viewer
-├── racing_viewer_obstacles.py   Racing viewer with Fish priors, obstacles, and dynamic walls
-├── export_spg_gifs.py           Clean SPG GIF exporter for both vehicle models and both viewers
+├── racing_viewer_obstacles.py   Racing with obstacles
 └── system/
     ├── __init__.py
     ├── controller.py            Shared MPPI, prior, Fish-planner, and controller utilities
@@ -257,13 +254,12 @@ The default GUI configuration uses:
     └── four_wheel.py            13-state four-wheel and chassis-roll model
 ```
 
-The obstacle viewer also expects the Fish-planner project resources to be available from the repository root:
+The obstacle viewer also expects the planner project resources to be available from the repository root:
 
 ```text
 geometry/
 graph/
 planner/
-save/policy.pkl
 ```
 
 ### 1. Create a virtual environment
@@ -276,7 +272,7 @@ Activate it for your operating system, then install the Python packages used by 
 
 ```bash
 python -m pip install --upgrade pip
-python -m pip install numpy numba matplotlib pillow
+python -m pip install requirements.txt
 ```
 
 Tkinter is required for the interactive viewers and is commonly provided by the system Python installation. The obstacle viewer additionally requires the dependencies of the Fish planner used by `geometry/`, `graph/`, and `planner/`.
@@ -292,7 +288,6 @@ From the control panel you can:
 - switch between **Ackermann** and **Four-wheel** dynamics;
 - select any controller variant;
 - change rollout count, horizon, speed, temporal noise, Σ₀ scale, LBPS parameter, and hard collision clearance;
-- show or hide the prior;
 - play, pause, and inspect the completed simulation.
 
 ### 3. Run the obstacle viewer
@@ -303,11 +298,11 @@ python racing_viewer_obstacles.py
 
 This viewer adds:
 
-- multimodal Fish priors;
+- multimodal priors;
 - active-mode probability visualization;
 - fixed obstacles and barriers;
 - `No wall`, `Dynamic 1`, and `Dynamic 2` wall modes;
-- exact terminal collision visualization.
+- show or hide the prior
 
 ---
 
