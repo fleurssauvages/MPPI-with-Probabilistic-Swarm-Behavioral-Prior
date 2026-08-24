@@ -5,7 +5,7 @@ from dataclasses import dataclass, fields
 from typing import List, Optional, Tuple
 
 import numpy as np
-from numba import njit
+from numba import njit, prange
 
 from . import ackermann
 
@@ -23,12 +23,12 @@ class MPPIConfig(ackermann.MPPIConfig):
     wheel_inertia: float = 0.025
     longitudinal_tire_stiffness: float = 100.0
     roll_inertia: float = 0.38
-    roll_stiffness: float = 32.0
-    roll_damping: float = 4.5
+    roll_stiffness: float = 60.0
+    roll_damping: float = 12.0
     cg_height: float = 0.15
     roll_center_height: float = 0.05
     wheel_damping: float = 0.004
-    wheel_speed_limit: float = 95.0
+    wheel_speed_limit: float = 220.0
     drive_bias_front: float = 0.45
     minimum_normal_load_fraction: float = 0.02
     roll_angle_limit: float = 0.45
@@ -152,6 +152,16 @@ def _dynamic_four_wheel_step_nb(
     front_fraction = rear_axle_distance / wheelbase
     rear_fraction = front_axle_distance / wheelbase
     min_normal = max(1e-6, minimum_normal_load_fraction * mass * gravity)
+    front_cornering = 0.5 * cornering_stiffness_front
+    rear_cornering = 0.5 * cornering_stiffness_rear
+    requested_force = mass * accel
+    front_torque = 0.5 * requested_force * drive_bias_front * wheel_radius
+    rear_torque = 0.5 * requested_force * (1.0 - drive_bias_front) * wheel_radius
+    inv_wheel_inertia = 1.0 / wheel_inertia
+    inv_mass = 1.0 / mass
+    inv_yaw_inertia = 1.0 / yaw_inertia
+    inv_roll_inertia = 1.0 / roll_inertia
+    roll_arm = max(cg_height - roll_center_height, 0.0)
     for _ in range(max(1, int(dynamics_substeps))):
         longitudinal_transfer = mass * accel * cg_height / wheelbase
         front_total = mass * gravity * front_fraction - longitudinal_transfer
@@ -161,73 +171,97 @@ def _dynamic_four_wheel_step_nb(
         lateral_transfer = (mass * lateral_estimate * cg_height + suspension_moment) / max(track_width, 1e-6)
         front_transfer = lateral_transfer * front_fraction
         rear_transfer = lateral_transfer * rear_fraction
-        fz0 = max(min_normal, 0.5 * front_total - 0.5 * front_transfer)
-        fz1 = max(min_normal, 0.5 * front_total + 0.5 * front_transfer)
-        fz2 = max(min_normal, 0.5 * rear_total - 0.5 * rear_transfer)
-        fz3 = max(min_normal, 0.5 * rear_total + 0.5 * rear_transfer)
-        total_fx = 0.0
-        total_fy = 0.0
-        yaw_moment = 0.0
-        tire_fx = np.empty(4, dtype=np.float64)
-        omegas = np.empty(4, dtype=np.float64)
-        omegas[0] = omega_fl
-        omegas[1] = omega_fr
-        omegas[2] = omega_rl
-        omegas[3] = omega_rr
-        fz = np.empty(4, dtype=np.float64)
-        fz[0] = fz0
-        fz[1] = fz1
-        fz[2] = fz2
-        fz[3] = fz3
-        for wheel in range(4):
-            front = wheel < 2
-            left = wheel == 0 or wheel == 2
-            xw = front_axle_distance if front else -rear_axle_distance
-            yw = half_track if left else -half_track
-            delta = steering if front else 0.0
-            local_vx = vx - yaw_rate * yw
-            local_vy = vy + yaw_rate * xw
-            cd = math.cos(delta)
-            sd = math.sin(delta)
-            wheel_vx = cd * local_vx + sd * local_vy
-            wheel_vy = -sd * local_vx + cd * local_vy
-            speed = max(abs(wheel_vx), minimum_tire_speed)
-            kappa = (wheel_radius * omegas[wheel] - wheel_vx) / speed
-            alpha = math.atan2(wheel_vy, speed)
-            cornering = 0.5 * (cornering_stiffness_front if front else cornering_stiffness_rear)
-            fx_wheel, fy_wheel = _combined_tire_force_nb(
-                kappa,
-                alpha,
-                fz[wheel],
-                longitudinal_tire_stiffness,
-                cornering,
-                tire_friction_coefficient,
-            )
-            tire_fx[wheel] = fx_wheel
-            fx_body = cd * fx_wheel - sd * fy_wheel
-            fy_body = sd * fx_wheel + cd * fy_wheel
-            total_fx += fx_body
-            total_fy += fy_body
-            yaw_moment += xw * fy_body - yw * fx_body
-        requested_force = mass * accel
-        front_torque = 0.5 * requested_force * drive_bias_front * wheel_radius
-        rear_torque = 0.5 * requested_force * (1.0 - drive_bias_front) * wheel_radius
-        omega_fl_dot = (front_torque - tire_fx[0] * wheel_radius - wheel_damping * omega_fl) / wheel_inertia
-        omega_fr_dot = (front_torque - tire_fx[1] * wheel_radius - wheel_damping * omega_fr) / wheel_inertia
-        omega_rl_dot = (rear_torque - tire_fx[2] * wheel_radius - wheel_damping * omega_rl) / wheel_inertia
-        omega_rr_dot = (rear_torque - tire_fx[3] * wheel_radius - wheel_damping * omega_rr) / wheel_inertia
+        fz_fl = max(min_normal, 0.5 * front_total - 0.5 * front_transfer)
+        fz_fr = max(min_normal, 0.5 * front_total + 0.5 * front_transfer)
+        fz_rl = max(min_normal, 0.5 * rear_total - 0.5 * rear_transfer)
+        fz_rr = max(min_normal, 0.5 * rear_total + 0.5 * rear_transfer)
+        cd = math.cos(steering)
+        sd = math.sin(steering)
+        front_local_vy = vy + yaw_rate * front_axle_distance
+        rear_local_vy = vy - yaw_rate * rear_axle_distance
+        local_vx_fl = vx - yaw_rate * half_track
+        wheel_vx_fl = cd * local_vx_fl + sd * front_local_vy
+        wheel_vy_fl = -sd * local_vx_fl + cd * front_local_vy
+        speed_fl = max(abs(wheel_vx_fl), minimum_tire_speed)
+        kappa_fl = (wheel_radius * omega_fl - wheel_vx_fl) / speed_fl
+        alpha_fl = math.atan2(wheel_vy_fl, speed_fl)
+        fx_fl, fy_fl = _combined_tire_force_nb(
+            kappa_fl,
+            alpha_fl,
+            fz_fl,
+            longitudinal_tire_stiffness,
+            front_cornering,
+            tire_friction_coefficient,
+        )
+        fx_body_fl = cd * fx_fl - sd * fy_fl
+        fy_body_fl = sd * fx_fl + cd * fy_fl
+        total_fx = fx_body_fl
+        total_fy = fy_body_fl
+        yaw_moment = front_axle_distance * fy_body_fl - half_track * fx_body_fl
+        local_vx_fr = vx + yaw_rate * half_track
+        wheel_vx_fr = cd * local_vx_fr + sd * front_local_vy
+        wheel_vy_fr = -sd * local_vx_fr + cd * front_local_vy
+        speed_fr = max(abs(wheel_vx_fr), minimum_tire_speed)
+        kappa_fr = (wheel_radius * omega_fr - wheel_vx_fr) / speed_fr
+        alpha_fr = math.atan2(wheel_vy_fr, speed_fr)
+        fx_fr, fy_fr = _combined_tire_force_nb(
+            kappa_fr,
+            alpha_fr,
+            fz_fr,
+            longitudinal_tire_stiffness,
+            front_cornering,
+            tire_friction_coefficient,
+        )
+        fx_body_fr = cd * fx_fr - sd * fy_fr
+        fy_body_fr = sd * fx_fr + cd * fy_fr
+        total_fx += fx_body_fr
+        total_fy += fy_body_fr
+        yaw_moment += front_axle_distance * fy_body_fr + half_track * fx_body_fr
+        local_vx_rl = vx - yaw_rate * half_track
+        speed_rl = max(abs(local_vx_rl), minimum_tire_speed)
+        kappa_rl = (wheel_radius * omega_rl - local_vx_rl) / speed_rl
+        alpha_rl = math.atan2(rear_local_vy, speed_rl)
+        fx_rl, fy_rl = _combined_tire_force_nb(
+            kappa_rl,
+            alpha_rl,
+            fz_rl,
+            longitudinal_tire_stiffness,
+            rear_cornering,
+            tire_friction_coefficient,
+        )
+        total_fx += fx_rl
+        total_fy += fy_rl
+        yaw_moment += -rear_axle_distance * fy_rl - half_track * fx_rl
+        local_vx_rr = vx + yaw_rate * half_track
+        speed_rr = max(abs(local_vx_rr), minimum_tire_speed)
+        kappa_rr = (wheel_radius * omega_rr - local_vx_rr) / speed_rr
+        alpha_rr = math.atan2(rear_local_vy, speed_rr)
+        fx_rr, fy_rr = _combined_tire_force_nb(
+            kappa_rr,
+            alpha_rr,
+            fz_rr,
+            longitudinal_tire_stiffness,
+            rear_cornering,
+            tire_friction_coefficient,
+        )
+        total_fx += fx_rr
+        total_fy += fy_rr
+        yaw_moment += -rear_axle_distance * fy_rr + half_track * fx_rr
+        omega_fl_dot = (front_torque - fx_fl * wheel_radius - wheel_damping * omega_fl) * inv_wheel_inertia
+        omega_fr_dot = (front_torque - fx_fr * wheel_radius - wheel_damping * omega_fr) * inv_wheel_inertia
+        omega_rl_dot = (rear_torque - fx_rl * wheel_radius - wheel_damping * omega_rl) * inv_wheel_inertia
+        omega_rr_dot = (rear_torque - fx_rr * wheel_radius - wheel_damping * omega_rr) * inv_wheel_inertia
         total_fx -= aerodynamic_drag_coefficient * vx * abs(vx)
         total_fx -= rolling_resistance_force * math.tanh(vx / 0.1)
         cpsi = math.cos(psi)
         spsi = math.sin(psi)
         px_dot = vx * cpsi - vy * spsi
         py_dot = vx * spsi + vy * cpsi
-        vx_dot = total_fx / mass + yaw_rate * vy
-        vy_dot = total_fy / mass - yaw_rate * vx
-        yaw_accel = yaw_moment / yaw_inertia
-        roll_moment = total_fy * max(cg_height - roll_center_height, 0.0)
-        roll_moment -= roll_stiffness * roll + roll_damping * roll_rate
-        roll_accel = roll_moment / roll_inertia
+        vx_dot = total_fx * inv_mass + yaw_rate * vy
+        vy_dot = total_fy * inv_mass - yaw_rate * vx
+        yaw_accel = yaw_moment * inv_yaw_inertia
+        roll_moment = total_fy * roll_arm - roll_stiffness * roll - roll_damping * roll_rate
+        roll_accel = roll_moment * inv_roll_inertia
         px += h * px_dot
         py += h * py_dot
         psi = _wrap_angle_nb(psi + h * yaw_rate)
@@ -641,9 +675,10 @@ def nominal_controls_to_track_path(
     ref: Array,
     cfg: MPPIConfig,
     cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
 ) -> Array:
     controls, _, _, _, _ = _full_model_ilqr_solution(
-        x0, ref, cfg, cov_blocks, need_jacobians=False
+        x0, ref, cfg, cov_blocks, initial_controls=initial_controls, need_jacobians=False
     )
     return controls
 
@@ -653,9 +688,10 @@ def nominal_controls_and_arc_positions(
     ref: Array,
     cfg: MPPIConfig,
     cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
 ) -> Tuple[Array, Array]:
     controls, positions, _, _, _ = _full_model_ilqr_solution(
-        x0, ref, cfg, cov_blocks, need_jacobians=False
+        x0, ref, cfg, cov_blocks, initial_controls=initial_controls, need_jacobians=False
     )
     return controls, positions
 
@@ -665,9 +701,10 @@ def nominal_controls_and_arc_positions_with_trajectory(
     ref: Array,
     cfg: MPPIConfig,
     cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
 ):
     controls, positions, _, _, trajectory = _full_model_ilqr_solution(
-        x0, ref, cfg, cov_blocks, need_jacobians=False
+        x0, ref, cfg, cov_blocks, initial_controls=initial_controls, need_jacobians=False
     )
     return controls, positions, trajectory
 
@@ -736,41 +773,207 @@ def batch_nominal_controls_and_trajectories(
     lengths: Array,
     cfg: MPPIConfig,
     cov_blocks: Optional[Array] = None,
+    initial_controls: Optional[Array] = None,
+    initial_mask: Optional[Array] = None,
 ) -> Tuple[Array, Array, Array]:
     controls, positions, _, _, trajectories = batch_nominal_solutions(
-        x0, refs, lengths, cfg, cov_blocks, need_final_jacobians=False
+        x0,
+        refs,
+        lengths,
+        cfg,
+        cov_blocks,
+        need_final_jacobians=False,
+        initial_controls=initial_controls,
+        initial_mask=initial_mask,
     )
     return controls, positions, trajectories
 
 
-def batch_nominal_solutions(
-    x0: Array,
-    refs: Array,
-    lengths: Array,
-    cfg: MPPIConfig,
-    cov_blocks: Optional[Array] = None,
-    need_final_jacobians: bool = True,
-) -> Tuple[Array, Array, Array, Array, Array]:
-    packed_refs = np.ascontiguousarray(np.asarray(refs, dtype=np.float64))
-    packed_lengths = np.ascontiguousarray(np.asarray(lengths, dtype=np.int64))
-    initial = _ackermann_batch_initial_controls(x0, packed_refs, packed_lengths, cfg, cov_blocks)
-    count = packed_refs.shape[0]
-    horizon = int(cfg.horizon)
+
+@njit(cache=True, nogil=True)
+def _four_wheel_ilqr_nominal_prepared_nb(
+    x0,
+    ref,
+    cov,
+    initial_controls,
+    horizon,
+    iterations,
+    line_search_steps,
+    covariance_floor,
+    mahalanobis_weight,
+    heading_weight,
+    progress_weight,
+    control_accel_weight,
+    control_steering_rate_weight,
+    terminal_position_weight,
+    terminal_velocity_weight,
+    regularization,
+    roll_weight,
+    roll_rate_weight,
+    need_final_jacobians,
+    *args,
+):
+    controls = np.zeros((horizon, 2), dtype=np.float64)
+    accel_min = args[17]
+    accel_max = args[18]
+    steering_rate_min = args[21]
+    steering_rate_max = args[22]
+    usable = min(horizon, initial_controls.shape[0])
+    for t in range(usable):
+        controls[t, 0] = min(max(initial_controls[t, 0], accel_min), accel_max)
+        controls[t, 1] = min(max(initial_controls[t, 1], steering_rate_min), steering_rate_max)
+    arc = ackermann._path_arc_lengths_ilqr_nb(ref)
+    states = rollout_four_wheel_single_nb(x0, controls, *args)
+    best_cost = _four_wheel_ilqr_total_cost_nb(
+        states,
+        controls,
+        ref,
+        arc,
+        cov,
+        covariance_floor,
+        mahalanobis_weight,
+        heading_weight,
+        progress_weight,
+        control_accel_weight,
+        control_steering_rate_weight,
+        terminal_position_weight,
+        terminal_velocity_weight,
+        roll_weight,
+        roll_rate_weight,
+    )
+    for _ in range(iterations):
+        kff, Kfb = _four_wheel_ilqr_backward_nb(
+            states,
+            controls,
+            ref,
+            arc,
+            cov,
+            covariance_floor,
+            mahalanobis_weight,
+            heading_weight,
+            progress_weight,
+            control_accel_weight,
+            control_steering_rate_weight,
+            terminal_position_weight,
+            terminal_velocity_weight,
+            regularization,
+            roll_weight,
+            roll_rate_weight,
+            *args,
+        )
+        accepted = False
+        for line_search in range(line_search_steps):
+            alpha = 0.5 ** line_search
+            trial_controls, trial_states = _four_wheel_ilqr_forward_update_nb(
+                x0, controls, states, kff, Kfb, alpha, *args
+            )
+            trial_cost = _four_wheel_ilqr_total_cost_nb(
+                trial_states,
+                trial_controls,
+                ref,
+                arc,
+                cov,
+                covariance_floor,
+                mahalanobis_weight,
+                heading_weight,
+                progress_weight,
+                control_accel_weight,
+                control_steering_rate_weight,
+                terminal_position_weight,
+                terminal_velocity_weight,
+                roll_weight,
+                roll_rate_weight,
+            )
+            if trial_cost < best_cost:
+                controls = trial_controls
+                states = trial_states
+                best_cost = trial_cost
+                accepted = True
+                break
+        if not accepted:
+            break
+    progress, _, _, _, _, _, _, _, _ = ackermann._project_ackermann_rollout_ilqr_nb(
+        states, ref, arc, cov, covariance_floor
+    )
+    positions = np.zeros(horizon, dtype=np.float64)
+    trajectory = np.zeros((horizon, 2), dtype=np.float64)
+    for t in range(horizon):
+        positions[t] = progress[t]
+        trajectory[t, 0] = states[t, 0]
+        trajectory[t, 1] = states[t, 1]
+    if need_final_jacobians:
+        A, B = _linearize_trajectory_nb(states, controls, *args)
+    else:
+        A = np.zeros((horizon, STATE_DIM, STATE_DIM), dtype=np.float64)
+        B = np.zeros((horizon, STATE_DIM, 2), dtype=np.float64)
+    return controls, positions, A, B, trajectory
+
+
+@njit(cache=True, parallel=True)
+def _four_wheel_ilqr_batch_nb(
+    x0,
+    refs,
+    cov_blocks,
+    lengths,
+    initial_controls,
+    use_covariance,
+    fallback_variance,
+    horizon,
+    iterations,
+    line_search_steps,
+    covariance_floor,
+    mahalanobis_weight,
+    heading_weight,
+    progress_weight,
+    control_accel_weight,
+    control_steering_rate_weight,
+    terminal_position_weight,
+    terminal_velocity_weight,
+    regularization,
+    roll_weight,
+    roll_rate_weight,
+    need_final_jacobians,
+    *args,
+):
+    count = refs.shape[0]
     controls = np.zeros((count, horizon, 2), dtype=np.float64)
     positions = np.zeros((count, horizon), dtype=np.float64)
     As = np.zeros((count, horizon, STATE_DIM, STATE_DIM), dtype=np.float64)
     Bs = np.zeros((count, horizon, STATE_DIM, 2), dtype=np.float64)
     trajectories = np.zeros((count, horizon, 2), dtype=np.float64)
-    for m in range(count):
-        n = int(packed_lengths[m])
-        mode_cov = None if cov_blocks is None else np.ascontiguousarray(np.asarray(cov_blocks[m, :n], dtype=np.float64))
-        result = _full_model_ilqr_solution(
+    for m in prange(count):
+        n = int(lengths[m])
+        if n < 2:
+            continue
+        ref = refs[m, :n]
+        if use_covariance:
+            cov = cov_blocks[m, :n]
+        else:
+            cov = np.zeros((n, 2, 2), dtype=np.float64)
+            for i in range(n):
+                cov[i, 0, 0] = fallback_variance
+                cov[i, 1, 1] = fallback_variance
+        result = _four_wheel_ilqr_nominal_prepared_nb(
             x0,
-            np.ascontiguousarray(packed_refs[m, :n]),
-            cfg,
-            mode_cov,
-            initial_controls=initial[m],
-            need_jacobians=need_final_jacobians,
+            ref,
+            cov,
+            initial_controls[m],
+            horizon,
+            iterations,
+            line_search_steps,
+            covariance_floor,
+            mahalanobis_weight,
+            heading_weight,
+            progress_weight,
+            control_accel_weight,
+            control_steering_rate_weight,
+            terminal_position_weight,
+            terminal_velocity_weight,
+            regularization,
+            roll_weight,
+            roll_rate_weight,
+            need_final_jacobians,
+            *args,
         )
         controls[m] = result[0]
         positions[m] = result[1]
@@ -779,6 +982,86 @@ def batch_nominal_solutions(
             As[m] = result[2]
             Bs[m] = result[3]
     return controls, positions, As, Bs, trajectories
+
+def batch_nominal_solutions(
+    x0: Array,
+    refs: Array,
+    lengths: Array,
+    cfg: MPPIConfig,
+    cov_blocks: Optional[Array] = None,
+    need_final_jacobians: bool = True,
+    initial_controls: Optional[Array] = None,
+    initial_mask: Optional[Array] = None,
+) -> Tuple[Array, Array, Array, Array, Array]:
+    packed_refs = np.ascontiguousarray(np.asarray(refs, dtype=np.float64))
+    packed_lengths = np.ascontiguousarray(np.asarray(lengths, dtype=np.int64).reshape(-1))
+    if packed_refs.ndim != 3 or packed_refs.shape[2] != 2:
+        raise ValueError(f'refs must have shape (M,K,2), got {packed_refs.shape}')
+    if packed_lengths.shape[0] != packed_refs.shape[0]:
+        raise ValueError('lengths must contain one entry per reference path.')
+    if cov_blocks is None:
+        packed_cov = np.zeros((packed_refs.shape[0], packed_refs.shape[1], 2, 2), dtype=np.float64)
+        use_covariance = False
+    else:
+        packed_cov = np.ascontiguousarray(np.asarray(cov_blocks, dtype=np.float64))
+        expected = (packed_refs.shape[0], packed_refs.shape[1], 2, 2)
+        if packed_cov.shape != expected:
+            raise ValueError(f'cov_blocks must have shape {expected}, got {packed_cov.shape}')
+        packed_cov = np.ascontiguousarray(0.5 * (packed_cov + np.swapaxes(packed_cov, 2, 3)))
+        use_covariance = True
+    count = packed_refs.shape[0]
+    horizon = int(cfg.horizon)
+    if initial_controls is None:
+        initial = _ackermann_batch_initial_controls(
+            x0, packed_refs, packed_lengths, cfg, packed_cov if use_covariance else None
+        )
+    else:
+        supplied = np.ascontiguousarray(np.asarray(initial_controls, dtype=np.float64))
+        expected_initial = (count, horizon, 2)
+        if supplied.shape != expected_initial:
+            raise ValueError(f'initial_controls must have shape {expected_initial}, got {supplied.shape}')
+        if initial_mask is None:
+            mask = np.ones(count, dtype=np.bool_)
+        else:
+            mask = np.ascontiguousarray(np.asarray(initial_mask, dtype=np.bool_).reshape(-1))
+            if mask.shape[0] != count:
+                raise ValueError('initial_mask must contain one entry per reference path.')
+        initial = supplied.copy()
+        missing = np.flatnonzero(~mask)
+        if missing.size:
+            missing_refs = np.ascontiguousarray(packed_refs[missing])
+            missing_lengths = np.ascontiguousarray(packed_lengths[missing])
+            missing_cov = np.ascontiguousarray(packed_cov[missing]) if use_covariance else None
+            initial_missing = _ackermann_batch_initial_controls(
+                x0, missing_refs, missing_lengths, cfg, missing_cov
+            )
+            initial[missing] = initial_missing
+    fallback_variance = float(cfg.prior_ilqr_covariance_fallback_std) ** 2
+    return _four_wheel_ilqr_batch_nb(
+        np.ascontiguousarray(np.asarray(x0, dtype=np.float64)),
+        packed_refs,
+        packed_cov,
+        packed_lengths,
+        np.ascontiguousarray(np.asarray(initial, dtype=np.float64)),
+        bool(use_covariance),
+        fallback_variance,
+        int(cfg.horizon),
+        int(cfg.prior_ilqr_iterations),
+        int(cfg.prior_ilqr_line_search_steps),
+        float(cfg.prior_ilqr_covariance_floor),
+        float(cfg.prior_ilqr_mahalanobis_weight),
+        float(cfg.prior_ilqr_heading_weight),
+        float(cfg.prior_ilqr_progress_weight),
+        float(cfg.prior_ilqr_control_accel_weight),
+        float(cfg.prior_ilqr_control_steering_rate_weight),
+        float(cfg.w_terminal_position),
+        float(cfg.w_terminal_velocity),
+        float(cfg.prior_ilqr_regularization),
+        float(cfg.prior_ilqr_roll_weight),
+        float(cfg.prior_ilqr_roll_rate_weight),
+        bool(need_final_jacobians),
+        *_dynamic_model_arguments(cfg),
+    )
 
 
 def nominal_controls_batch_to_track_paths(

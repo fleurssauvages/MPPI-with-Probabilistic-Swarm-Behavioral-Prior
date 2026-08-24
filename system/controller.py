@@ -144,13 +144,15 @@ if njit is not None:
         return noise
 
     @njit(cache=True)
-    def _apply_projected_covariance_nb(standard_noise, projected):
-        output = np.zeros_like(standard_noise)
+    def _apply_projected_covariance_into_nb(standard_noise, projected, output):
         for t in range(projected.shape[0]):
             a = projected[t, 0, 0]
             b = 0.5 * (projected[t, 0, 1] + projected[t, 1, 0])
             d = projected[t, 1, 1]
             if not (math.isfinite(a) and math.isfinite(b) and math.isfinite(d)):
+                for sample in range(standard_noise.shape[0]):
+                    output[sample, t, 0] = 0.0
+                    output[sample, t, 1] = 0.0
                 continue
             trace = a + d
             discriminant = math.sqrt(max(0.0, (a - d) * (a - d) + 4.0 * b * b))
@@ -170,8 +172,14 @@ if njit is not None:
                 output[sample, t, 0] = z0 * r00 + z1 * r01
                 output[sample, t, 1] = z0 * r01 + z1 * r11
         return output
+
+    @njit(cache=True)
+    def _apply_projected_covariance_nb(standard_noise, projected):
+        output = np.empty_like(standard_noise)
+        return _apply_projected_covariance_into_nb(standard_noise, projected, output)
 else:
     _temporal_smooth_noise_nb = None
+    _apply_projected_covariance_into_nb = None
     _apply_projected_covariance_nb = None
 
 def resample_path(path: Array, K: int) -> Array:
@@ -480,16 +488,50 @@ def _prior_second_moment_about_ilqr(model: Any, x_current: Array, local_mode: MP
     corrected, displacement, scalar_variance = _prior_second_moment_about_ilqr_nb(mean_path, cov_blocks, arc, positions, ilqr_xy)
     return (corrected, displacement, scalar_variance)
 
-def make_temporally_correlated_noise(model: Any, n: int, H: int, cfg: Any, rng: np.random.Generator, *, scale_override: Optional[Array]=None) -> Array:
+def fill_temporally_correlated_noise(model: Any, n: int, H: int, cfg: Any, rng: np.random.Generator, out: Array, *, scale_override: Optional[Array]=None) -> Array:
+    count = max(0, int(n))
+    horizon = max(0, int(H))
+    target = np.asarray(out, dtype=np.float64)
+    if target.ndim != 3 or target.shape[0] < count or target.shape[1] < horizon or target.shape[2] != 2:
+        raise ValueError('out must have shape (>=n, >=H, 2).')
+    view = target[:count, :horizon]
     scale = np.asarray(model.control_noise_scale(cfg), dtype=np.float64)
     if scale_override is not None:
         scale = np.asarray(scale_override, dtype=np.float64)
     if scale.shape != (2,):
         raise ValueError('model.control_noise_scale(cfg) must return shape (2,).')
-    noise = rng.normal(size=(n, H, 2))
-    noise *= scale[None, None, :]
-    alpha = float(cfg.temporal_noise_smoothing)
-    return _temporal_smooth_noise_nb(noise, alpha)
+    if count == 0 or horizon == 0:
+        return view
+    rng.standard_normal(size=view.shape, out=view)
+    view[:, :, 0] *= float(scale[0])
+    view[:, :, 1] *= float(scale[1])
+    return _temporal_smooth_noise_nb(view, float(cfg.temporal_noise_smoothing))
+
+def make_temporally_correlated_noise(model: Any, n: int, H: int, cfg: Any, rng: np.random.Generator, *, scale_override: Optional[Array]=None) -> Array:
+    noise = np.empty((int(n), int(H), 2), dtype=np.float64)
+    return fill_temporally_correlated_noise(model, n, H, cfg, rng, noise, scale_override=scale_override)
+
+def clip_controls_inplace(model: Any, controls: Array, cfg: Any) -> Array:
+    target = np.asarray(controls, dtype=np.float64)
+    clip_inplace = getattr(model, 'clip_control_batch_inplace', None)
+    if clip_inplace is not None:
+        return np.asarray(clip_inplace(target, cfg), dtype=np.float64)
+    target[...] = np.asarray(model.clip_control_batch(target, cfg), dtype=np.float64)
+    return target
+
+def sample_controls_around_nominal_into(model: Any, nominal: Array, n: int, cfg: Any, rng: np.random.Generator, out: Array) -> Array:
+    count = max(0, int(n))
+    horizon = int(cfg.horizon)
+    target = np.asarray(out, dtype=np.float64)
+    if target.ndim != 3 or target.shape[0] < count or target.shape[1] < horizon or target.shape[2] != 2:
+        raise ValueError('out must have shape (>=n, >=horizon, 2).')
+    view = target[:count, :horizon]
+    if count == 0:
+        return view
+    fill_temporally_correlated_noise(model, count, horizon, cfg, rng, view)
+    center = np.asarray(nominal, dtype=np.float64)
+    view += center[None, :, :]
+    return clip_controls_inplace(model, view, cfg)
 
 def _clip_controls(model: Any, raw_controls: Array, cfg: Any) -> Array:
     """Clip sampled controls to the model actuator limits."""

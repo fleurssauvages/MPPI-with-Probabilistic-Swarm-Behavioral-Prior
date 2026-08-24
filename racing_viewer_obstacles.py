@@ -14,14 +14,14 @@ from system.ackermann import _dynamic_ackermann_step_nb
 from system.four_wheel import _dynamic_four_wheel_step_nb
 try:
     import tkinter as tk
-    from tkinter import messagebox, ttk
+    from tkinter import filedialog, messagebox, ttk
 except ImportError as exc:
     raise SystemExit('Tkinter is required to run the racing viewer.') from exc
 from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolbar2Tk
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.patches import FancyArrowPatch, Polygon
-VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Control bank', 'control_bank_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 DISPLAY_TO_VARIANT = dict(VARIANTS)
 VARIANT_TO_DISPLAY = {value: label for label, value in VARIANTS}
 VEHICLE_SYSTEMS = list(controller_core.VEHICLE_SYSTEMS)
@@ -50,22 +50,65 @@ TURN_PRIOR_SIGMA = 1.5
 OBSTACLE_LINEAR_SCALE = 0.75
 TURN_BARRIER_LANE_WIDTH = 3.0
 TURN_BARRIER_THICKNESS = 0.25
-TURN_BARRIER_POINTS = 96
+TURN_BARRIER_POINTS = 320
 TURN_BARRIER_COLLISION_SEGMENT_LENGTH = 0.15
 INNER_STRAIGHT_BARRIER_EXTENSION = 0.0
 DYNAMIC_WALL_WIDTH = 0.3
 DYNAMIC_WALL_LIFETIME_LAPS = {'dynamic_1': 1.0, 'dynamic_2': 2.0}
+MAX_STEPS_PER_LAP = 400
 CONTROLLER_START = np.asarray([1.0, 1.0], dtype=np.float64)
 CONTROLLER_GOAL = np.asarray([9.0, 9.0], dtype=np.float64)
 CONTROLLER_START_GOAL_DISTANCE = float(np.linalg.norm(CONTROLLER_GOAL - CONTROLLER_START))
-TRACK_WIDTH = 2.0 * OUTER_RADIUS + CONTROLLER_START_GOAL_DISTANCE
-TRACK_CENTER_X = TRACK_X0 + 0.5 * TRACK_WIDTH
-TRACK_CENTER_Y = TRACK_Y0 + 0.5 * TRACK_HEIGHT
-LEFT_ARC_X = TRACK_X0 + OUTER_RADIUS
-RIGHT_ARC_X = LEFT_ARC_X + CONTROLLER_START_GOAL_DISTANCE
+STRAIGHT_SIDE_EXTENSION = 6.0
+STRAIGHT_EXTENSION_POINT_SPACING = 0.25
+OBSTACLE_STRAIGHT_LEFT_X = TRACK_X0 + OUTER_RADIUS
+OBSTACLE_STRAIGHT_RIGHT_X = OBSTACLE_STRAIGHT_LEFT_X + CONTROLLER_START_GOAL_DISTANCE
+LEFT_ARC_X = OBSTACLE_STRAIGHT_LEFT_X - STRAIGHT_SIDE_EXTENSION
+RIGHT_ARC_X = OBSTACLE_STRAIGHT_RIGHT_X + STRAIGHT_SIDE_EXTENSION
 STRAIGHT_LENGTH = RIGHT_ARC_X - LEFT_ARC_X
-TRACK_LENGTH = 2.0 * STRAIGHT_LENGTH + 2.0 * math.pi * CENTERLINE_RADIUS
-HALF_TRACK_LENGTH = STRAIGHT_LENGTH + math.pi * CENTERLINE_RADIUS
+TRACK_WIDTH = 2.0 * OUTER_RADIUS + STRAIGHT_LENGTH
+TRACK_CENTER_X = 0.5 * (LEFT_ARC_X + RIGHT_ARC_X)
+TRACK_CENTER_Y = TRACK_Y0 + 0.5 * TRACK_HEIGHT
+BOTTOM_TRACK_Y = TRACK_CENTER_Y - CENTERLINE_RADIUS
+TOP_TRACK_Y = TRACK_CENTER_Y + CENTERLINE_RADIUS
+CHICANE_RADIUS = CENTERLINE_RADIUS / 3.0
+CHICANE_HORIZONTAL_LENGTH = 10.0
+CHICANE_INNER_X_OFFSET = 4.0
+CHICANE_OUTER_X_OFFSET = CHICANE_INNER_X_OFFSET + CHICANE_HORIZONTAL_LENGTH
+CHICANE_ENTRY_GUARD_LENGTH = 10.0
+CHICANE_HAIRPIN_LENGTH = math.pi * CHICANE_RADIUS
+CHICANE_ENTRY_LENGTH = CHICANE_OUTER_X_OFFSET
+CHICANE_EXIT_LENGTH = CHICANE_OUTER_X_OFFSET
+CHICANE_LENGTH = CHICANE_ENTRY_LENGTH + 2.0 * CHICANE_HORIZONTAL_LENGTH + CHICANE_EXIT_LENGTH + 3.0 * CHICANE_HAIRPIN_LENGTH
+RIGHT_CHICANE_OUTER_X = RIGHT_ARC_X + CHICANE_OUTER_X_OFFSET
+RIGHT_CHICANE_INNER_X = RIGHT_ARC_X + CHICANE_INNER_X_OFFSET
+RIGHT_CHICANE_Y0 = BOTTOM_TRACK_Y
+RIGHT_CHICANE_Y1 = RIGHT_CHICANE_Y0 + 2.0 * CHICANE_RADIUS
+RIGHT_CHICANE_Y2 = RIGHT_CHICANE_Y1 + 2.0 * CHICANE_RADIUS
+RIGHT_CHICANE_Y3 = RIGHT_CHICANE_Y2 + 2.0 * CHICANE_RADIUS
+RIGHT_CHICANE_C1_X = RIGHT_CHICANE_OUTER_X
+RIGHT_CHICANE_C1_Y = 0.5 * (RIGHT_CHICANE_Y0 + RIGHT_CHICANE_Y1)
+RIGHT_CHICANE_C2_X = RIGHT_CHICANE_INNER_X
+RIGHT_CHICANE_C2_Y = 0.5 * (RIGHT_CHICANE_Y1 + RIGHT_CHICANE_Y2)
+RIGHT_CHICANE_C3_X = RIGHT_CHICANE_OUTER_X
+RIGHT_CHICANE_C3_Y = 0.5 * (RIGHT_CHICANE_Y2 + RIGHT_CHICANE_Y3)
+LEFT_CHICANE_OUTER_X = LEFT_ARC_X - CHICANE_OUTER_X_OFFSET
+LEFT_CHICANE_INNER_X = LEFT_ARC_X - CHICANE_INNER_X_OFFSET
+LEFT_CHICANE_Y0 = TOP_TRACK_Y
+LEFT_CHICANE_Y1 = LEFT_CHICANE_Y0 - 2.0 * CHICANE_RADIUS
+LEFT_CHICANE_Y2 = LEFT_CHICANE_Y1 - 2.0 * CHICANE_RADIUS
+LEFT_CHICANE_Y3 = LEFT_CHICANE_Y2 - 2.0 * CHICANE_RADIUS
+LEFT_CHICANE_C1_X = LEFT_CHICANE_OUTER_X
+LEFT_CHICANE_C1_Y = 0.5 * (LEFT_CHICANE_Y0 + LEFT_CHICANE_Y1)
+LEFT_CHICANE_C2_X = LEFT_CHICANE_INNER_X
+LEFT_CHICANE_C2_Y = 0.5 * (LEFT_CHICANE_Y1 + LEFT_CHICANE_Y2)
+LEFT_CHICANE_C3_X = LEFT_CHICANE_OUTER_X
+LEFT_CHICANE_C3_Y = 0.5 * (LEFT_CHICANE_Y2 + LEFT_CHICANE_Y3)
+CHICANE_OUTWARD_EXTENT = CHICANE_OUTER_X_OFFSET + CHICANE_RADIUS
+TRACK_PLOT_X_MIN = LEFT_ARC_X - CHICANE_OUTWARD_EXTENT - 0.5 * TURN_BARRIER_LANE_WIDTH - 0.8
+TRACK_PLOT_X_MAX = RIGHT_ARC_X + CHICANE_OUTWARD_EXTENT + 0.5 * TURN_BARRIER_LANE_WIDTH + 0.8
+TRACK_LENGTH = 2.0 * STRAIGHT_LENGTH + 2.0 * CHICANE_LENGTH
+HALF_TRACK_LENGTH = STRAIGHT_LENGTH + CHICANE_LENGTH
 START_S = 0.0
 
 @dataclass
@@ -82,6 +125,7 @@ class RaceResult:
     requested_laps: int
     completed_laps: int
     collision: bool
+    max_steps_per_lap: int
     runtime_s: float
     variant_value: str
     wall_mode: str
@@ -189,52 +233,173 @@ def _candidate_path_intersection_mask_nb(path_xy: np.ndarray, p0s: np.ndarray, p
     return out
 
 @njit(cache=True, inline='always')
+def _project_arc_candidate_nb(px: float, py: float, cx: float, cy: float, radius: float, theta0: float, sweep: float, s_offset: float, best_s: float, best_d2: float) -> tuple[float, float]:
+    theta = math.atan2(py - cy, px - cx)
+    span = abs(sweep)
+    directed = theta - theta0 if sweep > 0.0 else theta0 - theta
+    two_pi = 2.0 * math.pi
+    while directed < 0.0:
+        directed += two_pi
+    while directed >= two_pi:
+        directed -= two_pi
+    if directed <= span:
+        theta_q = theta0 + directed if sweep > 0.0 else theta0 - directed
+        qx = cx + radius * math.cos(theta_q)
+        qy = cy + radius * math.sin(theta_q)
+        dx = px - qx
+        dy = py - qy
+        d2 = dx * dx + dy * dy
+        if d2 < best_d2:
+            best_d2 = d2
+            best_s = s_offset + radius * directed
+    else:
+        qx0 = cx + radius * math.cos(theta0)
+        qy0 = cy + radius * math.sin(theta0)
+        dx0 = px - qx0
+        dy0 = py - qy0
+        d20 = dx0 * dx0 + dy0 * dy0
+        if d20 < best_d2:
+            best_d2 = d20
+            best_s = s_offset
+        theta1 = theta0 + sweep
+        qx1 = cx + radius * math.cos(theta1)
+        qy1 = cy + radius * math.sin(theta1)
+        dx1 = px - qx1
+        dy1 = py - qy1
+        d21 = dx1 * dx1 + dy1 * dy1
+        if d21 < best_d2:
+            best_d2 = d21
+            best_s = s_offset + radius * span
+    return best_s, best_d2
+
+@njit(cache=True, inline='always')
+def _project_segment_candidate_nb(px: float, py: float, ax: float, ay: float, bx: float, by: float, s_offset: float, best_s: float, best_d2: float) -> tuple[float, float]:
+    vx = bx - ax
+    vy = by - ay
+    length2 = vx * vx + vy * vy
+    if length2 <= 1e-18:
+        t = 0.0
+        length = 0.0
+    else:
+        t = ((px - ax) * vx + (py - ay) * vy) / length2
+        t = min(max(t, 0.0), 1.0)
+        length = math.sqrt(length2)
+    qx = ax + t * vx
+    qy = ay + t * vy
+    dx = px - qx
+    dy = py - qy
+    d2 = dx * dx + dy * dy
+    if d2 < best_d2:
+        best_d2 = d2
+        best_s = s_offset + t * length
+    return best_s, best_d2
+
+@njit(cache=True, inline='always')
 def _project_centerline_nb(px: float, py: float) -> tuple[float, float]:
-    """Return (arc coordinate modulo lap, squared distance to the centerline)."""
-    r = CENTERLINE_RADIUS
-    x_left = LEFT_ARC_X
-    x_right = RIGHT_ARC_X
-    yc = TRACK_CENTER_Y
-    straight = STRAIGHT_LENGTH
-    qx = _clamp_nb(px, x_left, x_right)
-    qy = yc - r
+    qx = _clamp_nb(px, LEFT_ARC_X, RIGHT_ARC_X)
     dx = px - qx
-    dy = py - qy
+    dy = py - BOTTOM_TRACK_Y
     best_d2 = dx * dx + dy * dy
-    best_s = qx - x_left
-    theta = math.atan2(py - yc, px - x_right)
-    theta = _clamp_nb(theta, -0.5 * math.pi, 0.5 * math.pi)
-    qx = x_right + r * math.cos(theta)
-    qy = yc + r * math.sin(theta)
+    best_s = qx - LEFT_ARC_X
+
+    right_offset = STRAIGHT_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        RIGHT_ARC_X, RIGHT_CHICANE_Y0,
+        RIGHT_CHICANE_OUTER_X, RIGHT_CHICANE_Y0,
+        right_offset, best_s, best_d2,
+    )
+    right_offset += CHICANE_ENTRY_LENGTH
+    best_s, best_d2 = _project_arc_candidate_nb(
+        px, py, RIGHT_CHICANE_C1_X, RIGHT_CHICANE_C1_Y, CHICANE_RADIUS,
+        -0.5 * math.pi, math.pi, right_offset, best_s, best_d2,
+    )
+    right_offset += CHICANE_HAIRPIN_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        RIGHT_CHICANE_OUTER_X, RIGHT_CHICANE_Y1,
+        RIGHT_CHICANE_INNER_X, RIGHT_CHICANE_Y1,
+        right_offset, best_s, best_d2,
+    )
+    right_offset += CHICANE_HORIZONTAL_LENGTH
+    best_s, best_d2 = _project_arc_candidate_nb(
+        px, py, RIGHT_CHICANE_C2_X, RIGHT_CHICANE_C2_Y, CHICANE_RADIUS,
+        -0.5 * math.pi, -math.pi, right_offset, best_s, best_d2,
+    )
+    right_offset += CHICANE_HAIRPIN_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        RIGHT_CHICANE_INNER_X, RIGHT_CHICANE_Y2,
+        RIGHT_CHICANE_OUTER_X, RIGHT_CHICANE_Y2,
+        right_offset, best_s, best_d2,
+    )
+    right_offset += CHICANE_HORIZONTAL_LENGTH
+    best_s, best_d2 = _project_arc_candidate_nb(
+        px, py, RIGHT_CHICANE_C3_X, RIGHT_CHICANE_C3_Y, CHICANE_RADIUS,
+        -0.5 * math.pi, math.pi, right_offset, best_s, best_d2,
+    )
+    right_offset += CHICANE_HAIRPIN_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        RIGHT_CHICANE_OUTER_X, RIGHT_CHICANE_Y3,
+        RIGHT_ARC_X, TOP_TRACK_Y,
+        right_offset, best_s, best_d2,
+    )
+
+    qx = _clamp_nb(px, LEFT_ARC_X, RIGHT_ARC_X)
     dx = px - qx
-    dy = py - qy
+    dy = py - TOP_TRACK_Y
     d2 = dx * dx + dy * dy
     if d2 < best_d2:
         best_d2 = d2
-        best_s = straight + r * (theta + 0.5 * math.pi)
-    qx = _clamp_nb(px, x_left, x_right)
-    qy = yc + r
-    dx = px - qx
-    dy = py - qy
-    d2 = dx * dx + dy * dy
-    if d2 < best_d2:
-        best_d2 = d2
-        best_s = straight + math.pi * r + (x_right - qx)
-    theta = math.atan2(py - yc, px - x_left)
-    if theta < 0.5 * math.pi:
-        theta += 2.0 * math.pi
-    theta = _clamp_nb(theta, 0.5 * math.pi, 1.5 * math.pi)
-    qx = x_left + r * math.cos(theta)
-    qy = yc + r * math.sin(theta)
-    dx = px - qx
-    dy = py - qy
-    d2 = dx * dx + dy * dy
-    if d2 < best_d2:
-        best_d2 = d2
-        best_s = 2.0 * straight + math.pi * r + r * (theta - 0.5 * math.pi)
+        best_s = STRAIGHT_LENGTH + CHICANE_LENGTH + (RIGHT_ARC_X - qx)
+
+    left_offset = 2.0 * STRAIGHT_LENGTH + CHICANE_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        LEFT_ARC_X, LEFT_CHICANE_Y0,
+        LEFT_CHICANE_OUTER_X, LEFT_CHICANE_Y0,
+        left_offset, best_s, best_d2,
+    )
+    left_offset += CHICANE_ENTRY_LENGTH
+    best_s, best_d2 = _project_arc_candidate_nb(
+        px, py, LEFT_CHICANE_C1_X, LEFT_CHICANE_C1_Y, CHICANE_RADIUS,
+        0.5 * math.pi, math.pi, left_offset, best_s, best_d2,
+    )
+    left_offset += CHICANE_HAIRPIN_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        LEFT_CHICANE_OUTER_X, LEFT_CHICANE_Y1,
+        LEFT_CHICANE_INNER_X, LEFT_CHICANE_Y1,
+        left_offset, best_s, best_d2,
+    )
+    left_offset += CHICANE_HORIZONTAL_LENGTH
+    best_s, best_d2 = _project_arc_candidate_nb(
+        px, py, LEFT_CHICANE_C2_X, LEFT_CHICANE_C2_Y, CHICANE_RADIUS,
+        0.5 * math.pi, -math.pi, left_offset, best_s, best_d2,
+    )
+    left_offset += CHICANE_HAIRPIN_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        LEFT_CHICANE_INNER_X, LEFT_CHICANE_Y2,
+        LEFT_CHICANE_OUTER_X, LEFT_CHICANE_Y2,
+        left_offset, best_s, best_d2,
+    )
+    left_offset += CHICANE_HORIZONTAL_LENGTH
+    best_s, best_d2 = _project_arc_candidate_nb(
+        px, py, LEFT_CHICANE_C3_X, LEFT_CHICANE_C3_Y, CHICANE_RADIUS,
+        0.5 * math.pi, math.pi, left_offset, best_s, best_d2,
+    )
+    left_offset += CHICANE_HAIRPIN_LENGTH
+    best_s, best_d2 = _project_segment_candidate_nb(
+        px, py,
+        LEFT_CHICANE_OUTER_X, LEFT_CHICANE_Y3,
+        LEFT_ARC_X, BOTTOM_TRACK_Y,
+        left_offset, best_s, best_d2,
+    )
     if best_s >= TRACK_LENGTH:
         best_s -= TRACK_LENGTH
-    return (best_s, best_d2)
+    return best_s, best_d2
 
 @njit(cache=True, inline='always')
 def _signed_progress_delta_nb(new_s: float, old_s: float) -> float:
@@ -245,6 +410,201 @@ def _signed_progress_delta_nb(new_s: float, old_s: float) -> float:
     elif ds < -half:
         ds += TRACK_LENGTH
     return ds
+
+@njit(cache=True, inline='always')
+def _accept_near_s_projection_nb(
+    candidate_s: float,
+    candidate_d2: float,
+    reference_s: float,
+    backward_limit: float,
+    forward_limit: float,
+    best_s: float,
+    best_d2: float,
+    best_abs_ds: float,
+) -> tuple[float, float, float]:
+    candidate_s %= TRACK_LENGTH
+    ds = _signed_progress_delta_nb(candidate_s, reference_s)
+    if ds < -backward_limit or ds > forward_limit:
+        return best_s, best_d2, best_abs_ds
+    abs_ds = abs(ds)
+    if candidate_d2 < best_d2 - 1e-12 or (
+        abs(candidate_d2 - best_d2) <= 1e-12 and abs_ds < best_abs_ds
+    ):
+        return candidate_s, candidate_d2, abs_ds
+    return best_s, best_d2, best_abs_ds
+
+@njit(cache=True, inline='always')
+def _project_centerline_near_s_nb(
+    px: float,
+    py: float,
+    reference_s: float,
+    backward_limit: float,
+    forward_limit: float,
+) -> tuple[float, float]:
+    """Project to the geometrically closest track branch near the known progress.
+
+    The chicanes fold several distant arc-length locations into a small XY area.
+    A global closest-point projection can therefore jump to another hairpin branch.
+    This projection evaluates the same exact track primitives, but rejects candidates
+    that are not reachable from ``reference_s`` during one simulation step.
+    """
+    reference_s %= TRACK_LENGTH
+    backward_limit = max(0.0, float(backward_limit))
+    forward_limit = max(0.0, float(forward_limit))
+    best_s = reference_s
+    best_d2 = 1e300
+    best_abs_ds = 1e300
+
+    qx = _clamp_nb(px, LEFT_ARC_X, RIGHT_ARC_X)
+    dx = px - qx
+    dy = py - BOTTOM_TRACK_Y
+    candidate_s = qx - LEFT_ARC_X
+    candidate_d2 = dx * dx + dy * dy
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+
+    right_offset = STRAIGHT_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, RIGHT_ARC_X, RIGHT_CHICANE_Y0, RIGHT_CHICANE_OUTER_X,
+        RIGHT_CHICANE_Y0, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    right_offset += CHICANE_ENTRY_LENGTH
+    candidate_s, candidate_d2 = _project_arc_candidate_nb(
+        px, py, RIGHT_CHICANE_C1_X, RIGHT_CHICANE_C1_Y, CHICANE_RADIUS,
+        -0.5 * math.pi, math.pi, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    right_offset += CHICANE_HAIRPIN_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, RIGHT_CHICANE_OUTER_X, RIGHT_CHICANE_Y1, RIGHT_CHICANE_INNER_X,
+        RIGHT_CHICANE_Y1, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    right_offset += CHICANE_HORIZONTAL_LENGTH
+    candidate_s, candidate_d2 = _project_arc_candidate_nb(
+        px, py, RIGHT_CHICANE_C2_X, RIGHT_CHICANE_C2_Y, CHICANE_RADIUS,
+        -0.5 * math.pi, -math.pi, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    right_offset += CHICANE_HAIRPIN_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, RIGHT_CHICANE_INNER_X, RIGHT_CHICANE_Y2, RIGHT_CHICANE_OUTER_X,
+        RIGHT_CHICANE_Y2, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    right_offset += CHICANE_HORIZONTAL_LENGTH
+    candidate_s, candidate_d2 = _project_arc_candidate_nb(
+        px, py, RIGHT_CHICANE_C3_X, RIGHT_CHICANE_C3_Y, CHICANE_RADIUS,
+        -0.5 * math.pi, math.pi, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    right_offset += CHICANE_HAIRPIN_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, RIGHT_CHICANE_OUTER_X, RIGHT_CHICANE_Y3, RIGHT_ARC_X,
+        TOP_TRACK_Y, right_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+
+    qx = _clamp_nb(px, LEFT_ARC_X, RIGHT_ARC_X)
+    dx = px - qx
+    dy = py - TOP_TRACK_Y
+    candidate_s = STRAIGHT_LENGTH + CHICANE_LENGTH + (RIGHT_ARC_X - qx)
+    candidate_d2 = dx * dx + dy * dy
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+
+    left_offset = 2.0 * STRAIGHT_LENGTH + CHICANE_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, LEFT_ARC_X, LEFT_CHICANE_Y0, LEFT_CHICANE_OUTER_X,
+        LEFT_CHICANE_Y0, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    left_offset += CHICANE_ENTRY_LENGTH
+    candidate_s, candidate_d2 = _project_arc_candidate_nb(
+        px, py, LEFT_CHICANE_C1_X, LEFT_CHICANE_C1_Y, CHICANE_RADIUS,
+        0.5 * math.pi, math.pi, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    left_offset += CHICANE_HAIRPIN_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, LEFT_CHICANE_OUTER_X, LEFT_CHICANE_Y1, LEFT_CHICANE_INNER_X,
+        LEFT_CHICANE_Y1, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    left_offset += CHICANE_HORIZONTAL_LENGTH
+    candidate_s, candidate_d2 = _project_arc_candidate_nb(
+        px, py, LEFT_CHICANE_C2_X, LEFT_CHICANE_C2_Y, CHICANE_RADIUS,
+        0.5 * math.pi, -math.pi, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    left_offset += CHICANE_HAIRPIN_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, LEFT_CHICANE_INNER_X, LEFT_CHICANE_Y2, LEFT_CHICANE_OUTER_X,
+        LEFT_CHICANE_Y2, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    left_offset += CHICANE_HORIZONTAL_LENGTH
+    candidate_s, candidate_d2 = _project_arc_candidate_nb(
+        px, py, LEFT_CHICANE_C3_X, LEFT_CHICANE_C3_Y, CHICANE_RADIUS,
+        0.5 * math.pi, math.pi, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    left_offset += CHICANE_HAIRPIN_LENGTH
+    candidate_s, candidate_d2 = _project_segment_candidate_nb(
+        px, py, LEFT_CHICANE_OUTER_X, LEFT_CHICANE_Y3, LEFT_ARC_X,
+        BOTTOM_TRACK_Y, left_offset, 0.0, 1e300,
+    )
+    best_s, best_d2, best_abs_ds = _accept_near_s_projection_nb(
+        candidate_s, candidate_d2, reference_s, backward_limit, forward_limit,
+        best_s, best_d2, best_abs_ds,
+    )
+    if best_d2 >= 1e299:
+        return reference_s, best_d2
+    return best_s, best_d2
 
 @njit(cache=True, inline='always')
 def _state_hits_circles_nb(state: np.ndarray, circle_centers: np.ndarray, circle_radii: np.ndarray, vehicle_length: float, vehicle_width: float, hard_collision_clearance: float) -> bool:
@@ -503,6 +863,10 @@ def _racing_rollout_costs_ackermann_nb(
     costs = np.empty(n_rollouts, dtype=np.float64)
     collisions = np.zeros(n_rollouts, dtype=np.bool_)
     terminal_progress = np.empty(n_rollouts, dtype=np.float64)
+    progress_step_limit = max(
+        1.0,
+        2.0 * max(abs(float(v_min)), abs(float(v_max)), abs(float(lateral_velocity_limit))) * float(dt) + 0.25,
+    )
     for n in prange(n_rollouts):
         state = np.empty(7, dtype=np.float64)
         next_state = np.empty(7, dtype=np.float64)
@@ -555,7 +919,10 @@ def _racing_rollout_costs_ackermann_nb(
             ):
                 hit = True
                 break
-            s_mod, _ = _project_centerline_nb(next_state[0], next_state[1])
+            s_mod, _ = _project_centerline_near_s_nb(
+                next_state[0], next_state[1], previous_s,
+                progress_step_limit, progress_step_limit,
+            )
             cumulative += _signed_progress_delta_nb(s_mod, previous_s)
             previous_s = s_mod
             prefix_sum += cumulative
@@ -623,6 +990,10 @@ def _racing_rollout_costs_four_wheel_nb(
     costs = np.empty(n_rollouts, dtype=np.float64)
     collisions = np.zeros(n_rollouts, dtype=np.bool_)
     terminal_progress = np.empty(n_rollouts, dtype=np.float64)
+    progress_step_limit = max(
+        1.0,
+        2.0 * max(abs(float(v_min)), abs(float(v_max)), abs(float(lateral_velocity_limit))) * float(dt) + 0.25,
+    )
     for n in prange(n_rollouts):
         state = np.empty(13, dtype=np.float64)
         next_state = np.empty(13, dtype=np.float64)
@@ -690,7 +1061,10 @@ def _racing_rollout_costs_four_wheel_nb(
             ):
                 hit = True
                 break
-            s_mod, _ = _project_centerline_nb(next_state[0], next_state[1])
+            s_mod, _ = _project_centerline_near_s_nb(
+                next_state[0], next_state[1], previous_s,
+                progress_step_limit, progress_step_limit,
+            )
             cumulative += _signed_progress_delta_nb(s_mod, previous_s)
             previous_s = s_mod
             prefix_sum += cumulative
@@ -740,17 +1114,28 @@ def _localize_prior_ranges_nb(
     cursors: np.ndarray,
     px: float,
     py: float,
+    current_s: float,
     horizon: int,
     step_distance: float,
     search_back: int,
     search_forward: int,
     block_size: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Localize each prior by ordered track progress, then by XY distance.
+
+    XY alone is ambiguous in a folded chicane.  The executed track progress is the
+    causal coordinate: a point on another hairpin branch can be physically close but
+    is many metres away in track arc length.  Searching the first-lap prior by track
+    progress makes the selected prior window deterministic even after cursor resets,
+    wall changes, or non-sequential visualization frame access.
+    """
     count = active_indices.shape[0]
     starts = np.zeros(count, dtype=np.int64)
     ends = np.zeros(count, dtype=np.int64)
     updated = cursors.copy()
     preview_span = max(0, int(horizon) - 1) * max(float(step_distance), 1e-09)
+    current_s %= TRACK_LENGTH
+
     for q in prange(count):
         m = int(active_indices[q])
         n = int(lengths[m])
@@ -761,49 +1146,53 @@ def _localize_prior_ranges_nb(
             ends[q] = max(0, n - 1)
             updated[m] = 0
             continue
+
         previous = int(cursors[m])
-        nearest = 0
-        best = 1e300
-        if previous >= 0 and previous < nloc:
+        if previous >= 0 and previous < unique_n:
             previous %= unique_n
-            back = min(max(1, int(search_back)), unique_n - 1) if unique_n > 1 else 0
-            forward = min(max(2, int(search_forward)), unique_n - 1) if unique_n > 1 else 0
-            for offset in range(-back, forward + 1):
-                i = (previous + offset) % unique_n
-                dx = mean_paths[m, i, 0] - px
-                dy = mean_paths[m, i, 1] - py
-                d2 = dx * dx + dy * dy
-                if d2 < best or (d2 == best and i < nearest):
-                    best = d2
-                    nearest = i
-        blocks = int(localization_block_counts[m])
-        bs = max(1, int(block_size))
-        for block in range(blocks):
-            minx = localization_block_mins[m, block, 0]
-            miny = localization_block_mins[m, block, 1]
-            maxx = localization_block_maxs[m, block, 0]
-            maxy = localization_block_maxs[m, block, 1]
-            dx = 0.0
-            if px < minx:
-                dx = minx - px
-            elif px > maxx:
-                dx = px - maxx
-            dy = 0.0
-            if py < miny:
-                dy = miny - py
-            elif py > maxy:
-                dy = py - maxy
-            if dx * dx + dy * dy > best:
-                continue
-            a = block * bs
-            b = min(unique_n, a + bs)
-            for i in range(a, b):
-                ddx = mean_paths[m, i, 0] - px
-                ddy = mean_paths[m, i, 1] - py
-                d2 = ddx * ddx + ddy * ddy
-                if d2 < best or (d2 == best and i < nearest):
-                    best = d2
-                    nearest = i
+        else:
+            previous = -1
+
+        nearest = 0
+        best_progress_error = 1e300
+        best_xy = 1e300
+        best_cursor_arc = 1e300
+        previous_arc = arc_lengths[m, previous] if previous >= 0 else 0.0
+        loop_arc = arc_lengths[m, nloc - 1] - arc_lengths[m, 0]
+
+        for i in range(unique_n):
+            point_s, _ = _project_centerline_nb(mean_paths[m, i, 0], mean_paths[m, i, 1])
+            progress_error = abs(_signed_progress_delta_nb(point_s, current_s))
+            dx = mean_paths[m, i, 0] - px
+            dy = mean_paths[m, i, 1] - py
+            d2 = dx * dx + dy * dy
+
+            cursor_arc = 0.0
+            if previous >= 0:
+                cursor_arc = arc_lengths[m, i] - previous_arc
+                if loop_arc > 1e-12:
+                    half_loop_arc = 0.5 * loop_arc
+                    if cursor_arc > half_loop_arc:
+                        cursor_arc -= loop_arc
+                    elif cursor_arc < -half_loop_arc:
+                        cursor_arc += loop_arc
+                cursor_arc = abs(cursor_arc)
+
+            if (
+                progress_error < best_progress_error - 1e-9
+                or (
+                    abs(progress_error - best_progress_error) <= 1e-9
+                    and (
+                        d2 < best_xy - 1e-12
+                        or (abs(d2 - best_xy) <= 1e-12 and cursor_arc < best_cursor_arc)
+                    )
+                )
+            ):
+                nearest = i
+                best_progress_error = progress_error
+                best_xy = d2
+                best_cursor_arc = cursor_arc
+
         start = min(nearest, n - 2)
         updated[m] = start
         s0 = arc_lengths[m, start]
@@ -862,6 +1251,7 @@ def _localize_sample_paths_nb(
     sample_ids: np.ndarray,
     px: float,
     py: float,
+    current_s: float,
     horizon: int,
     step_distance: float,
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -869,17 +1259,25 @@ def _localize_sample_paths_nb(
     starts = np.zeros(count, dtype=np.int64)
     ends = np.zeros(count, dtype=np.int64)
     preview_span = max(0, int(horizon) - 1) * max(float(step_distance), 1e-09)
+    current_s %= TRACK_LENGTH
     for q in prange(count):
         sample_id = int(sample_ids[q])
         n = int(sample_lengths[sample_id])
         nearest = 0
-        best = 1e300
+        best_progress_error = 1e300
+        best_xy = 1e300
         for i in range(n):
+            point_s, _ = _project_centerline_nb(sample_paths[sample_id, i, 0], sample_paths[sample_id, i, 1])
+            progress_error = abs(_signed_progress_delta_nb(point_s, current_s))
             dx = sample_paths[sample_id, i, 0] - px
             dy = sample_paths[sample_id, i, 1] - py
             d2 = dx * dx + dy * dy
-            if d2 < best:
-                best = d2
+            if (
+                progress_error < best_progress_error - 1e-9
+                or (abs(progress_error - best_progress_error) <= 1e-9 and d2 < best_xy)
+            ):
+                best_progress_error = progress_error
+                best_xy = d2
                 nearest = i
         start = min(nearest, max(0, n - 2))
         s0 = sample_arc_lengths[sample_id, start]
@@ -906,6 +1304,7 @@ def _localize_sample_paths_nb(
             refs[q, i, 0] = sample_paths[sample_id, a + i, 0]
             refs[q, i, 1] = sample_paths[sample_id, a + i, 1]
     return refs, lengths
+
 
 @njit(cache=True, inline='always')
 def _path_heading_nb(path: np.ndarray, n: int, i: int) -> float:
@@ -964,24 +1363,76 @@ def _prior_feasible_mask_nb(mean_paths: np.ndarray, localization_lengths: np.nda
         feasible[m] = not hit
     return feasible
 
+def _arc_point_tangent(cx: float, cy: float, theta: float, turn_sign: float) -> tuple[np.ndarray, np.ndarray]:
+    point = np.asarray([cx + CHICANE_RADIUS * math.cos(theta), cy + CHICANE_RADIUS * math.sin(theta)], dtype=np.float64)
+    if turn_sign > 0.0:
+        tangent = np.asarray([-math.sin(theta), math.cos(theta)], dtype=np.float64)
+    else:
+        tangent = np.asarray([math.sin(theta), -math.cos(theta)], dtype=np.float64)
+    return point, tangent
+
+def _right_chicane_point_tangent(local_s: float) -> tuple[np.ndarray, np.ndarray]:
+    s = min(max(float(local_s), 0.0), CHICANE_LENGTH)
+    if s < CHICANE_ENTRY_LENGTH:
+        return np.asarray([RIGHT_ARC_X + s, RIGHT_CHICANE_Y0], dtype=np.float64), np.asarray([1.0, 0.0], dtype=np.float64)
+    s -= CHICANE_ENTRY_LENGTH
+    if s < CHICANE_HAIRPIN_LENGTH:
+        theta = -0.5 * math.pi + s / CHICANE_RADIUS
+        return _arc_point_tangent(RIGHT_CHICANE_C1_X, RIGHT_CHICANE_C1_Y, theta, 1.0)
+    s -= CHICANE_HAIRPIN_LENGTH
+    if s < CHICANE_HORIZONTAL_LENGTH:
+        return np.asarray([RIGHT_CHICANE_OUTER_X - s, RIGHT_CHICANE_Y1], dtype=np.float64), np.asarray([-1.0, 0.0], dtype=np.float64)
+    s -= CHICANE_HORIZONTAL_LENGTH
+    if s < CHICANE_HAIRPIN_LENGTH:
+        theta = -0.5 * math.pi - s / CHICANE_RADIUS
+        return _arc_point_tangent(RIGHT_CHICANE_C2_X, RIGHT_CHICANE_C2_Y, theta, -1.0)
+    s -= CHICANE_HAIRPIN_LENGTH
+    if s < CHICANE_HORIZONTAL_LENGTH:
+        return np.asarray([RIGHT_CHICANE_INNER_X + s, RIGHT_CHICANE_Y2], dtype=np.float64), np.asarray([1.0, 0.0], dtype=np.float64)
+    s -= CHICANE_HORIZONTAL_LENGTH
+    if s < CHICANE_HAIRPIN_LENGTH:
+        theta = -0.5 * math.pi + s / CHICANE_RADIUS
+        return _arc_point_tangent(RIGHT_CHICANE_C3_X, RIGHT_CHICANE_C3_Y, theta, 1.0)
+    s -= CHICANE_HAIRPIN_LENGTH
+    return np.asarray([RIGHT_CHICANE_OUTER_X - s, RIGHT_CHICANE_Y3], dtype=np.float64), np.asarray([-1.0, 0.0], dtype=np.float64)
+
+def _left_chicane_point_tangent(local_s: float) -> tuple[np.ndarray, np.ndarray]:
+    s = min(max(float(local_s), 0.0), CHICANE_LENGTH)
+    if s < CHICANE_ENTRY_LENGTH:
+        return np.asarray([LEFT_ARC_X - s, LEFT_CHICANE_Y0], dtype=np.float64), np.asarray([-1.0, 0.0], dtype=np.float64)
+    s -= CHICANE_ENTRY_LENGTH
+    if s < CHICANE_HAIRPIN_LENGTH:
+        theta = 0.5 * math.pi + s / CHICANE_RADIUS
+        return _arc_point_tangent(LEFT_CHICANE_C1_X, LEFT_CHICANE_C1_Y, theta, 1.0)
+    s -= CHICANE_HAIRPIN_LENGTH
+    if s < CHICANE_HORIZONTAL_LENGTH:
+        return np.asarray([LEFT_CHICANE_OUTER_X + s, LEFT_CHICANE_Y1], dtype=np.float64), np.asarray([1.0, 0.0], dtype=np.float64)
+    s -= CHICANE_HORIZONTAL_LENGTH
+    if s < CHICANE_HAIRPIN_LENGTH:
+        theta = 0.5 * math.pi - s / CHICANE_RADIUS
+        return _arc_point_tangent(LEFT_CHICANE_C2_X, LEFT_CHICANE_C2_Y, theta, -1.0)
+    s -= CHICANE_HAIRPIN_LENGTH
+    if s < CHICANE_HORIZONTAL_LENGTH:
+        return np.asarray([LEFT_CHICANE_INNER_X - s, LEFT_CHICANE_Y2], dtype=np.float64), np.asarray([-1.0, 0.0], dtype=np.float64)
+    s -= CHICANE_HORIZONTAL_LENGTH
+    if s < CHICANE_HAIRPIN_LENGTH:
+        theta = 0.5 * math.pi + s / CHICANE_RADIUS
+        return _arc_point_tangent(LEFT_CHICANE_C3_X, LEFT_CHICANE_C3_Y, theta, 1.0)
+    s -= CHICANE_HAIRPIN_LENGTH
+    return np.asarray([LEFT_CHICANE_OUTER_X + s, LEFT_CHICANE_Y3], dtype=np.float64), np.asarray([1.0, 0.0], dtype=np.float64)
+
 def centerline_point_tangent(s_value: float) -> tuple[np.ndarray, np.ndarray]:
     s = float(s_value % TRACK_LENGTH)
-    r = CENTERLINE_RADIUS
-    straight = STRAIGHT_LENGTH
-    yc = TRACK_CENTER_Y
-    if s < straight:
-        return (np.asarray([LEFT_ARC_X + s, yc - r], dtype=np.float64), np.asarray([1.0, 0.0], dtype=np.float64))
-    s -= straight
-    arc_len = math.pi * r
-    if s < arc_len:
-        theta = -0.5 * math.pi + s / r
-        return (np.asarray([RIGHT_ARC_X + r * math.cos(theta), yc + r * math.sin(theta)], dtype=np.float64), np.asarray([-math.sin(theta), math.cos(theta)], dtype=np.float64))
-    s -= arc_len
-    if s < straight:
-        return (np.asarray([RIGHT_ARC_X - s, yc + r], dtype=np.float64), np.asarray([-1.0, 0.0], dtype=np.float64))
-    s -= straight
-    theta = 0.5 * math.pi + s / r
-    return (np.asarray([LEFT_ARC_X + r * math.cos(theta), yc + r * math.sin(theta)], dtype=np.float64), np.asarray([-math.sin(theta), math.cos(theta)], dtype=np.float64))
+    if s < STRAIGHT_LENGTH:
+        return np.asarray([LEFT_ARC_X + s, BOTTOM_TRACK_Y], dtype=np.float64), np.asarray([1.0, 0.0], dtype=np.float64)
+    s -= STRAIGHT_LENGTH
+    if s < CHICANE_LENGTH:
+        return _right_chicane_point_tangent(s)
+    s -= CHICANE_LENGTH
+    if s < STRAIGHT_LENGTH:
+        return np.asarray([RIGHT_ARC_X - s, TOP_TRACK_Y], dtype=np.float64), np.asarray([-1.0, 0.0], dtype=np.float64)
+    s -= STRAIGHT_LENGTH
+    return _left_chicane_point_tangent(s)
 
 def sample_centerline(start_s: float, distance: float, count: int) -> np.ndarray:
     values = np.linspace(float(start_s), float(start_s) + float(distance), int(count))
@@ -991,19 +1442,25 @@ def sample_centerline(start_s: float, distance: float, count: int) -> np.ndarray
     return points
 
 def racing_prior_covariance(reference: np.ndarray) -> np.ndarray:
-    """Fixed NASCAR covariance used only on the two deterministic U-turns."""
+    """Fixed NASCAR covariance used only on the two deterministic chicanes."""
     variance = TURN_PRIOR_SIGMA * TURN_PRIOR_SIGMA
     cov = np.zeros((len(reference), 2, 2), dtype=np.float64)
     cov[:, 0, 0] = variance
     cov[:, 1, 1] = variance
     return np.ascontiguousarray(cov)
-P2 = np.asarray([LEFT_ARC_X, TRACK_CENTER_Y - CENTERLINE_RADIUS], dtype=np.float64)
-P3 = np.asarray([RIGHT_ARC_X, TRACK_CENTER_Y - CENTERLINE_RADIUS], dtype=np.float64)
-P4 = np.asarray([RIGHT_ARC_X, TRACK_CENTER_Y + CENTERLINE_RADIUS], dtype=np.float64)
-P1 = np.asarray([LEFT_ARC_X, TRACK_CENTER_Y + CENTERLINE_RADIUS], dtype=np.float64)
+P2 = np.asarray([LEFT_ARC_X, BOTTOM_TRACK_Y], dtype=np.float64)
+P3 = np.asarray([RIGHT_ARC_X, BOTTOM_TRACK_Y], dtype=np.float64)
+P4 = np.asarray([RIGHT_ARC_X, TOP_TRACK_Y], dtype=np.float64)
+P1 = np.asarray([LEFT_ARC_X, TOP_TRACK_Y], dtype=np.float64)
+
+FISH_P2 = np.asarray([OBSTACLE_STRAIGHT_LEFT_X, BOTTOM_TRACK_Y], dtype=np.float64)
+FISH_P3 = np.asarray([OBSTACLE_STRAIGHT_RIGHT_X, BOTTOM_TRACK_Y], dtype=np.float64)
+FISH_P4 = np.asarray([OBSTACLE_STRAIGHT_RIGHT_X, TOP_TRACK_Y], dtype=np.float64)
+FISH_P1 = np.asarray([OBSTACLE_STRAIGHT_LEFT_X, TOP_TRACK_Y], dtype=np.float64)
 TURN_POINTS = 80
 MAX_EMPIRICAL_PATHS_PER_JOINT_MODE = 24
 PRIOR_LOCALIZATION_BLOCK_SIZE = 32
+MAX_PRIOR = 20
 
 def _poly_vertices(obstacle: object) -> np.ndarray:
     vertices = getattr(obstacle, 'vertices', obstacle)
@@ -1067,37 +1524,56 @@ def _scale_polygon_about_centroid(vertices: np.ndarray, scale: float) -> np.ndar
     center = np.mean(p, axis=0)
     return np.ascontiguousarray(center[None, :] + factor * (p - center[None, :]), dtype=np.float64)
 
-def _turn_barrier_polygon(center: np.ndarray, theta0: float, theta1: float, wall_radius: float) -> np.ndarray:
-    half = 0.5 * TURN_BARRIER_THICKNESS
-    inner = float(wall_radius) - half
-    outer = float(wall_radius) + half
-    if inner <= 0.0:
-        raise ValueError('Turn barrier radius must remain positive.')
-    angles = np.linspace(float(theta0), float(theta1), int(TURN_BARRIER_POINTS))
-    c = np.asarray(center, dtype=np.float64)[:2]
-    outer_arc = c[None, :] + outer * np.column_stack((np.cos(angles), np.sin(angles)))
-    inner_arc = c[None, :] + inner * np.column_stack((np.cos(angles[::-1]), np.sin(angles[::-1])))
-    return np.ascontiguousarray(np.vstack((outer_arc, inner_arc)), dtype=np.float64)
+def _sample_chicane_geometry(side: str, count: int) -> tuple[np.ndarray, np.ndarray]:
+    values = np.linspace(0.0, CHICANE_LENGTH, max(2, int(count)))
+    points = np.empty((len(values), 2), dtype=np.float64)
+    tangents = np.empty((len(values), 2), dtype=np.float64)
+    sampler = _right_chicane_point_tangent if side == 'right' else _left_chicane_point_tangent
+    for i, value in enumerate(values):
+        point, tangent = sampler(float(value))
+        points[i] = point
+        tangents[i] = tangent
+    return points, tangents
+
+def _chicane_boundary_polygon(side: str, lateral_sign: float) -> np.ndarray:
+    half_lane = 0.5 * TURN_BARRIER_LANE_WIDTH
+    half_thickness = 0.5 * TURN_BARRIER_THICKNESS
+    if half_lane <= half_thickness:
+        raise ValueError('Chicane lane width must exceed the turn-barrier thickness.')
+    points, tangents = _sample_chicane_geometry(side, int(TURN_BARRIER_POINTS))
+    normals = np.column_stack((-tangents[:, 1], tangents[:, 0]))
+    center_offset = float(lateral_sign) * half_lane
+    edge_a = points + (center_offset - half_thickness) * normals
+    edge_b = points + (center_offset + half_thickness) * normals
+    return np.ascontiguousarray(np.vstack((edge_a, edge_b[::-1])), dtype=np.float64)
+
+def _chicane_entry_guard_walls() -> list[object]:
+    half_lane = 0.5 * TURN_BARRIER_LANE_WIDTH
+    right_a = np.asarray([RIGHT_CHICANE_INNER_X - CHICANE_INNER_X_OFFSET, RIGHT_CHICANE_Y0 - half_lane], dtype=np.float64)
+    right_b = np.asarray([RIGHT_CHICANE_INNER_X - CHICANE_INNER_X_OFFSET, RIGHT_CHICANE_Y0 - half_lane - CHICANE_ENTRY_GUARD_LENGTH], dtype=np.float64)
+    left_a = np.asarray([LEFT_CHICANE_INNER_X + CHICANE_INNER_X_OFFSET, LEFT_CHICANE_Y0 + half_lane], dtype=np.float64)
+    left_b = np.asarray([LEFT_CHICANE_INNER_X + CHICANE_INNER_X_OFFSET, LEFT_CHICANE_Y0 + half_lane + CHICANE_ENTRY_GUARD_LENGTH], dtype=np.float64)
+    return [
+        controller_core.make_wall_between_points(right_a, right_b, width=TURN_BARRIER_THICKNESS, extension=0.0),
+        controller_core.make_wall_between_points(left_a, left_b, width=TURN_BARRIER_THICKNESS, extension=0.0),
+    ]
 
 def _build_turn_barriers() -> list[object]:
     PolyObstacle, *_ = controller_core._planner_symbols()
-    half_lane = 0.5 * TURN_BARRIER_LANE_WIDTH
-    inner_radius = CENTERLINE_RADIUS - half_lane
-    if inner_radius <= 0.5 * TURN_BARRIER_THICKNESS:
-        raise ValueError('U-turn lane is too wide for the selected centerline radius.')
-    right_center = np.asarray([RIGHT_ARC_X, TRACK_CENTER_Y], dtype=np.float64)
-    left_center = np.asarray([LEFT_ARC_X, TRACK_CENTER_Y], dtype=np.float64)
-    barriers: list[object] = []
-    for radius in (inner_radius,):
-        barriers.append(PolyObstacle(_turn_barrier_polygon(right_center, -0.5 * math.pi, 0.5 * math.pi, radius)))
-        barriers.append(PolyObstacle(_turn_barrier_polygon(left_center, 0.5 * math.pi, 1.5 * math.pi, radius)))
+    barriers = [
+        PolyObstacle(_chicane_boundary_polygon('right', 1.0)),
+        PolyObstacle(_chicane_boundary_polygon('right', -1.0)),
+        PolyObstacle(_chicane_boundary_polygon('left', 1.0)),
+        PolyObstacle(_chicane_boundary_polygon('left', -1.0)),
+    ]
+    barriers.extend(_chicane_entry_guard_walls())
     return barriers
 
 def _build_inner_straight_barriers() -> list[object]:
-    """Build the H-shaped infield barrier requested for shortcut prevention.
+    """Build the H-shaped infield barrier used for shortcut prevention.
 
-    The vertical walls are the chords between the two endpoints of each inner
-    U-turn barrier.  The horizontal wall joins the midpoints of those chords.
+    The vertical walls join the two endpoints of each inner chicane barrier,
+    and the horizontal wall joins the midpoints of those chords.
     """
     half_lane = 0.5 * TURN_BARRIER_LANE_WIDTH
     inner_radius = CENTERLINE_RADIUS - half_lane
@@ -1120,31 +1596,32 @@ def _build_fixed_barriers() -> tuple[list[object], list[object]]:
     return (turn_barriers + inner_straight_barriers, inner_straight_barriers)
 
 def _turn_barrier_collision_circles() -> list[tuple[np.ndarray, float]]:
-    """Conservatively cover the two inner curved U-turn walls with short circle chains.
-
-    The generic polygon bounding-circle helper would turn each long curved annulus
-    into a very large circle.  Here each annular arc interval gets its own enclosing
-    circle, using the same 0.15 m longitudinal resolution as controller walls.
-    """
     half_lane = 0.5 * TURN_BARRIER_LANE_WIDTH
     half_thickness = 0.5 * TURN_BARRIER_THICKNESS
-    radii = (CENTERLINE_RADIUS - half_lane,)
-    specs = ((np.asarray([RIGHT_ARC_X, TRACK_CENTER_Y], dtype=np.float64), -0.5 * math.pi, 0.5 * math.pi), (np.asarray([LEFT_ARC_X, TRACK_CENTER_Y], dtype=np.float64), 0.5 * math.pi, 1.5 * math.pi))
-    circles: list[tuple[np.ndarray, float]] = []
     max_seg = max(1e-06, float(TURN_BARRIER_COLLISION_SEGMENT_LENGTH))
-    for wall_radius in radii:
-        segment_count = max(2, int(math.ceil(math.pi * wall_radius / max_seg)))
-        for center, theta0, theta1 in specs:
-            edges = np.linspace(theta0, theta1, segment_count + 1)
+    segment_count = max(2, int(math.ceil(CHICANE_LENGTH / max_seg)))
+    circles: list[tuple[np.ndarray, float]] = []
+    guards = _chicane_entry_guard_walls()
+    for side_index, side in enumerate(('right', 'left')):
+        sampler = _right_chicane_point_tangent if side == 'right' else _left_chicane_point_tangent
+        for lateral_sign in (1.0, -1.0):
             for i in range(segment_count):
-                a0 = float(edges[i])
-                a1 = float(edges[i + 1])
-                amid = 0.5 * (a0 + a1)
-                half_span = 0.5 * (a1 - a0)
-                circle_center = center + wall_radius * np.asarray([math.cos(amid), math.sin(amid)], dtype=np.float64)
-                outer_radius = wall_radius + half_thickness
-                enclosure_radius = math.sqrt(max(0.0, wall_radius * wall_radius + outer_radius * outer_radius - 2.0 * wall_radius * outer_radius * math.cos(half_span)))
-                circles.append((np.asarray(circle_center, dtype=np.float64), float(enclosure_radius)))
+                s0 = CHICANE_LENGTH * i / float(segment_count)
+                s1 = CHICANE_LENGTH * (i + 1) / float(segment_count)
+                sm = 0.5 * (s0 + s1)
+                pm, tm = sampler(sm)
+                nm = np.asarray([-tm[1], tm[0]], dtype=np.float64)
+                circle_center = pm + lateral_sign * half_lane * nm
+                max_centerline_distance = 0.0
+                for fraction in (0.0, 0.25, 0.5, 0.75, 1.0):
+                    sp = s0 + fraction * (s1 - s0)
+                    pp, tp = sampler(sp)
+                    np_left = np.asarray([-tp[1], tp[0]], dtype=np.float64)
+                    barrier_point = pp + lateral_sign * half_lane * np_left
+                    distance = float(np.linalg.norm(barrier_point - circle_center))
+                    max_centerline_distance = max(max_centerline_distance, distance)
+                circles.append((np.asarray(circle_center, dtype=np.float64), max_centerline_distance + half_thickness + 1e-06))
+        circles.extend(controller_core.obstacle_bounding_circles([guards[side_index]]))
     return circles
 
 def _build_collision_sector_bank(lower_obstacles: list[object], upper_obstacles: list[object], inner_straight_barriers: list[object]) -> CollisionSectorBank:
@@ -1214,8 +1691,8 @@ def _sector_mask_for_prediction(
     boundaries = (
         0.0,
         STRAIGHT_LENGTH,
-        STRAIGHT_LENGTH + math.pi * CENTERLINE_RADIUS,
-        2.0 * STRAIGHT_LENGTH + math.pi * CENTERLINE_RADIUS,
+        STRAIGHT_LENGTH + CHICANE_LENGTH,
+        2.0 * STRAIGHT_LENGTH + CHICANE_LENGTH,
         TRACK_LENGTH,
     )
     intervals: list[tuple[float, float]] = []
@@ -1304,14 +1781,13 @@ def build_racing_obstacles() -> tuple[list[object], list[object], list[object]]:
     source_scene, source_obstacles, source_start, source_goal = _canonical_controller_scene()
     del source_scene
     PolyObstacle, *_ = controller_core._planner_symbols()
-    lower = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, P2, P3)) for obs in source_obstacles]
-    upper = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, P4, P1)) for obs in source_obstacles]
+    lower = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, FISH_P2, FISH_P3)) for obs in source_obstacles]
+    upper = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, FISH_P4, FISH_P1)) for obs in source_obstacles]
     fixed_barriers, _ = _build_fixed_barriers()
     return (lower, upper, lower + upper + fixed_barriers)
 
 def _fixed_turn(start_s: float) -> tuple[np.ndarray, np.ndarray]:
-    distance = math.pi * CENTERLINE_RADIUS
-    points = sample_centerline(start_s, distance, TURN_POINTS)
+    points = sample_centerline(start_s, CHICANE_LENGTH, TURN_POINTS)
     return (points, racing_prior_covariance(points))
 
 def _force_path_endpoints(path: np.ndarray, start: np.ndarray, goal: np.ndarray) -> np.ndarray:
@@ -1350,6 +1826,52 @@ def _concat_covariances(paths: list[np.ndarray], covariances: list[np.ndarray]) 
         first = False
     return np.ascontiguousarray(np.concatenate(blocks, axis=0), dtype=np.float64)
 
+def _straight_connector(start: np.ndarray, goal: np.ndarray) -> np.ndarray:
+    """Sample one deterministic straight connector for an added end section."""
+    a = np.asarray(start, dtype=np.float64)[:2]
+    b = np.asarray(goal, dtype=np.float64)[:2]
+    distance = float(np.linalg.norm(b - a))
+    if distance <= 1e-12:
+        return np.ascontiguousarray(a[None, :], dtype=np.float64)
+    spacing = max(float(STRAIGHT_EXTENSION_POINT_SPACING), 1e-06)
+    count = max(2, int(math.ceil(distance / spacing)) + 1)
+    return np.ascontiguousarray(np.linspace(a, b, count), dtype=np.float64)
+
+def _extend_mode_with_straight_ends(
+    mode: controller_core.MPPIHomotopyMode,
+    full_start: np.ndarray,
+    fish_start: np.ndarray,
+    fish_goal: np.ndarray,
+    full_goal: np.ndarray,
+) -> controller_core.MPPIHomotopyMode:
+    """Add equal straight tails while leaving the middle section untouched."""
+    core = _force_path_endpoints(mode.mean_path, fish_start, fish_goal)
+    core_cov = np.asarray(mode.cov_blocks, dtype=np.float64)
+    if core_cov.shape != (len(core), 2, 2):
+        raise ValueError('Covariance does not match the transformed mean path.')
+
+    entry = _straight_connector(full_start, fish_start)
+    exit_ = _straight_connector(fish_goal, full_goal)
+    entry_cov = np.repeat(core_cov[0:1], len(entry), axis=0)
+    exit_cov = np.repeat(core_cov[-1:], len(exit_), axis=0)
+    mean = _concat_pieces([entry, core, exit_])
+    cov = _concat_covariances([entry, core, exit_], [entry_cov, core_cov, exit_cov])
+
+    samples: list[np.ndarray] = []
+    for raw in list(mode.sample_paths or []):
+        sample_core = _force_path_endpoints(raw, fish_start, fish_goal)
+        samples.append(_concat_pieces([entry, sample_core, exit_]))
+
+    return controller_core.prepare_mode_prior_cache(
+        controller_core.MPPIHomotopyMode(
+            signature=tuple(mode.signature),
+            probability=float(mode.probability),
+            mean_path=mean,
+            cov_blocks=cov,
+            sample_paths=samples,
+        )
+    )
+
 def _duplicate_loop(path: np.ndarray, cov: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     repeated_path = np.vstack((path, path[1:]))
     repeated_cov = np.concatenate((cov, cov[1:]), axis=0)
@@ -1373,35 +1895,37 @@ def _joint_empirical_paths(bottom_mode: controller_core.MPPIHomotopyMode, top_mo
     return out
 
 def build_racing_prior_modes(seed: int) -> tuple[list[controller_core.MPPIHomotopyMode], list[object], list[object], list[object], list[object]]:
-    """Run Fish exactly as the standard viewer, then rigidly map priors to the oval."""
+    """Run planner exactly as the standard viewer, then map priors to the chicane circuit."""
     source_scene, source_obstacles, source_start, source_goal = _canonical_controller_scene()
     canonical_bottom = controller_core.build_homotopy_modes(source_scene, source_obstacles, int(seed))
     canonical_top = controller_core.build_homotopy_modes(source_scene, source_obstacles, int(seed) + 1)
     if not canonical_bottom:
-        raise RuntimeError('Canonical Fish planner returned no modes for the P2->P3 straight.')
+        raise RuntimeError('Canonical planner returned no modes for the P2->P3 straight.')
     if not canonical_top:
-        raise RuntimeError('Canonical Fish planner returned no modes for the P4->P1 straight.')
-    bottom_modes = [_transform_planner_mode(mode, source_start, source_goal, P2, P3) for mode in canonical_bottom]
-    top_modes = [_transform_planner_mode(mode, source_start, source_goal, P4, P1) for mode in canonical_top]
+        raise RuntimeError('Canonical planner returned no modes for the P4->P1 straight.')
+    bottom_core_modes = [_transform_planner_mode(mode, source_start, source_goal, FISH_P2, FISH_P3) for mode in canonical_bottom]
+    top_core_modes = [_transform_planner_mode(mode, source_start, source_goal, FISH_P4, FISH_P1) for mode in canonical_top]
+    bottom_modes = [_extend_mode_with_straight_ends(mode, P2, FISH_P2, FISH_P3, P3) for mode in bottom_core_modes]
+    top_modes = [_extend_mode_with_straight_ends(mode, P4, FISH_P4, FISH_P1, P1) for mode in top_core_modes]
     PolyObstacle, *_ = controller_core._planner_symbols()
-    lower_obstacles = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, P2, P3)) for obs in source_obstacles]
-    upper_obstacles = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, P4, P1)) for obs in source_obstacles]
+    lower_obstacles = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, FISH_P2, FISH_P3)) for obs in source_obstacles]
+    upper_obstacles = [PolyObstacle(_rigid_transform_points(_poly_vertices(obs), source_start, source_goal, FISH_P4, FISH_P1)) for obs in source_obstacles]
     fixed_barriers, inner_straight_barriers = _build_fixed_barriers()
     all_obstacles = lower_obstacles + upper_obstacles + fixed_barriers
     right_turn, right_cov = _fixed_turn(STRAIGHT_LENGTH)
-    p1_s = 2.0 * STRAIGHT_LENGTH + math.pi * CENTERLINE_RADIUS
+    p1_s = 2.0 * STRAIGHT_LENGTH + CHICANE_LENGTH
     left_turn, left_cov = _fixed_turn(p1_s)
     joint: list[controller_core.MPPIHomotopyMode] = []
     for bi, bottom_mode in enumerate(bottom_modes):
         bottom = _force_path_endpoints(bottom_mode.mean_path, P2, P3)
         bottom_cov = np.asarray(bottom_mode.cov_blocks, dtype=np.float64)
         if bottom_cov.shape[0] != len(bottom):
-            raise ValueError('Bottom Fish covariance does not match its mean path.')
+            raise ValueError('Bottom covariance does not match its mean path.')
         for ti, top_mode in enumerate(top_modes):
             top = _force_path_endpoints(top_mode.mean_path, P4, P1)
             top_cov = np.asarray(top_mode.cov_blocks, dtype=np.float64)
             if top_cov.shape[0] != len(top):
-                raise ValueError('Top Fish covariance does not match its mean path.')
+                raise ValueError('Top covariance does not match its mean path.')
             pieces = [bottom, right_turn, top, left_turn]
             covs = [bottom_cov, right_cov, top_cov, left_cov]
             loop = _concat_pieces(pieces)
@@ -1553,7 +2077,7 @@ def _select_shortest_cutting_wall(candidates: list[DynamicWallCandidate], candid
     Candidates are pre-sorted by center-to-center length.  The path-crossing test is
     one parallel Numba pass; only crossing candidates reach the more expensive prior
     feasibility test.  If the geometrically shortest crossing wall would close every
-    Fish prior, the next-shortest crossing wall is tried.
+    prior, the next-shortest crossing wall is tried.
     """
     if not candidates or np.asarray(taken_path).shape[0] < 2:
         return None
@@ -1568,13 +2092,21 @@ def _select_shortest_cutting_wall(candidates: list[DynamicWallCandidate], candid
             return candidate
     return None
 
-def _active_prior_selection(prior_bank: PackedRacingPriorBank, fixed_feasible_mask: np.ndarray, dynamic_circle_centers: np.ndarray, dynamic_circle_radii: np.ndarray, cfg: ackermann.MPPIConfig) -> tuple[np.ndarray, np.ndarray]:
+def _active_prior_selection(prior_bank: PackedRacingPriorBank, fixed_feasible_mask: np.ndarray, dynamic_circle_centers: np.ndarray, dynamic_circle_radii: np.ndarray, cfg: ackermann.MPPIConfig, max_prior: Optional[int] = None) -> tuple[np.ndarray, np.ndarray]:
     feasible = np.ascontiguousarray(np.asarray(fixed_feasible_mask, dtype=np.bool_)).copy()
     if dynamic_circle_radii.size:
         feasible &= _prior_feasible_mask_nb(prior_bank.mean_paths, prior_bank.localization_lengths, dynamic_circle_centers, dynamic_circle_radii, float(cfg.vehicle_length), float(cfg.vehicle_width), float(cfg.hard_collision_clearance), int(cfg.mode_blocking_substeps))
     active_indices = np.ascontiguousarray(np.flatnonzero(feasible), dtype=np.int64)
     if active_indices.size == 0:
-        raise RuntimeError('No complete Fish prior remains feasible with the active barriers.')
+        raise RuntimeError('No complete prior remains feasible with the active barriers.')
+    if max_prior is not None:
+        limit = int(max_prior)
+        if limit < 1:
+            raise ValueError('max_prior must be at least 1 or None.')
+        if active_indices.size > limit:
+            feasible_probabilities = np.asarray(prior_bank.probabilities[active_indices], dtype=np.float64)
+            order = np.argsort(-feasible_probabilities, kind='stable')[:limit]
+            active_indices = np.ascontiguousarray(active_indices[order], dtype=np.int64)
     probabilities = np.asarray(prior_bank.probabilities[active_indices], dtype=np.float64)
     mass = float(np.sum(probabilities))
     if mass <= 1e-15:
@@ -1585,6 +2117,7 @@ def _active_prior_selection(prior_bank: PackedRacingPriorBank, fixed_feasible_ma
 
 def _local_racing_ranges(
     state: np.ndarray,
+    current_s: float,
     prior_bank: PackedRacingPriorBank,
     cfg: ackermann.MPPIConfig,
     active_indices: np.ndarray,
@@ -1604,6 +2137,7 @@ def _local_racing_ranges(
         np.ascontiguousarray(localization_cursors, dtype=np.int64),
         float(state[0]),
         float(state[1]),
+        float(current_s),
         int(cfg.horizon),
         float(ds),
         24,
@@ -1614,13 +2148,14 @@ def _local_racing_ranges(
 
 def _local_racing_batch(
     state: np.ndarray,
+    current_s: float,
     prior_bank: PackedRacingPriorBank,
     cfg: ackermann.MPPIConfig,
     active_indices: np.ndarray,
     localization_cursors: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     starts, ends, updated = _local_racing_ranges(
-        state, prior_bank, cfg, active_indices, localization_cursors
+        state, current_s, prior_bank, cfg, active_indices, localization_cursors
     )
     refs, covs, arcs, lengths = _pack_local_prior_windows_nb(
         prior_bank.mean_paths,
@@ -1642,9 +2177,13 @@ def _is_fixed_turn_covariance_sample(mean: np.ndarray, covariance: np.ndarray) -
         and abs(float(covariance[1, 0])) <= 1e-10
     ):
         return False
-    right_radius = math.hypot(float(mean[0]) - RIGHT_ARC_X, float(mean[1]) - TRACK_CENTER_Y)
-    left_radius = math.hypot(float(mean[0]) - LEFT_ARC_X, float(mean[1]) - TRACK_CENTER_Y)
-    return min(abs(right_radius - CENTERLINE_RADIUS), abs(left_radius - CENTERLINE_RADIUS)) <= 1e-6
+    s_value, distance_sq = _project_centerline_nb(float(mean[0]), float(mean[1]))
+    if distance_sq > 1e-10:
+        return False
+    right_start = STRAIGHT_LENGTH
+    right_end = right_start + CHICANE_LENGTH
+    left_start = 2.0 * STRAIGHT_LENGTH + CHICANE_LENGTH
+    return right_start - 1e-10 <= s_value <= right_end + 1e-10 or left_start - 1e-10 <= s_value < TRACK_LENGTH
 
 
 def _sparse_covariance_mode_geometry(
@@ -1667,6 +2206,8 @@ def _sparse_covariance_mode_geometry(
     last_arc = -1e300
     minimum_spacing = max(float(spacing), 1e-6)
     for i in range(n):
+        if i == 0 or i == n - 1:
+            continue
         covariance = 0.5 * (covs[i] + covs[i].T)
         if not np.all(np.isfinite(covariance)):
             continue
@@ -1840,6 +2381,7 @@ def _active_sample_ids(
 
 def _planner_control_bank(
     state: np.ndarray,
+    current_s: float,
     prior_bank: PackedRacingPriorBank,
     active_indices: np.ndarray,
     cfg: object,
@@ -1856,6 +2398,7 @@ def _planner_control_bank(
             sample_ids,
             float(state[0]),
             float(state[1]),
+            float(current_s),
             int(cfg.horizon),
             float(controller_core.prior_preview_step_distance(cfg)),
         )
@@ -1935,7 +2478,7 @@ def racing_controller_step(
     if prior_variant:
         counts = _probability_rollout_counts(int(cfg.num_rollouts), probabilities)
         refs, covs, arcs, local_lengths, updated_cursors = _local_racing_batch(
-            state, prior_bank, cfg, active_indices, updated_cursors
+            state, current_s, prior_bank, cfg, active_indices, updated_cursors
         )
         if variant == controller_core.ControllerVariant.SENSITIVITY_PROJECTED_GAUSSIAN_MPPI:
             nominal_controls, control_positions, As, Bs, ilqr_positions = model.batch_nominal_solutions(
@@ -2029,7 +2572,7 @@ def racing_controller_step(
         primary_index = int(active_indices[primary_position])
         if variant == controller_core.ControllerVariant.CONTROL_BANK_MPPI:
             local_active_refs, local_active_covs, _, local_active_lengths, updated_cursors = _local_racing_batch(
-                state, prior_bank, cfg, active_indices, updated_cursors
+                state, current_s, prior_bank, cfg, active_indices, updated_cursors
             )
             primary_local_position = primary_position
             primary_ref = np.ascontiguousarray(local_active_refs[primary_local_position, :int(local_active_lengths[primary_local_position])])
@@ -2040,6 +2583,7 @@ def racing_controller_step(
             )
             bank_controls = _planner_control_bank(
                 state,
+                current_s,
                 prior_bank,
                 active_indices,
                 cfg,
@@ -2063,6 +2607,7 @@ def racing_controller_step(
         else:
             refs, covs, _, local_lengths, updated_cursors = _local_racing_batch(
                 state,
+                current_s,
                 prior_bank,
                 cfg,
                 np.asarray([primary_index], dtype=np.int64),
@@ -2177,7 +2722,9 @@ def run_race(
     v_max: float = 4.0,
     hard_collision_clearance: float = 0.01,
     model_name: str = 'ackermann',
+    max_prior: Optional[int] = MAX_PRIOR,
     record_predictions: bool = True,
+    max_steps_per_lap: int = MAX_STEPS_PER_LAP,
     max_steps: Optional[int] = None,
 ) -> RaceResult:
     if variant_value not in VARIANT_TO_DISPLAY:
@@ -2208,6 +2755,14 @@ def run_race(
     hard_collision_clearance = float(hard_collision_clearance)
     if not math.isfinite(hard_collision_clearance) or hard_collision_clearance < 0.0:
         raise ValueError('hard_collision_clearance must be nonnegative.')
+    if max_prior is not None:
+        max_prior = int(max_prior)
+        if max_prior < 1:
+            raise ValueError('max_prior must be at least 1 or None.')
+    max_steps_per_lap = int(max_steps_per_lap)
+    if max_steps_per_lap < 1:
+        raise ValueError('max_steps_per_lap must be at least 1.')
+    active_prior_limit = max_prior if variant_value in PRIOR_MEAN_VARIANTS else None
 
     cfg = make_racing_config(
         num_rollouts,
@@ -2239,7 +2794,7 @@ def run_race(
         int(cfg.mode_blocking_substeps),
     )
     if not np.any(fixed_feasible_mask):
-        raise RuntimeError('The H-shaped infield barrier blocks every complete Fish prior. Increase the infield clearance or regenerate a wider prior bank.')
+        raise RuntimeError('The H-shaped infield barrier blocks every complete prior. Increase the infield clearance or regenerate a wider prior bank.')
     fixed_feasible_mask = np.ascontiguousarray(fixed_feasible_mask, dtype=np.bool_)
 
     lower_wall_candidates: list[DynamicWallCandidate] = []
@@ -2264,7 +2819,7 @@ def run_race(
         sector_bank, dynamic_circle_centers, dynamic_circle_radii
     )
     active_indices, active_probabilities = _active_prior_selection(
-        prior_bank, fixed_feasible_mask, dynamic_circle_centers, dynamic_circle_radii, cfg
+        prior_bank, fixed_feasible_mask, dynamic_circle_centers, dynamic_circle_radii, cfg, active_prior_limit
     )
     localization_cursors = np.full(len(prior_bank.modes), -1, dtype=np.int64)
 
@@ -2272,10 +2827,13 @@ def run_race(
     start_s, _ = _project_centerline_nb(float(state[0]), float(state[1]))
     current_s = float(start_s)
     cumulative = 0.0
+    progress_step_limit = max(
+        1.0,
+        2.0 * max(abs(float(cfg.v_min)), abs(float(cfg.v_max)), abs(float(cfg.lateral_velocity_limit))) * float(cfg.dt) + 0.25,
+    )
     target_progress = laps * TRACK_LENGTH
     if max_steps is None:
-        theoretical_steps = TRACK_LENGTH / max(float(cfg.v_max) * float(cfg.dt), 1e-9)
-        max_steps = int(math.ceil(4.0 * laps * theoretical_steps + 10.0 / cfg.dt))
+        max_steps = int(laps * max_steps_per_lap)
 
     states = [state.copy()]
     controls: list[np.ndarray] = []
@@ -2288,6 +2846,7 @@ def run_race(
     lap_times: list[float] = []
     completed_laps = 0
     collision = False
+    lap_start_step = 0
     dynamic_wall_history: list[list[np.ndarray]] = [[]]
     active_prior_indices_history: list[np.ndarray] = []
 
@@ -2309,6 +2868,8 @@ def run_race(
 
     t0 = time.perf_counter()
     for step in range(int(max_steps)):
+        if step - lap_start_step >= max_steps_per_lap:
+            break
         sector_mask = _sector_mask_for_prediction(current_s, state, cfg, sector_bank)
         prediction_centers = prediction_collision_cache.mask_centers[sector_mask]
         prediction_radii = prediction_collision_cache.mask_radii[sector_mask]
@@ -2345,7 +2906,10 @@ def run_race(
         )
         if exact_hit:
             terminal_state = np.asarray(collision_state, dtype=np.float64)
-            new_s, _ = _project_centerline_nb(float(terminal_state[0]), float(terminal_state[1]))
+            new_s, _ = _project_centerline_near_s_nb(
+                float(terminal_state[0]), float(terminal_state[1]), float(current_s),
+                progress_step_limit, progress_step_limit,
+            )
             ds = float(_signed_progress_delta_nb(float(new_s), float(current_s)))
             cumulative += ds
             current_s = float(new_s)
@@ -2359,9 +2923,12 @@ def run_race(
                 nominal_predictions.append(np.asarray(info['nominal_traj'], dtype=np.float64).copy())
                 mppi_predictions.append(np.asarray(info['optimal_traj'], dtype=np.float64).copy())
             new_completed = int(math.floor(max(cumulative, 0.0) / TRACK_LENGTH + 1e-12))
+            previous_completed_laps = completed_laps
             while completed_laps < min(new_completed, laps):
                 completed_laps += 1
                 lap_times.append((step + 1) * float(cfg.dt))
+            if completed_laps > previous_completed_laps:
+                lap_start_step = step + 1
             dynamic_wall_history.append([
                 active.candidate.vertices
                 for active in active_dynamic_walls
@@ -2370,7 +2937,10 @@ def run_race(
             state = terminal_state
             break
 
-        new_s, _ = _project_centerline_nb(float(next_state[0]), float(next_state[1]))
+        new_s, _ = _project_centerline_near_s_nb(
+            float(next_state[0]), float(next_state[1]), float(current_s),
+            progress_step_limit, progress_step_limit,
+        )
         ds = float(_signed_progress_delta_nb(float(new_s), float(current_s)))
         cumulative += ds
         current_s = float(new_s)
@@ -2384,9 +2954,12 @@ def run_race(
             nominal_predictions.append(np.asarray(info['nominal_traj'], dtype=np.float64).copy())
             mppi_predictions.append(np.asarray(info['optimal_traj'], dtype=np.float64).copy())
         new_completed = int(math.floor(max(cumulative, 0.0) / TRACK_LENGTH + 1e-12))
+        previous_completed_laps = completed_laps
         while completed_laps < min(new_completed, laps):
             completed_laps += 1
             lap_times.append((step + 1) * float(cfg.dt))
+        if completed_laps > previous_completed_laps:
+            lap_start_step = step + 1
 
         wall_configuration_changed = False
         if wall_lifetime_laps > 0.0:
@@ -2456,6 +3029,7 @@ def run_race(
                     dynamic_circle_centers,
                     dynamic_circle_radii,
                     cfg,
+                    active_prior_limit,
                 )
                 localization_cursors.fill(-1)
 
@@ -2486,6 +3060,7 @@ def run_race(
         requested_laps=laps,
         completed_laps=completed_laps,
         collision=collision,
+        max_steps_per_lap=max_steps_per_lap,
         runtime_s=runtime,
         variant_value=variant_value,
         wall_mode=wall_mode,
@@ -2544,16 +3119,17 @@ class NASCARViewer:
         plot_frame.rowconfigure(0, weight=1)
         ttk.Label(controls, text='NASCAR race', font=('TkDefaultFont', 12, 'bold')).grid(row=0, column=0, sticky='w', pady=(0, 8))
         base_cfg = ackermann.MPPIConfig()
-        self.vehicle_var = tk.StringVar(value='Ackermann')
+        self.vehicle_var = tk.StringVar(value='Four-wheel')
         self.variant_var = tk.StringVar(value='SPG prior')
         self.wall_mode_var = tk.StringVar(value='No wall')
-        self.laps_var = tk.StringVar(value='10')
-        self.rollouts_var = tk.StringVar(value='4096')
+        self.laps_var = tk.StringVar(value='3')
+        self.rollouts_var = tk.StringVar(value='256')
         self.lbps_delta_var = tk.StringVar(value='0.9')
         self.seed_var = tk.StringVar(value='1')
+        self.max_prior_var = tk.StringVar(value=str(MAX_PRIOR))
         self.speed_var = tk.StringVar(value='4.0')
-        self.horizon_var = tk.DoubleVar(value=float(25))
-        self.temporal_noise_var = tk.DoubleVar(value=float(base_cfg.temporal_noise_smoothing))
+        self.horizon_var = tk.DoubleVar(value=float(15))
+        self.temporal_noise_var = tk.DoubleVar(value=float(0.3))
         self.sigma0_scale_var = tk.DoubleVar(value=1.0)
         self.vmax_var = tk.DoubleVar(value=6.0)
         self.hard_collision_clearance_var = tk.DoubleVar(value=float(0.02))
@@ -2568,11 +3144,12 @@ class NASCARViewer:
         row = self._add_entry(controls, row, 'Rollouts per step', self.rollouts_var)
         row = self._add_entry(controls, row, 'LBPS delta', self.lbps_delta_var)
         row = self._add_entry(controls, row, 'Controller seed', self.seed_var)
+        row = self._add_entry(controls, row, 'Max active priors', self.max_prior_var)
         ttk.Separator(controls).grid(row=row, column=0, sticky='ew', pady=(10, 6))
         row += 1
         ttk.Label(controls, text='Racing controller config', font=('TkDefaultFont', 11, 'bold')).grid(row=row, column=0, sticky='w')
         row += 1
-        row = self._add_slider(controls, row, 'Horizon H', self.horizon_var, 15.0, 35.0, formatter=lambda value: str(int(round(value))))
+        row = self._add_slider(controls, row, 'Horizon H', self.horizon_var, 10.0, 30.0, formatter=lambda value: str(int(round(value))))
         row = self._add_slider(controls, row, 'Temporal noise', self.temporal_noise_var, 0.0, 0.95, formatter=lambda value: f'{value:.2f}')
         row = self._add_slider(controls, row, 'Sigma_0 covariance scale', self.sigma0_scale_var, 0.1, 4.0, formatter=lambda value: f'{value:.2f}x')
         row = self._add_slider(controls, row, 'V_max [m/s]', self.vmax_var, 4.0, 10.0, formatter=lambda value: f'{value:.1f}')
@@ -2586,6 +3163,8 @@ class NASCARViewer:
         self.play_button.grid(row=1, column=0, sticky='ew', padx=(0, 3))
         self.restart_button = ttk.Button(buttons, text='Restart', command=self.restart_animation, state='disabled')
         self.restart_button.grid(row=1, column=1, sticky='ew', padx=(3, 0))
+        self.export_gif_button = ttk.Button(buttons, text='Export GIF', command=self.export_gif, state='disabled')
+        self.export_gif_button.grid(row=2, column=0, columnspan=2, sticky='ew', pady=(6, 0))
         row += 1
         ttk.Separator(controls).grid(row=row, column=0, sticky='ew', pady=10)
         row += 1
@@ -2668,6 +3247,7 @@ class NASCARViewer:
             rollouts = int(self.rollouts_var.get())
             lbps_delta = float(self.lbps_delta_var.get())
             seed = int(self.seed_var.get())
+            max_prior = int(self.max_prior_var.get())
             horizon = int(round(float(self.horizon_var.get())))
             temporal_noise = float(self.temporal_noise_var.get())
             sigma0_scale = float(self.sigma0_scale_var.get())
@@ -2681,6 +3261,8 @@ class NASCARViewer:
                 raise ValueError('Rollouts per step must be at least 32.')
             if not 0.0 < lbps_delta < 1.0:
                 raise ValueError('LBPS delta must be strictly between 0 and 1.')
+            if max_prior < 1:
+                raise ValueError('Max active priors must be at least 1.')
             if not 10 <= horizon <= 100:
                 raise ValueError('Horizon H must be between 10 and 100.')
             if not 0.0 <= temporal_noise < 1.0:
@@ -2700,9 +3282,10 @@ class NASCARViewer:
         self.run_button.configure(state='disabled')
         self.play_button.configure(state='disabled', text='Play')
         self.restart_button.configure(state='disabled')
+        self.export_gif_button.configure(state='disabled')
         self.frame_scale.configure(state='disabled')
-        self.status_var.set(f'Running {vehicle_label} / {variant_label} / {wall_mode_label}: H={horizon}, temporal={temporal_noise:.2f}, Sigma_0 scale={sigma0_scale:.2f}x, v_max={v_max:.1f} m/s. First run also builds the two Fish straight-line prior banks.')
-        settings = dict(variant_value=variant_value, laps=laps, num_rollouts=rollouts, lbps_delta=lbps_delta, seed=seed, wall_mode=wall_mode, horizon=horizon, temporal_noise_smoothing=temporal_noise, sigma0_scale=sigma0_scale, v_max=v_max, hard_collision_clearance=hard_collision_clearance, model_name=model_name)
+        self.status_var.set(f'Running {vehicle_label} / {variant_label} / {wall_mode_label}: H={horizon}, max_prior={max_prior}, temporal={temporal_noise:.2f}, Sigma_0 scale={sigma0_scale:.2f}x, v_max={v_max:.1f} m/s. First run also builds the two straight-line prior banks.')
+        settings = dict(variant_value=variant_value, laps=laps, num_rollouts=rollouts, lbps_delta=lbps_delta, seed=seed, wall_mode=wall_mode, horizon=horizon, temporal_noise_smoothing=temporal_noise, sigma0_scale=sigma0_scale, v_max=v_max, hard_collision_clearance=hard_collision_clearance, model_name=model_name, max_prior=max_prior)
         self.worker = threading.Thread(target=self._worker_run, kwargs=settings, daemon=True)
         self.worker.start()
 
@@ -2739,6 +3322,7 @@ class NASCARViewer:
         self.frame_scale.configure(from_=0, to=total_frames, state='normal')
         self.play_button.configure(state='normal')
         self.restart_button.configure(state='normal')
+        self.export_gif_button.configure(state='normal')
         self.frame_index = 0
         self._set_slider(0)
         self._draw_frame(0)
@@ -2748,7 +3332,7 @@ class NASCARViewer:
         elif self.result.collision:
             self.status_var.set(f'DNF: obstacle collision after {self.result.completed_laps}/{self.result.requested_laps} laps; final frame is first contact. Simulated time {len(self.result.controls) * self.result.cfg.dt:.2f}s.')
         else:
-            self.status_var.set(f'DNF: step limit reached after {self.result.completed_laps}/{self.result.requested_laps} laps.')
+            self.status_var.set(f'DNF: {self.result.max_steps_per_lap}-step per-lap limit reached after {self.result.completed_laps}/{self.result.requested_laps} laps.')
         if len(self.result.states) > 1:
             self.playing = True
             self.play_button.configure(text='Pause')
@@ -2758,6 +3342,7 @@ class NASCARViewer:
         self.run_button.configure(state='normal')
         self.play_button.configure(state='disabled', text='Play')
         self.restart_button.configure(state='disabled')
+        self.export_gif_button.configure(state='disabled')
         self.status_var.set('Race failed. See error dialog.')
         messagebox.showerror('Race failed', text)
 
@@ -2812,6 +3397,116 @@ class NASCARViewer:
         self._set_slider(0)
         self._draw_frame(0)
 
+    def export_gif(self) -> None:
+        if self.result is None or len(self.result.states) == 0:
+            return
+
+        was_playing = self.playing
+        original_frame = int(self.frame_index)
+        self._stop_animation()
+        path = filedialog.asksaveasfilename(
+            parent=self.root,
+            title='Export race animation as GIF',
+            defaultextension='.gif',
+            filetypes=[('GIF animation', '*.gif'), ('All files', '*.*')],
+            initialfile='nascar_race.gif',
+        )
+        if not path:
+            if was_playing and original_frame < len(self.result.states) - 1:
+                self.playing = True
+                self.play_button.configure(text='Pause')
+                self._schedule_next_frame()
+            return
+
+        try:
+            import imageio.v2 as imageio
+            from PIL import Image
+        except ImportError:
+            messagebox.showerror(
+                'GIF export unavailable',
+                'GIF export requires imageio and Pillow. Install them with: pip install imageio pillow',
+                parent=self.root,
+            )
+            if was_playing and original_frame < len(self.result.states) - 1:
+                self.playing = True
+                self.play_button.configure(text='Pause')
+                self._schedule_next_frame()
+            return
+
+        previous_status = self.status_var.get()
+        axis_was_on = bool(self.ax.axison)
+        title_was_visible = bool(self.ax.title.get_visible())
+        legend = self.ax.get_legend()
+        legend_was_visible = bool(legend.get_visible()) if legend is not None else False
+        export_width = 720
+        self.export_gif_button.configure(state='disabled')
+        try:
+            try:
+                playback = max(float(self.speed_var.get()), 0.1)
+            except ValueError:
+                playback = 1.0
+            delay_ms = max(10, int(1000.0 * float(self.result.cfg.dt) / playback))
+            total_frames = len(self.result.states)
+            self._prior_visual_cursors = None
+            with imageio.get_writer(path, mode='I', duration=delay_ms, loop=0) as writer:
+                for frame in range(total_frames):
+                    self.frame_index = frame
+                    self._set_slider(frame)
+                    self._draw_frame(frame)
+
+                    # Export only the clean plot: no axes, labels, ticks, grid, title, or legend.
+                    self.ax.set_axis_off()
+                    self.ax.title.set_visible(False)
+                    if legend is not None:
+                        legend.set_visible(False)
+                    self.canvas.draw()
+
+                    rgba = np.asarray(self.canvas.buffer_rgba())
+                    renderer = self.canvas.get_renderer()
+                    bbox = self.ax.get_window_extent(renderer=renderer)
+                    x0 = max(0, int(math.floor(bbox.x0)))
+                    x1 = min(rgba.shape[1], int(math.ceil(bbox.x1)))
+                    y0 = max(0, int(math.floor(rgba.shape[0] - bbox.y1)))
+                    y1 = min(rgba.shape[0], int(math.ceil(rgba.shape[0] - bbox.y0)))
+                    rgb = np.ascontiguousarray(rgba[y0:y1, x0:x1, :3])
+                    if rgb.size == 0:
+                        raise RuntimeError('GIF export produced an empty plot crop.')
+
+                    export_height = max(1, int(round(rgb.shape[0] * export_width / rgb.shape[1])))
+                    image = Image.fromarray(rgb).resize(
+                        (export_width, export_height),
+                        Image.Resampling.LANCZOS,
+                    )
+                    writer.append_data(np.ascontiguousarray(np.asarray(image)))
+
+                    if frame % 10 == 0 or frame == total_frames - 1:
+                        self.status_var.set(
+                            f'Exporting GIF: {frame + 1}/{total_frames}  ({export_width}x{export_height})'
+                        )
+                        self.root.update_idletasks()
+            self.status_var.set(f'GIF exported: {path}')
+        except Exception as exc:
+            self.status_var.set(previous_status)
+            messagebox.showerror('GIF export failed', str(exc), parent=self.root)
+        finally:
+            if axis_was_on:
+                self.ax.set_axis_on()
+            else:
+                self.ax.set_axis_off()
+            self.ax.title.set_visible(title_was_visible)
+            if legend is not None:
+                legend.set_visible(legend_was_visible)
+            self._prior_visual_cursors = None
+            self.frame_index = original_frame
+            self._set_slider(original_frame)
+            self._draw_frame(original_frame)
+            self.canvas.draw_idle()
+            self.export_gif_button.configure(state='normal' if self.result is not None else 'disabled')
+            if was_playing and self.result is not None and original_frame < len(self.result.states) - 1:
+                self.playing = True
+                self.play_button.configure(text='Pause')
+                self._schedule_next_frame()
+
     def _set_slider(self, value: int) -> None:
         self.updating_slider = True
         self.frame_scale.set(value)
@@ -2859,7 +3554,7 @@ class NASCARViewer:
                 patch.set_visible(False)
 
     def _init_plot_artists(self) -> None:
-        self.ax.set_xlim(-0.8, TRACK_WIDTH + 0.8)
+        self.ax.set_xlim(TRACK_PLOT_X_MIN, TRACK_PLOT_X_MAX)
         self.ax.set_ylim(-0.8, TRACK_HEIGHT + 0.8)
         self.ax.set_aspect('equal', adjustable='box')
         self.ax.set_xlabel('x [m]')
@@ -2869,7 +3564,7 @@ class NASCARViewer:
         self.obstacle_patches: list[Polygon] = []
         self._sync_obstacle_artists(self._default_obstacle_vertices)
         if self.obstacle_patches:
-            self.obstacle_patches[0].set_label('Obstacles / fixed barriers')
+            self.obstacle_patches[0].set_label('Obstacles')
         self.dynamic_wall_patches: list[Polygon] = []
         dynamic_legend_patch = Polygon(
             np.zeros((3, 2)),
@@ -2878,8 +3573,7 @@ class NASCARViewer:
             edgecolor='0.02',
             linewidth=1.3,
             alpha=0.92,
-            zorder=4,
-            label='Dynamic wall',
+            zorder=4
         )
         dynamic_legend_patch.set_visible(False)
         self.ax.add_patch(dynamic_legend_patch)
@@ -3095,8 +3789,10 @@ class NASCARViewer:
             if self._prior_visual_cursors is None or len(self._prior_visual_cursors) != len(self.result.prior_bank.modes):
                 self._prior_visual_cursors = np.full(len(self.result.prior_bank.modes), -1, dtype=np.int64)
             prior_state = self.result.states[pred_idx]
+            prior_s = float((START_S + self.result.cumulative_progress[pred_idx]) % TRACK_LENGTH)
             starts, ends, updated_visual_cursors = _local_racing_ranges(
                 prior_state,
+                prior_s,
                 self.result.prior_bank,
                 self.result.cfg,
                 active_prior_indices,

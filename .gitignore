@@ -6,4 +6,6 @@
 /planner/__pycache__
 /system/__pycache__
 /results
-/benchmark_results
+/benchmark_results_rollouts
+/benchmark_results_vmax
+/benchmark_results_obstacles

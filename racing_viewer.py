@@ -29,7 +29,6 @@ from matplotlib.patches import FancyArrowPatch, Polygon
 VARIANTS = [
     ("Centerline iLQR", "planner_ilqr"),
     ("Standard MPPI", "standard_mppi"),
-    ("Control bank", "control_bank_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
     ("Gaussian prior", "gaussian_prior_mppi"),
     ("SPG prior", "sensitivity_projected_gaussian_prior_mppi"),
@@ -1152,8 +1151,8 @@ class NASCARViewer:
                 raise ValueError("Rollouts per step must be at least 32.")
             if not (0.0 < lbps_delta < 1.0):
                 raise ValueError("LBPS delta must be strictly between 0 and 1.")
-            if not (10 <= horizon <= 100):
-                raise ValueError("Horizon H must be between 10 and 100.")
+            if not (1 <= horizon <= 100):
+                raise ValueError("Horizon H must be between 1 and 100.")
             if not (0.0 <= temporal_noise < 1.0):
                 raise ValueError("Temporal noise smoothing must be in [0, 1).")
             if sigma0_scale <= 0.0:
