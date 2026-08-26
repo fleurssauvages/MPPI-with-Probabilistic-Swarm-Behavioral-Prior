@@ -30,7 +30,6 @@ VARIANTS = [
     ("Centerline iLQR", "planner_ilqr"),
     ("Standard MPPI", "standard_mppi"),
     ("Corridor prior", "corridor_prior_mppi"),
-    ("Gaussian prior", "gaussian_prior_mppi"),
     ("SPG prior", "sensitivity_projected_gaussian_prior_mppi"),
 ]
 DISPLAY_TO_VARIANT = dict(VARIANTS)

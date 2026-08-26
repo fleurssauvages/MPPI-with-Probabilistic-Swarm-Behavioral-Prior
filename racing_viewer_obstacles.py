@@ -21,7 +21,7 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg, NavigationToolb
 from matplotlib.collections import LineCollection, PolyCollection
 from matplotlib.figure import Figure
 from matplotlib.patches import FancyArrowPatch, Polygon
-VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('Gaussian prior', 'gaussian_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
+VARIANTS = [('Planner iLQR', 'planner_ilqr'), ('Standard MPPI', 'standard_mppi'), ('Corridor prior', 'corridor_prior_mppi'), ('SPG prior', 'sensitivity_projected_gaussian_prior_mppi')]
 DISPLAY_TO_VARIANT = dict(VARIANTS)
 VARIANT_TO_DISPLAY = {value: label for label, value in VARIANTS}
 VEHICLE_SYSTEMS = list(controller_core.VEHICLE_SYSTEMS)
